@@ -15,7 +15,11 @@ bs58.workspace = true
 hex.workspace = true
 thiserror.workspace = true
 serde.workspace = true
-rand_core = "0.6"
+getrandom = "0.4"
+zeroize.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
 
 [lints]
 workspace = true

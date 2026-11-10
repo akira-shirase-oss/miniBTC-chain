@@ -1056,6 +1056,7 @@ dependencies = [
  "minibtc-primitives",
  "minibtc-script",
  "serde",
+ "serde_json",
  "thiserror",
 ]
 
@@ -1064,13 +1065,15 @@ name = "minibtc-crypto"
 version = "0.1.0"
 dependencies = [
  "bs58",
+ "getrandom",
  "hex",
  "k256",
- "rand_core 0.6.4",
  "ripemd",
  "serde",
+ "serde_json",
  "sha2",
  "thiserror",
+ "zeroize",
 ]
 
 [[package]]
