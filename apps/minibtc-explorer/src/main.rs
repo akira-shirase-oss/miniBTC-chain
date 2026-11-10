@@ -89,7 +89,10 @@ td,th{{border:1px solid #ccc;padding:.3em .6em;text-align:left;font-size:.85em}}
 th{{background:#f4f4f4}}\
 a{{color:#0645ad}}code{{background:#f6f6f6;padding:.1em .3em}}\
 .nav a{{margin-right:1em}}.dim{{color:#777}}.err{{color:#a00}}</style></head>\
-<body><div class=\"nav\"><a href=\"/\">blocks</a><a href=\"/mempool\">mempool</a></div>\
+<body><div class=\"nav\"><a href=\"/\">blocks</a><a href=\"/mempool\">mempool</a>\
+<form method=\"get\" action=\"/search\" style=\"display:inline;margin-left:1em\">\
+<input name=\"q\" size=\"42\" placeholder=\"search txid / block / height / address\">\
+<button type=\"submit\">go</button></form></div>\
 <h1>{}</h1>{}</body></html>",
         esc(title),
         esc(title),
