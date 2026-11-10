@@ -372,6 +372,77 @@ impl RpcBackend for NodeBackend {
                 Ok(Value::Array(out))
             }
 
+            "getaddresshistory" => {
+                // Every output ever paid to this address: received
+                // history with spent/unspent flags. Uses the storage
+                // address index when available, else scans blocks.
+                let addr_s = param_str(params, 0, "address")?;
+                let script = self.address_script(addr_s)?;
+                let inner = self.inner();
+                let tip = inner.chain.height();
+                let mut ops: Vec<OutPoint> = Vec::new();
+                let mut indexed = false;
+                if let Some(store) = &self.node.store {
+                    if let Ok(v) = store.addr_outpoints(&script) {
+                        ops = v;
+                        indexed = true;
+                    }
+                }
+                if !indexed {
+                    for rec in inner.chain.blocks.values() {
+                        for t in &rec.block.txs {
+                            for (i, o) in t.outputs.iter().enumerate() {
+                                if o.script_pubkey == script {
+                                    ops.push(OutPoint {
+                                        txid: t.txid(),
+                                        vout: i as u32,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                let mut seen = std::collections::HashSet::new();
+                let mut out = Vec::new();
+                for op in ops {
+                    if !seen.insert(op) {
+                        continue;
+                    }
+                    let Some(tx) = core::find_tx(&self.node, &inner, &op.txid) else {
+                        continue;
+                    };
+                    let Some(o) = tx.outputs.get(op.vout as usize) else {
+                        continue;
+                    };
+                    // Block height via txindex → block record.
+                    let (bh, h) = inner
+                        .txindex
+                        .get(&op.txid)
+                        .and_then(|bh| inner.chain.blocks.get(bh).map(|r| (*bh, r.height)))
+                        .unwrap_or((op.txid, 0));
+                    let _ = bh;
+                    let spent = inner.chain.utxos.get(&op).is_none();
+                    out.push(json!({
+                        "txid": op.txid.to_hex(),
+                        "vout": op.vout,
+                        "value_sats": o.value.sats(),
+                        "height": h,
+                        "confirmations": u64::from(tip.saturating_sub(h)) + 1,
+                        "spent": spent,
+                    }));
+                }
+                // Newest first.
+                out.sort_by(|a, b| {
+                    b["height"].as_u64().cmp(&a["height"].as_u64())
+                });
+                Ok(json!({
+                    "address": addr_s,
+                    "indexed": indexed,
+                    "count": out.len(),
+                    "outputs": out,
+                }))
+            }
+
             "scantxoutset" => {
                 // Full UTXO dump for wallet scanning — devnet scale,
                 // hard-capped so a hostile/buggy caller can't OOM us.

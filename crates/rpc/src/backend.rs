@@ -34,6 +34,7 @@ pub const NODE_METHODS: &[&str] = &[
     "getrawtransaction",
     "gettxout",
     "getaddressutxos",
+    "getaddresshistory",
     "scantxoutset",
     "getaddressinfo",
     "validateaddress",

@@ -19,9 +19,12 @@ const MINE_TIMEOUT: Duration = Duration::from_secs(300);
 pub struct RpcClient {
     http: reqwest::Client,
     url: String,
-    user: String,
-    pass: String,
+    /// Basic-auth credentials — behind a lock so a 401 can reload the
+    /// `.cookie` file (a node restart rotates credentials).
+    creds: std::sync::Arc<std::sync::Mutex<(String, String)>>,
     next_id: std::sync::Arc<AtomicU64>,
+    /// `.cookie` path when built via `from_datadir`.
+    cookie_path: Option<std::path::PathBuf>,
 }
 
 impl std::fmt::Debug for RpcClient {
@@ -42,9 +45,9 @@ impl RpcClient {
         Ok(Self {
             http,
             url: format!("http://{host}:{port}/"),
-            user: auth.user,
-            pass: auth.pass,
+            creds: std::sync::Arc::new(std::sync::Mutex::new((auth.user, auth.pass))),
             next_id: std::sync::Arc::new(AtomicU64::new(1)),
+            cookie_path: None,
         })
     }
 
@@ -54,46 +57,86 @@ impl RpcClient {
         let contents = std::fs::read_to_string(&cookie_path)
             .map_err(|e| RpcError::App(format!("cannot read {}: {e}", cookie_path.display())))?;
         let auth = CookieAuth::from_cookie_file(&contents)?;
-        Self::new("127.0.0.1", port, auth)
+        let mut c = Self::new("127.0.0.1", port, auth)?;
+        c.cookie_path = Some(cookie_path);
+        Ok(c)
+    }
+
+    fn creds(&self) -> (String, String) {
+        self.creds
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_else(|_| (String::new(), String::new()))
+    }
+
+    /// Re-read `.cookie` after a 401; `true` if credentials changed.
+    fn reload_auth(&self) -> bool {
+        let Some(path) = &self.cookie_path else {
+            return false;
+        };
+        let Ok(contents) = std::fs::read_to_string(path) else {
+            return false;
+        };
+        let Ok(auth) = CookieAuth::from_cookie_file(&contents) else {
+            return false;
+        };
+        let Ok(mut g) = self.creds.lock() else {
+            return false;
+        };
+        if *g == (auth.user.clone(), auth.pass.clone()) {
+            return false;
+        }
+        *g = (auth.user, auth.pass);
+        true
     }
 
     /// Raw call: method + positional params → result Value.
+    /// Retries once on 401 after reloading `.cookie` (node restarts
+    /// rotate credentials).
     pub async fn call(&self, method: &str, params: Value) -> Result<Value, RpcError> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let req = JsonRpcRequest {
-            jsonrpc: "2.0".into(),
-            id: json!(id),
-            method: method.to_string(),
-            params,
-        };
-        let resp = self
-            .http
-            .post(&self.url)
-            .basic_auth(&self.user, Some(&self.pass))
-            .json(&req)
-            .send()
-            .await
-            .map_err(|e| RpcError::Internal(format!("rpc transport: {e}")))?;
-        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(RpcError::App(
-                "RPC auth failed — wrong cookie or node not running".into(),
-            ));
+        for attempt in 0..2 {
+            let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+            let (user, pass) = self.creds();
+            let req = JsonRpcRequest {
+                jsonrpc: "2.0".into(),
+                id: json!(id),
+                method: method.to_string(),
+                params: params.clone(),
+            };
+            let resp = self
+                .http
+                .post(&self.url)
+                .basic_auth(&user, Some(&pass))
+                .json(&req)
+                .send()
+                .await
+                .map_err(|e| RpcError::Internal(format!("rpc transport: {e}")))?;
+            if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+                if attempt == 0 && self.reload_auth() {
+                    continue;
+                }
+                return Err(RpcError::App(
+                    "RPC auth failed — wrong cookie or node not running".into(),
+                ));
+            }
+            let body: JsonRpcResponse = resp
+                .json()
+                .await
+                .map_err(|e| RpcError::Internal(format!("rpc decode: {e}")))?;
+            if let Some(err) = body.error {
+                return Err(match err.code {
+                    -32601 => RpcError::MethodNotFound(err.message),
+                    -32602 => RpcError::InvalidParams(err.message),
+                    -32600 => RpcError::InvalidRequest(err.message),
+                    -32700 => RpcError::Parse(err.message),
+                    _ => RpcError::App(err.message),
+                });
+            }
+            return body
+                .result
+                .ok_or_else(|| RpcError::Internal("empty rpc result".into()));
         }
-        let body: JsonRpcResponse = resp
-            .json()
-            .await
-            .map_err(|e| RpcError::Internal(format!("rpc decode: {e}")))?;
-        if let Some(err) = body.error {
-            return Err(match err.code {
-                -32601 => RpcError::MethodNotFound(err.message),
-                -32602 => RpcError::InvalidParams(err.message),
-                -32600 => RpcError::InvalidRequest(err.message),
-                -32700 => RpcError::Parse(err.message),
-                _ => RpcError::App(err.message),
-            });
-        }
-        body.result
-            .ok_or_else(|| RpcError::Internal("empty rpc result".into()))
+        unreachable!("call loop always returns")
     }
 
     /// Call with a custom timeout (mining).
@@ -107,6 +150,7 @@ impl RpcClient {
             .timeout(timeout)
             .build()
             .map_err(|e| RpcError::Internal(format!("http client: {e}")))?;
+        let (user, pass) = self.creds();
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let req = JsonRpcRequest {
             jsonrpc: "2.0".into(),
@@ -116,7 +160,7 @@ impl RpcClient {
         };
         let resp = http
             .post(&self.url)
-            .basic_auth(&self.user, Some(&self.pass))
+            .basic_auth(&user, Some(&pass))
             .json(&req)
             .send()
             .await
