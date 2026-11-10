@@ -136,6 +136,11 @@ pub struct Mempool {
 }
 
 impl Mempool {
+    /// The configured policy (read-only).
+    pub fn policy(&self) -> &MempoolPolicy {
+        &self.policy
+    }
+
     /// New mempool with policy.
     pub fn new(policy: MempoolPolicy) -> Self {
         Self {

@@ -12,11 +12,13 @@
 //! - [`next_bits`] — difficulty retarget per params (clamped ×4).
 
 use minibtc_consensus::{ChainParams, retarget_bits};
-use minibtc_crypto::{Hash256, Keypair};
 use minibtc_primitives::{
     Block, BlockHeader, OutPoint, Sats, Transaction, TxInput, TxOutput, merkle_root,
 };
+#[cfg(test)]
 use minibtc_script::Script;
+#[cfg(test)]
+use minibtc_crypto::Keypair;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Errors building or mining a block.
@@ -47,7 +49,7 @@ pub struct Template {
     pub fees: Sats,
 }
 
-/// Build a mining template: coinbase paying `miner` the subsidy+fees,
+/// Build a mining template: coinbase paying `payout_script` the subsidy+fees,
 /// plus up to `max_tx` mempool transactions in fee-rate order.
 ///
 /// `mempool_txs` — `(tx, fee)` pairs already selected & fee-sorted by the
@@ -60,7 +62,7 @@ pub fn build_template(
     params: &ChainParams,
     prev: &BlockHeader,
     mempool_txs: &[(Transaction, Sats)],
-    miner: &Keypair,
+    payout_script: &[u8],
     height: u64,
     time: u32,
     bits: u32,
@@ -93,7 +95,7 @@ pub fn build_template(
         .checked_add(fees)
         .ok_or(MineError::Template("coinbase value overflow"))?;
 
-    let cb = coinbase_transaction(miner, height, coinbase_value, &selected);
+    let cb = coinbase_transaction(height, coinbase_value, payout_script, &selected);
     let mut txs = Vec::with_capacity(selected.len() + 1);
     txs.push(cb);
     txs.extend(selected);
@@ -110,12 +112,13 @@ pub fn build_template(
     Ok(Template { header, txs, fees })
 }
 
-/// The coinbase transaction: one null-prevout input + outputs paying the
-/// miner. ScriptSig carries the height (BIP34-style) plus a tag.
+/// The coinbase transaction: one null-prevout input + one output paying
+/// `payout_script` (any scriptPubKey — P2PKH address, raw script, etc.).
+/// ScriptSig carries the height (BIP34-style) plus a tag.
 pub fn coinbase_transaction(
-    miner: &Keypair,
     height: u64,
     value: Sats,
+    payout_script: &[u8],
     _mempool_txs: &[Transaction],
 ) -> Transaction {
     // Commit to the tx set lightly via a hash in the scriptSig — gives
@@ -133,7 +136,7 @@ pub fn coinbase_transaction(
         }],
         outputs: vec![TxOutput {
             value,
-            script_pubkey: Script::p2pkh(&miner.public_key().key_hash()).0,
+            script_pubkey: payout_script.to_vec(),
         }],
         locktime: 0,
     }
@@ -147,7 +150,6 @@ pub fn coinbase_transaction(
 /// caller can yield periodically (the node uses a large budget + cancel).
 pub fn mine(
     template: &Template,
-    params: &ChainParams,
     budget: u64,
     cancel: Option<&AtomicBool>,
 ) -> Result<BlockHeader, MineError> {
@@ -227,12 +229,12 @@ mod tests {
     #[test]
     fn template_builds_coinbase_first() {
         let p = params();
-        let miner = Keypair::generate().unwrap();
+        let payout = Script::p2pkh(&Keypair::generate().unwrap().public_key().key_hash()).0;
         let t = build_template(
             &p,
             &prev_header(),
             &[],
-            &miner,
+            &payout,
             1,
             1_700_000_031,
             p.pow_limit_bits,
@@ -246,21 +248,21 @@ mod tests {
     #[test]
     fn mine_finds_valid_nonce_fast_on_devnet() {
         let p = params();
-        let miner = Keypair::generate().unwrap();
+        let payout = Script::p2pkh(&Keypair::generate().unwrap().public_key().key_hash()).0;
         let t = build_template(
             &p,
             &prev_header(),
             &[],
-            &miner,
+            &payout,
             1,
             1_700_000_031,
             p.pow_limit_bits,
         )
         .unwrap();
-        let h = mine(&t, &p, 1_000_000, None).unwrap();
+        let h = mine(&t, 1_000_000, None).unwrap();
         assert!(hash_meets_target(&h, p.pow_limit_bits));
         // Deterministic: same template → same nonce (RFC-free grinding).
-        let h2 = mine(&t, &p, 1_000_000, None).unwrap();
+        let h2 = mine(&t, 1_000_000, None).unwrap();
         assert_eq!(h.nonce, h2.nonce);
     }
 
@@ -268,12 +270,12 @@ mod tests {
     fn mine_respects_budget_and_cancel() {
         let p = params();
         // Impossible target: bits with mantissa tiny → target ~0.
-        let miner = Keypair::generate().unwrap();
+        let payout = Script::p2pkh(&Keypair::generate().unwrap().public_key().key_hash()).0;
         let t = build_template(
             &p,
             &prev_header(),
             &[],
-            &miner,
+            &payout,
             1,
             1_700_000_031,
             0x0100_0341,
@@ -281,13 +283,13 @@ mod tests {
         .unwrap();
         // Budget 10 → must fail.
         assert!(matches!(
-            mine(&t, &p, 10, None),
+            mine(&t, 10, None),
             Err(MineError::BudgetExhausted(10))
         ));
         // Cancel flag set → Cancelled.
         let cancel = AtomicBool::new(true);
         assert!(matches!(
-            mine(&t, &p, 1_000_000, Some(&cancel)),
+            mine(&t, 1_000_000, Some(&cancel)),
             Err(MineError::Cancelled)
         ));
     }
@@ -296,7 +298,6 @@ mod tests {
     fn template_includes_mempool_txs_and_fees() {
         let p = params();
         let miner = Keypair::generate().unwrap();
-        let payer = Keypair::generate().unwrap();
         // Fake a mempool tx paying miner.
         let tx = Transaction {
             version: 1,
@@ -318,7 +319,7 @@ mod tests {
             &p,
             &prev_header(),
             &[(tx, Sats(500))],
-            &miner,
+            &Script::p2pkh(&miner.public_key().key_hash()).0,
             1,
             1_700_000_031,
             p.pow_limit_bits,
@@ -343,9 +344,9 @@ mod tests {
 
     #[test]
     fn coinbase_txid_unique_per_height() {
-        let miner = Keypair::generate().unwrap();
-        let a = coinbase_transaction(&miner, 1, Sats(100), &[]);
-        let b = coinbase_transaction(&miner, 2, Sats(100), &[]);
+        let payout = Script::p2pkh(&Keypair::generate().unwrap().public_key().key_hash()).0;
+        let a = coinbase_transaction(1, Sats(100), &payout, &[]);
+        let b = coinbase_transaction(2, Sats(100), &payout, &[]);
         assert_ne!(a.txid(), b.txid(), "coinbase txids must differ by height");
     }
 }

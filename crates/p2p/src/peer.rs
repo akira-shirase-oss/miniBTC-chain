@@ -72,7 +72,7 @@ pub enum PeerError {
 }
 
 /// Per-peer state tracked by the manager.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct PeerState {
     /// Remote socket address.
     pub addr: SocketAddr,
@@ -284,6 +284,12 @@ impl PeerManager {
     /// Current score of a peer.
     pub fn score_of(&self, addr: &SocketAddr) -> Option<i32> {
         self.peers.get(addr).map(|p| p.score)
+    }
+
+    /// Snapshot of all peers (addr, state) — for RPC `getpeerinfo` and
+    /// the maintenance sweep. Bounded by `max_peers`.
+    pub fn snapshot(&self) -> Vec<(SocketAddr, PeerState)> {
+        self.peers.iter().map(|(a, p)| (*a, p.clone())).collect()
     }
 
     /// Remove a peer (disconnect).

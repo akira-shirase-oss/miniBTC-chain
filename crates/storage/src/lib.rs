@@ -75,7 +75,7 @@ pub enum StoreError {
 
 /// The durable store. `Clone`-able handle — redb databases are
 /// thread-safe; each method opens its own transaction.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Store {
     db: Arc<Database>,
 }
@@ -138,9 +138,12 @@ impl Store {
             txindex.retain(|_, _| false)?;
             addrindex.retain(|_, _| false)?;
 
-            // Chain meta: params fingerprint-ish + genesis.
+            // Chain meta: genesis ++ tip (tip makes load robust across
+            // partial disconnects where inactive blocks still hold the
+            // highest cum_work).
             let mut cm = Writer::new();
             cm.hash256(&chain.genesis);
+            cm.hash256(&chain.tip);
             chainmeta.insert(&b"chain"[..], cm.into_bytes().as_slice())?;
 
             // Blocks + meta + txindex + addrindex inputs.
@@ -188,6 +191,140 @@ impl Store {
         Ok(())
     }
 
+    /// Incrementally persist one newly-connected block: block bytes,
+    /// index meta, tx/address indexes, the UTXO delta and its undo data —
+    /// one atomic write txn, cost O(block) instead of O(chain). Use for
+    /// the common direct-tip-extension path; reorgs and side branches
+    /// still go through [`Self::snapshot`].
+    ///
+    /// The caller must invoke this *after* `chain.connect_tip`/`consider_block`
+    /// has applied the block, while `chain.undos` still holds its undo.
+    pub fn append_block(&self, chain: &Chain, hash: &Hash256) -> Result<(), StoreError> {
+        let rec = chain
+            .blocks
+            .get(hash)
+            .ok_or_else(|| StoreError::Corrupt("append_block: unknown block".into()))?
+            .clone();
+        let undo = chain
+            .undos
+            .get(hash)
+            .ok_or_else(|| StoreError::Corrupt("append_block: missing undo".into()))?;
+        let txn = self.db.begin_write()?;
+        {
+            let mut blocks = txn.open_table(BLOCKS)?;
+            let mut meta = txn.open_table(META)?;
+            let mut utxos = txn.open_table(UTKOS)?;
+            let mut undos = txn.open_table(UNDOS)?;
+            let mut txindex = txn.open_table(TXINDEX)?;
+            let mut addrindex = txn.open_table(ADDRINDEX)?;
+            let mut chainmeta = txn.open_table(CHAINMETA)?;
+
+            blocks.insert(hash.as_bytes(), rec.block.encode().as_slice())?;
+            let mut m = Writer::new();
+            m.u32(rec.height);
+            m.bytes(&rec.cum_work.to_le_bytes());
+            m.u8(match rec.status {
+                minibtc_chainstate::BlockStatus::Active => 1,
+                minibtc_chainstate::BlockStatus::Inactive => 0,
+            });
+            m.hash256(&rec.block.header.prev_hash);
+            meta.insert(hash.as_bytes(), m.into_bytes().as_slice())?;
+            undos.insert(hash.as_bytes(), encode_undo(undo).as_slice())?;
+
+            // Tx-by-tx in order: spend prevouts, create outputs. Sequential
+            // order keeps intra-block spends correct.
+            for (i, tx) in rec.block.txs.iter().enumerate() {
+                let txid = tx.txid();
+                txindex.insert(txid.as_bytes(), hash.as_bytes())?;
+                let is_cb = i == 0;
+                if !is_cb {
+                    for inp in &tx.inputs {
+                        let _ = utxos.remove(outpoint_key(&inp.prev).as_slice())?;
+                    }
+                }
+                for (vout, out) in tx.outputs.iter().enumerate() {
+                    let vout32 = vout as u32;
+                    let mut buf = addrindex
+                        .get(out.script_pubkey.as_slice())?
+                        .map(|g| g.value().to_vec())
+                        .unwrap_or_default();
+                    buf.extend_from_slice(txid.as_bytes());
+                    buf.extend_from_slice(&vout32.to_le_bytes());
+                    addrindex.insert(out.script_pubkey.as_slice(), buf.as_slice())?;
+                    let entry = UtxoEntry {
+                        output: out.clone(),
+                        height: rec.height,
+                        coinbase: is_cb,
+                    };
+                    let op = OutPoint {
+                        txid,
+                        vout: vout32,
+                    };
+                    utxos.insert(
+                        outpoint_key(&op).as_slice(),
+                        encode_utxo(&entry).as_slice(),
+                    )?;
+                }
+            }
+            // Advance the recorded tip.
+            let mut cm = Writer::new();
+            cm.hash256(&chain.genesis);
+            cm.hash256(hash);
+            chainmeta.insert(&b"chain"[..], cm.into_bytes().as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Persist a tip disconnect: restore spent outputs, remove created
+    /// ones, mark the block inactive. Call *before* `chain.disconnect_tip`
+    /// while the undo record is still in `chain.undos`. Reorgs that
+    /// disconnect several blocks should use [`Self::snapshot`] instead.
+    pub fn disconnect_block(&self, chain: &Chain, hash: &Hash256) -> Result<(), StoreError> {
+        let undo = chain
+            .undos
+            .get(hash)
+            .ok_or_else(|| StoreError::Corrupt("disconnect_block: missing undo".into()))?;
+        let txn = self.db.begin_write()?;
+        {
+            let mut utxos = txn.open_table(UTKOS)?;
+            let mut meta = txn.open_table(META)?;
+            let mut chainmeta = txn.open_table(CHAINMETA)?;
+            // Reverse order — mirrors chainstate::disconnect_tip. A spent
+            // entry recorded for an intra-block spend is itself deleted by
+            // the creating tx's `created` list when its turn comes.
+            for u in undo.txs.iter().rev() {
+                for op in &u.created {
+                    let _ = utxos.remove(outpoint_key(op).as_slice())?;
+                }
+                for (op, entry) in &u.spent {
+                    utxos.insert(
+                        outpoint_key(op).as_slice(),
+                        encode_utxo(entry).as_slice(),
+                    )?;
+                }
+            }
+            let mut new_tip = None;
+            if let Some(rec) = chain.blocks.get(hash) {
+                let mut m = Writer::new();
+                m.u32(rec.height);
+                m.bytes(&rec.cum_work.to_le_bytes());
+                m.u8(0u8); // inactive
+                m.hash256(&rec.block.header.prev_hash);
+                meta.insert(hash.as_bytes(), m.into_bytes().as_slice())?;
+                new_tip = Some(rec.block.header.prev_hash);
+            }
+            if let Some(tip) = new_tip {
+                let mut cm = Writer::new();
+                cm.hash256(&chain.genesis);
+                cm.hash256(&tip);
+                chainmeta.insert(&b"chain"[..], cm.into_bytes().as_slice())?;
+            }
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
     /// Load the stored chain state into memory. Returns `None` if the
     /// store is empty.
     ///
@@ -216,6 +353,28 @@ impl Store {
         chain.blocks.clear();
         chain.utxos = minibtc_chainstate::UtxoSet::default();
         chain.undos.clear();
+
+        // Recorded tip (genesis++tip written by snapshot/append/disconnect).
+        // Fall back to max-work for stores written before tip tracking.
+        let recorded_tip = {
+            let txn2 = self.db.begin_read()?;
+            match opt_table(&txn2, CHAINMETA)? {
+                Some(t) => match t.get(&b"chain"[..])? {
+                    Some(g) => {
+                        let b = g.value();
+                        if b.len() >= 64 {
+                            let mut arr = [0u8; 32];
+                            arr.copy_from_slice(&b[32..64]);
+                            Some(Hash256(arr))
+                        } else {
+                            None
+                        }
+                    }
+                    None => None,
+                },
+                None => None,
+            }
+        };
 
         // Rebuild UTXO set from stored entries.
         for row in utxos_t.iter()? {
@@ -285,12 +444,10 @@ impl Store {
             let hash = Hash256(karr);
             chain.undos.insert(hash, decode_undo(v.value())?);
         }
-        // Tip = most work.
-        chain.tip = if max_work.0 > 0 {
-            max_work.1
-        } else {
-            genesis_hash
-        };
+        // Tip = recorded tip when it names a stored block, else most work.
+        chain.tip = recorded_tip
+            .filter(|t| *t == genesis_hash || chain.blocks.contains_key(t))
+            .unwrap_or(if max_work.0 > 0 { max_work.1 } else { genesis_hash });
         // Recompute active status: mark only the active-chain blocks.
         mark_active(&mut chain);
         Ok(Some(chain))
@@ -302,8 +459,7 @@ impl Store {
         let txn = self.db.begin_read()?;
         let Some(blocks_t) = opt_table(&txn, BLOCKS)? else {
             // Empty store → replay just genesis.
-            let mut chain = Chain::new(params.clone(), genesis)?;
-            return Ok(chain);
+            return Ok(Chain::new(params.clone(), genesis)?);
         };
         let mut blocks: Vec<Block> = Vec::new();
         for row in blocks_t.iter()? {

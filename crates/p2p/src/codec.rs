@@ -31,6 +31,8 @@ pub const MAX_MESSAGE_SIZE: u32 = 2 * 1024 * 1024;
 /// Cap on `addr`/`inv` vector lengths inside payloads.
 pub const MAX_ADDR_COUNT: usize = 1_000;
 pub const MAX_INV_COUNT: usize = 50_000;
+/// Locator hashes per getheaders (Bitcoin uses ~10-11; allow slack).
+pub const MAX_LOCATOR_COUNT: usize = 128;
 /// Per-message I/O deadline — every read/write is bounded.
 pub const IO_TIMEOUT: Duration = Duration::from_secs(30);
 /// Handshake timeout — a peer that can't complete version/verack in this
@@ -140,6 +142,13 @@ pub enum Message {
         /// The headers.
         headers: Vec<BlockHeader>,
     },
+    /// `getheaders` — request headers building on a locator.
+    GetHeaders {
+        /// Hashes the requester already has (newest first).
+        locator: Vec<Hash256>,
+        /// Stop hash — do not send headers at/before it (ZERO = no stop).
+        stop: Hash256,
+    },
     /// `ping` — keepalive with payload nonce.
     Ping(u64),
     /// `pong` — keepalive reply.
@@ -248,6 +257,13 @@ pub fn encode_payload(msg: &Message, params: &ChainParams) -> Vec<u8> {
                 w.bytes(&h.encode());
             }
         }
+        Message::GetHeaders { locator, stop } => {
+            w.compact_size(locator.len() as u64);
+            for h in locator {
+                w.hash256(h);
+            }
+            w.hash256(stop);
+        }
         Message::Ping(n) | Message::Pong(n) => w.u64(*n),
         Message::Addr(addrs) => {
             w.compact_size(addrs.len() as u64);
@@ -300,12 +316,21 @@ pub fn decode_payload(command: &str, payload: &[u8]) -> Result<Message, WireErro
         "verack" => Message::Verack,
         "inv" => Message::Inv(decode_inv(&mut r)?),
         "getdata" => Message::GetData(decode_inv(&mut r)?),
-        "tx" => Message::Tx(Transaction::decode(r.rest())?),
-        "block" => Message::Block(Block::decode(
-            r.rest(),
-            usize::MAX,
-            MAX_MESSAGE_SIZE as usize,
-        )?),
+        "tx" => {
+            // tx/block payloads are self-delimiting and consume the whole
+            // remainder — decode from `rest()`, then advance the cursor so
+            // `finish()` sees a clean tail.
+            let tx = Transaction::decode(r.rest())?;
+            let n = r.remaining();
+            r.take(n)?;
+            Message::Tx(tx)
+        }
+        "block" => {
+            let block = Block::decode(r.rest(), usize::MAX, MAX_MESSAGE_SIZE as usize)?;
+            let n = r.remaining();
+            r.take(n)?;
+            Message::Block(block)
+        }
         "headers" => {
             let count = r.compact_size()? as usize;
             if count > 2_000 {
@@ -324,6 +349,23 @@ pub fn decode_payload(command: &str, payload: &[u8]) -> Result<Message, WireErro
                 count: count as u32,
                 headers,
             }
+        }
+        "getheaders" => {
+            let count = r.compact_size()? as usize;
+            if count > MAX_LOCATOR_COUNT {
+                return Err(WireError::Decode(
+                    minibtc_primitives::de::ReadError::LengthOverflow {
+                        declared: u64::MAX,
+                        remaining: 0,
+                    },
+                ));
+            }
+            let mut locator = Vec::with_capacity(count);
+            for _ in 0..count {
+                locator.push(r.hash256()?);
+            }
+            let stop = r.hash256()?;
+            Message::GetHeaders { locator, stop }
         }
         "ping" => Message::Ping(r.u64()?),
         "pong" => Message::Pong(r.u64()?),
@@ -398,6 +440,7 @@ pub fn command_name(msg: &Message) -> &'static str {
         Message::Tx(_) => "tx",
         Message::Block(_) => "block",
         Message::Headers { .. } => "headers",
+        Message::GetHeaders { .. } => "getheaders",
         Message::Ping(_) => "ping",
         Message::Pong(_) => "pong",
         Message::Addr(_) => "addr",

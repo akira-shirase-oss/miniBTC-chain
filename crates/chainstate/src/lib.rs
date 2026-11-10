@@ -523,7 +523,8 @@ impl Chain {
     }
 
     /// Median of up to `median_time_span` past block times (newest first).
-    fn median_time_past(&self) -> Option<u32> {
+    /// Public so the miner/RPC can compute candidate timestamps.
+    pub fn median_time_past(&self) -> Option<u32> {
         let mut times: Vec<u32> = Vec::with_capacity(self.params.median_time_span);
         let mut cur = self.tip;
         loop {

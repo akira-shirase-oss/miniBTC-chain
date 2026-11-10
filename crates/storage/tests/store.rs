@@ -194,6 +194,62 @@ fn empty_store_loads_none() {
 }
 
 #[test]
+fn append_block_incremental_matches_snapshot() {
+    // Persist every block via append_block (the node's hot path) and prove
+    // the loaded state equals a snapshot-built store.
+    let (chain, _m, params) = build_chain(6);
+    let expected_fp = chain.utxos.fingerprint();
+    let (dir, _g) = tempdir();
+    let store = Store::open(&dir).unwrap();
+    // Walk active chain genesis → tip.
+    let mut order = Vec::new();
+    let mut cur = chain.tip;
+    loop {
+        order.push(cur);
+        let rec = &chain.blocks[&cur];
+        if cur == chain.genesis {
+            break;
+        }
+        cur = rec.block.header.prev_hash;
+    }
+    order.reverse();
+    for h in &order {
+        store.append_block(&chain, h).unwrap();
+    }
+    let genesis = chain.blocks[&chain.genesis].block.clone();
+    let loaded = store.load(params, genesis).unwrap().unwrap();
+    assert_eq!(loaded.utxos.fingerprint(), expected_fp);
+    assert_eq!(loaded.tip, chain.tip);
+    assert_eq!(loaded.height(), chain.height());
+    // Indexes populated by append path.
+    let tip_cb = chain.blocks[&chain.tip].block.txs[0].txid();
+    assert_eq!(store.tx_block(&tip_cb).unwrap(), Some(chain.tip));
+}
+
+#[test]
+fn disconnect_block_persists_utxo_reversal() {
+    let (mut chain, _m, params) = build_chain(5);
+    let full_fp = chain.utxos.fingerprint();
+    let (dir, _g) = tempdir();
+    let store = Store::open(&dir).unwrap();
+    store.snapshot(&chain).unwrap();
+
+    // Disconnect two tips, persisting each BEFORE chainstate consumes
+    // the undo — the exact order the node uses.
+    for _ in 0..2 {
+        let tip = chain.tip;
+        store.disconnect_block(&chain, &tip).unwrap();
+        chain.disconnect_tip().unwrap();
+    }
+    assert_ne!(chain.utxos.fingerprint(), full_fp);
+    let genesis = chain.blocks[&chain.genesis].block.clone();
+    let loaded = store.load(params, genesis).unwrap().unwrap();
+    assert_eq!(loaded.utxos.fingerprint(), chain.utxos.fingerprint());
+    assert_eq!(loaded.tip, chain.tip);
+    assert_eq!(loaded.height(), 3);
+}
+
+#[test]
 fn snapshot_is_atomic_wipe_and_rewrite() {
     let (chain, _m, params) = build_chain(3);
     let (dir, _g) = tempdir();
