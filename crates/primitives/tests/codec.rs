@@ -1,7 +1,7 @@
 //! Codec and merkle-rule tests: round-trips, canonical-form rejection,
 //! bounds, and the CVE-2012-2459 ambiguity case.
 
-use minibtc_crypto::{double_sha256, Hash256};
+use minibtc_crypto::{Hash256, double_sha256};
 use minibtc_primitives::*;
 
 fn sample_tx(marker: u8) -> Transaction {

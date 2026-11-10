@@ -15,7 +15,7 @@
 //! agree — the consistency test replays blocks into a fresh chain and
 //! compares UTXO sets hash-for-hash.
 
-use minibtc_consensus::{validate_block_with_time, BlockError, ChainParams, UtxoView};
+use minibtc_consensus::{BlockError, ChainParams, UtxoView, validate_block_with_time};
 use minibtc_crypto::Hash256;
 use minibtc_primitives::{Block, OutPoint, Transaction, TxOutput};
 use std::collections::HashMap;
@@ -74,14 +74,22 @@ impl UtxoSet {
         self.map.iter()
     }
 
+    /// Insert an entry directly — used by storage load paths (the
+    /// in-memory apply path stays `apply_tx`).
+    pub fn insert(&mut self, op: OutPoint, entry: UtxoEntry) {
+        self.map.insert(op, entry);
+    }
+
+    /// Remove an entry — used by storage/replay paths.
+    pub fn remove(&mut self, op: &OutPoint) -> Option<UtxoEntry> {
+        self.map.remove(op)
+    }
+
     /// Deterministic fingerprint of the whole set — sorted serialization
     /// hashed. Used by the "reorg == fresh replay" consistency proof.
     pub fn fingerprint(&self) -> Hash256 {
-        let mut items: Vec<(OutPoint, UtxoEntry)> = self
-            .map
-            .iter()
-            .map(|(k, v)| (*k, v.clone()))
-            .collect();
+        let mut items: Vec<(OutPoint, UtxoEntry)> =
+            self.map.iter().map(|(k, v)| (*k, v.clone())).collect();
         items.sort_by_key(|(op, _)| (op.txid, op.vout));
         let mut w = minibtc_primitives::Writer::new();
         for (op, e) in items {
@@ -250,9 +258,8 @@ impl Chain {
 
     /// Work contributed by a header's bits.
     fn header_work(&self, h: &minibtc_primitives::BlockHeader) -> Result<u128, ChainError> {
-        minibtc_consensus::pow::work_units(h.bits).map_err(|e| {
-            ChainError::InvalidBlock(BlockError::Pow(e))
-        })
+        minibtc_consensus::pow::work_units(h.bits)
+            .map_err(|e| ChainError::InvalidBlock(BlockError::Pow(e)))
     }
 
     /// Enforce coinbase maturity for every input of `tx`.
@@ -290,7 +297,14 @@ impl Chain {
         // Validate against current UTXO set (blockval needs a view).
         let adjusted = Some(self.adjusted_time());
         let mtp = self.median_time_past();
-        validate_block_with_time(&block, &self.utxos, &self.params, u64::from(height), adjusted, mtp)?;
+        validate_block_with_time(
+            &block,
+            &self.utxos,
+            &self.params,
+            u64::from(height),
+            adjusted,
+            mtp,
+        )?;
 
         let undo = self.apply_block_at(&block, height)?;
         self.blocks.insert(
@@ -331,10 +345,7 @@ impl Chain {
             .get(&tip_hash)
             .ok_or(ChainError::NotTip)?
             .clone();
-        let undo = self
-            .undos
-            .remove(&tip_hash)
-            .ok_or(ChainError::NotTip)?;
+        let undo = self.undos.remove(&tip_hash).ok_or(ChainError::NotTip)?;
         // Reverse txs in reverse order.
         for (i, tx) in rec.block.txs.iter().enumerate().rev() {
             let txid = tx.txid();
@@ -381,7 +392,14 @@ impl Chain {
         // apply (missing prevouts error there).
         let adjusted = Some(self.adjusted_time());
         let mtp = self.median_time_past();
-        validate_block_with_time(&block, &self.utxos, &self.params, u64::from(height), adjusted, mtp)?;
+        validate_block_with_time(
+            &block,
+            &self.utxos,
+            &self.params,
+            u64::from(height),
+            adjusted,
+            mtp,
+        )?;
 
         if parent_hash == self.tip {
             // Direct extension.
@@ -418,11 +436,7 @@ impl Chain {
     /// branch forward. UTXOs end up exactly equal to fresh replay.
     fn maybe_reorg(&mut self, candidate: Hash256) -> Result<(), ChainError> {
         // Walk candidate back to find fork point with active chain.
-        let tip_work = self
-            .blocks
-            .get(&self.tip)
-            .map(|r| r.cum_work)
-            .unwrap_or(0);
+        let tip_work = self.blocks.get(&self.tip).map(|r| r.cum_work).unwrap_or(0);
         let cand_work = self.blocks.get(&candidate).map(|r| r.cum_work).unwrap_or(0);
         if cand_work <= tip_work {
             return Ok(()); // no reorg — candidate stays inactive

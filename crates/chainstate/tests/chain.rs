@@ -5,9 +5,9 @@
 use minibtc_chainstate::*;
 use minibtc_consensus::ChainParams;
 use minibtc_crypto::{Hash256, Keypair};
-use std::collections::HashMap;
 use minibtc_primitives::*;
 use minibtc_script::Script;
+use std::collections::HashMap;
 
 /// Grind a nonce until the header passes PoW (devnet target ~2^255 →
 /// ~2 tries average).
@@ -51,7 +51,10 @@ fn build_block(
     let mut txs = txs;
     // Ensure coinbase present: if caller didn't supply one, prepend.
     if txs.is_empty() || !txs[0].is_coinbase() {
-        txs.insert(0, coinbase_tx(&Keypair::generate().unwrap(), 0, params.subsidy_start));
+        txs.insert(
+            0,
+            coinbase_tx(&Keypair::generate().unwrap(), 0, params.subsidy_start),
+        );
     }
     let mr = merkle_root(&txs);
     let header = mine_header(BlockHeader {
@@ -103,7 +106,11 @@ fn genesis_connects_and_issues_coinbase() {
 #[test]
 fn connect_blocks_extends_tip_and_utxo() {
     let (mut chain, miner) = fresh_chain();
-    let mut prev = *chain.blocks.get(&chain.tip).map(|r| &r.block.header).unwrap();
+    let mut prev = *chain
+        .blocks
+        .get(&chain.tip)
+        .map(|r| &r.block.header)
+        .unwrap();
     let mut time = prev.time;
     for h in 1..=5u32 {
         time += 31;
@@ -120,7 +127,11 @@ fn connect_blocks_extends_tip_and_utxo() {
 fn coinbase_maturity_blocks_early_spend() {
     let (mut chain, miner) = fresh_chain();
     // Mine 3 blocks (depth of genesis coinbase = 3 < 100).
-    let mut prev = *chain.blocks.get(&chain.tip).map(|r| &r.block.header).unwrap();
+    let mut prev = *chain
+        .blocks
+        .get(&chain.tip)
+        .map(|r| &r.block.header)
+        .unwrap();
     let mut time = prev.time;
     for h in 1..=3u32 {
         time += 31;
@@ -149,10 +160,21 @@ fn coinbase_maturity_blocks_early_spend() {
     };
     // Sign it properly so only maturity can fail — need sighash against
     // the coinbase's scriptPubKey.
-    let prev_spk = chain.utxos.get(&genesis_cb_op).unwrap().output.script_pubkey.clone();
+    let prev_spk = chain
+        .utxos
+        .get(&genesis_cb_op)
+        .unwrap()
+        .output
+        .script_pubkey
+        .clone();
     let item = minibtc_script::sighash::sign_input(&spend, 0, &prev_spk, &miner).unwrap();
     spend.inputs[0].script_sig = Script::p2pkh_spend(&item, &miner.public_key()).0;
-    let blk = build_block(&prev, vec![coinbase_tx(&miner, 4, chain.params.subsidy_start), spend], time + 31, &chain.params);
+    let blk = build_block(
+        &prev,
+        vec![coinbase_tx(&miner, 4, chain.params.subsidy_start), spend],
+        time + 31,
+        &chain.params,
+    );
     // Wait — build_block puts cb first; spend second. Height 4 < maturity.
     let err = chain.consider_block(blk);
     assert!(err.is_err(), "immature coinbase spend must fail");
@@ -162,7 +184,11 @@ fn coinbase_maturity_blocks_early_spend() {
 fn reorg_restores_utxo_exactly() {
     let (mut chain_a, miner) = fresh_chain();
     // Build branch A: 3 blocks. Record fingerprint after each.
-    let mut prev_a = *chain_a.blocks.get(&chain_a.tip).map(|r| &r.block.header).unwrap();
+    let mut prev_a = *chain_a
+        .blocks
+        .get(&chain_a.tip)
+        .map(|r| &r.block.header)
+        .unwrap();
     let mut time = prev_a.time;
     // Simpler: build two independent chains to same height, then feed the
     // heavier fork's blocks into chain_a and check fingerprint equality
@@ -192,11 +218,19 @@ fn reorg_restores_utxo_exactly() {
     for b in &a_blocks {
         replay.consider_block(b.clone()).unwrap();
     }
-    assert_eq!(fp_a, replay.utxos.fingerprint(), "replay fingerprint differs");
+    assert_eq!(
+        fp_a,
+        replay.utxos.fingerprint(),
+        "replay fingerprint differs"
+    );
 
     // --- now a competing fork b1..b4 (one block longer = more work) ---
     // Build fork from genesis.
-    let genesis_hdr = *chain_a.blocks.get(&chain_a.genesis).map(|r| &r.block.header).unwrap();
+    let genesis_hdr = *chain_a
+        .blocks
+        .get(&chain_a.genesis)
+        .map(|r| &r.block.header)
+        .unwrap();
     let mut fh = genesis_hdr;
     // Fork timestamps must exceed the a-branch's median-time-past —
     // start well above it (a realistic "mined later" fork).
@@ -204,7 +238,11 @@ fn reorg_restores_utxo_exactly() {
     let mut f_blocks = Vec::new();
     for i in 0..4u32 {
         ftime += 31;
-        let cb = coinbase_tx(&Keypair::generate().unwrap(), i + 1, chain_a.params.subsidy_start);
+        let cb = coinbase_tx(
+            &Keypair::generate().unwrap(),
+            i + 1,
+            chain_a.params.subsidy_start,
+        );
         let blk = build_block(&fh, vec![cb], ftime, &chain_a.params);
         fh = blk.header;
         f_blocks.push(blk);
@@ -230,6 +268,14 @@ fn reorg_restores_utxo_exactly() {
     // never connected... wait — a-branch WAS connected then disconnected;
     // its coinbases must be gone from utxo set).
     let a3_cb_txid = a_blocks[2].txs[0].txid();
-    assert!(chain_a.utxos.get(&OutPoint { txid: a3_cb_txid, vout: 0 }).is_none(),
-        "disconnected branch coinbase still in UTXO set");
+    assert!(
+        chain_a
+            .utxos
+            .get(&OutPoint {
+                txid: a3_cb_txid,
+                vout: 0
+            })
+            .is_none(),
+        "disconnected branch coinbase still in UTXO set"
+    );
 }

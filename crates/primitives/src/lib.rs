@@ -13,10 +13,10 @@ pub mod ser;
 pub mod tx;
 
 pub use block::{
-    check_merkle_root, merkle_root, merkle_root_from_txids, Block, BlockHeader, MerkleError,
-    MAX_BLOCK_SIZE, MAX_BLOCK_TXS,
+    Block, BlockHeader, MAX_BLOCK_SIZE, MAX_BLOCK_TXS, MerkleError, check_merkle_root, merkle_root,
+    merkle_root_from_txids,
 };
 pub use de::{ReadError, Reader};
 pub use money::{MoneyError, Sats};
 pub use ser::Writer;
-pub use tx::{OutPoint, Transaction, TxInput, TxOutput, MAX_TX_IO, MAX_TX_SIZE};
+pub use tx::{MAX_TX_IO, MAX_TX_SIZE, OutPoint, Transaction, TxInput, TxOutput};

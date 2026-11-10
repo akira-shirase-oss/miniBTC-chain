@@ -16,9 +16,9 @@ pub mod subsidy;
 pub mod txval;
 
 pub use blockval::{
-    median_time_past, validate_block, validate_block_with_time, BlockError, BlockValidation,
+    BlockError, BlockValidation, median_time_past, validate_block, validate_block_with_time,
 };
 pub use params::{ChainParams, ParamsError};
-pub use pow::{decode_compact, encode_compact, retarget_bits, target_for_bits, PowError};
-pub use subsidy::{max_coinbase_value, subsidy_at, SubsidyError};
-pub use txval::{validate_tx, TxError, UtxoView};
+pub use pow::{PowError, decode_compact, encode_compact, retarget_bits, target_for_bits};
+pub use subsidy::{SubsidyError, max_coinbase_value, subsidy_at};
+pub use txval::{TxError, UtxoView, validate_tx};

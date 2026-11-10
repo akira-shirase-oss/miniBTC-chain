@@ -173,9 +173,7 @@ impl ChainParams {
             || self.max_block_txs == 0
             || self.max_block_size == 0
         {
-            return Err(ParamsError::Invalid(
-                "zero-valued interval/size parameter",
-            ));
+            return Err(ParamsError::Invalid("zero-valued interval/size parameter"));
         }
         if self.subsidy_start > self.max_money {
             return Err(ParamsError::Invalid("subsidy exceeds max_money"));

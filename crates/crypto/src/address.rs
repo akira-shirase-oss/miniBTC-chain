@@ -11,7 +11,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 use std::str::FromStr;
 
-use crate::hash::{double_sha256, Hash160};
+use crate::hash::{Hash160, double_sha256};
 
 /// Errors decoding an address string.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

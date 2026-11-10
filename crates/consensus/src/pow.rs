@@ -38,7 +38,10 @@ pub fn decode_compact(bits: u32) -> Result<[u8; 32], PowError> {
         if shift >= 32 {
             return Ok(out); // target underflows to zero — invalid for PoW
         }
-        #[allow(clippy::cast_possible_truncation, reason = "shift < 32 checked above; value fits u32")]
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "shift < 32 checked above; value fits u32"
+        )]
         let v = mantissa >> shift;
         out[28] = (v >> 24) as u8;
         out[29] = (v >> 16) as u8;
@@ -366,7 +369,10 @@ mod tests {
         // Easier target (bigger) → less work. powLimit-ish vs tighter.
         let easy = work_units(0x207f_ffff).unwrap();
         let harder = work_units(0x1d00_ffff).unwrap();
-        assert!(easy < harder, "easier target must mean less work: {easy} vs {harder}");
+        assert!(
+            easy < harder,
+            "easier target must mean less work: {easy} vs {harder}"
+        );
         // Same bits → same work.
         assert_eq!(work_units(0x207f_ffff).unwrap(), easy);
     }

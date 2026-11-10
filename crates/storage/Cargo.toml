@@ -10,6 +10,9 @@ description = "MiniBTC durable storage: redb-backed block store, UTXO set and in
 [dependencies]
 minibtc-crypto = { path = "../crypto" }
 minibtc-primitives = { path = "../primitives" }
+minibtc-chainstate = { path = "../chainstate" }
+minibtc-consensus = { path = "../consensus" }
+minibtc-script = { path = "../script" }
 redb.workspace = true
 serde.workspace = true
 thiserror.workspace = true
@@ -17,3 +20,6 @@ tracing.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

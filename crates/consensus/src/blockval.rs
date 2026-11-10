@@ -3,12 +3,12 @@
 //! structural checks (decode, merkle, PoW) — ordered cheapest-first.
 
 use minibtc_crypto::Hash256;
-use minibtc_primitives::{check_merkle_root, Block, BlockHeader, MerkleError, Sats};
+use minibtc_primitives::{Block, BlockHeader, MerkleError, Sats, check_merkle_root};
 
 use crate::params::ChainParams;
 use crate::pow::{self, PowError};
 use crate::subsidy::{self, SubsidyError};
-use crate::txval::{validate_tx, TxError, UtxoView};
+use crate::txval::{TxError, UtxoView, validate_tx};
 
 /// Why a block was rejected.
 #[derive(Debug, thiserror::Error)]
@@ -150,7 +150,9 @@ pub fn validate_block_with_time<V: UtxoView>(
             index: i,
             source: e,
         })?;
-        total_fees = total_fees.checked_add(fee).ok_or(BlockError::Limits("fee overflow"))?;
+        total_fees = total_fees
+            .checked_add(fee)
+            .ok_or(BlockError::Limits("fee overflow"))?;
         sigops = sigops.saturating_add(count_sigops(tx));
     }
     if sigops > params.max_block_sigops {
@@ -185,10 +187,7 @@ pub fn validate_block_with_time<V: UtxoView>(
         }
     }
 
-    Ok(BlockValidation {
-        total_fees,
-        sigops,
-    })
+    Ok(BlockValidation { total_fees, sigops })
 }
 
 /// Count sigops in a tx — our script subset has exactly one sigop per
@@ -201,7 +200,12 @@ pub fn validate_block_with_time<V: UtxoView>(
 fn count_sigops(tx: &minibtc_primitives::Transaction) -> usize {
     tx.outputs
         .iter()
-        .map(|o| o.script_pubkey.iter().filter(|&&b| b == minibtc_script::OP_CHECKSIG).count())
+        .map(|o| {
+            o.script_pubkey
+                .iter()
+                .filter(|&&b| b == minibtc_script::OP_CHECKSIG)
+                .count()
+        })
         .sum()
 }
 

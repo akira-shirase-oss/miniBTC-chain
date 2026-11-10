@@ -12,7 +12,6 @@ minibtc-crypto = { path = "../crypto" }
 minibtc-primitives = { path = "../primitives" }
 minibtc-script = { path = "../script" }
 minibtc-consensus = { path = "../consensus" }
-minibtc-storage = { path = "../storage" }
 thiserror.workspace = true
 serde.workspace = true
 indexmap = "2"

@@ -109,7 +109,9 @@ pub fn validate_tx<V: UtxoView>(
     let mut prevouts: Vec<minibtc_primitives::TxOutput> = Vec::with_capacity(tx.inputs.len());
     for (i, inp) in tx.inputs.iter().enumerate() {
         let prev = view.get(&inp.prev).ok_or(TxError::MissingInput(inp.prev))?;
-        in_sum = in_sum.checked_add(prev.value).ok_or(TxError::ValueOverflow)?;
+        in_sum = in_sum
+            .checked_add(prev.value)
+            .ok_or(TxError::ValueOverflow)?;
         // scriptSig + prevout scriptPubKey must evaluate true.
         let ctx = ExecContext {
             tx,
@@ -144,10 +146,10 @@ pub fn validate_tx<V: UtxoView>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use minibtc_crypto::Keypair;
     use minibtc_crypto::Hash256;
+    use minibtc_crypto::Keypair;
     use minibtc_primitives::{OutPoint, Transaction, TxInput, TxOutput};
-    use minibtc_script::{sighash, Script};
+    use minibtc_script::{Script, sighash};
     use std::collections::HashMap;
 
     struct MapView(HashMap<OutPoint, minibtc_primitives::TxOutput>);
@@ -206,7 +208,15 @@ mod tests {
         let p = ChainParams::devnet();
         let kp = Keypair::generate().unwrap();
         let view = MapView(HashMap::new());
-        let tx = signed_spend(&kp, OutPoint { txid: Hash256([1; 32]), vout: 0 }, &[0x51], 1);
+        let tx = signed_spend(
+            &kp,
+            OutPoint {
+                txid: Hash256([1; 32]),
+                vout: 0,
+            },
+            &[0x51],
+            1,
+        );
         assert!(matches!(
             validate_tx(&tx, &view, &p),
             Err(TxError::MissingInput(_))
@@ -221,7 +231,12 @@ mod tests {
         let mut map = HashMap::new();
         map.insert(op, out);
         let view = MapView(map);
-        let mut tx = signed_spend(&kp, op, &Script::p2pkh(&kp.public_key().key_hash()).0, 5_000);
+        let mut tx = signed_spend(
+            &kp,
+            op,
+            &Script::p2pkh(&kp.public_key().key_hash()).0,
+            5_000,
+        );
         // Duplicate the input — same outpoint twice.
         tx.inputs.push(tx.inputs[0].clone());
         assert!(matches!(

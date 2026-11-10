@@ -7,7 +7,7 @@
 //! strict: non-canonical CompactSize, trailing bytes, and oversized vectors
 //! are all errors (see [`crate::de`]).
 
-use minibtc_crypto::{double_sha256, Hash256};
+use minibtc_crypto::{Hash256, double_sha256};
 use serde::{Deserialize, Serialize};
 
 use crate::de::{ReadError, Reader};
@@ -125,7 +125,10 @@ impl std::fmt::Debug for TxOutput {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TxOutput")
             .field("value", &self.value)
-            .field("script_pubkey", &crate::tx::hex::encode_hex(&self.script_pubkey))
+            .field(
+                "script_pubkey",
+                &crate::tx::hex::encode_hex(&self.script_pubkey),
+            )
             .finish()
     }
 }

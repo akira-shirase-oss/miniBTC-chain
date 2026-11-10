@@ -16,13 +16,13 @@
 use getrandom::SysRng;
 use k256::ecdsa::signature::hazmat::{PrehashSigner, PrehashVerifier};
 use k256::ecdsa::{Signature as EcdsaSignature, SigningKey, VerifyingKey};
-use k256::elliptic_curve::scalar::IsHigh;
 use k256::elliptic_curve::Generate;
+use k256::elliptic_curve::scalar::IsHigh;
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 
-use crate::hash::{hex_decode, hex_encode, Hash256};
+use crate::hash::{Hash256, hex_decode, hex_encode};
 
 /// Errors from key/signature operations.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -104,11 +104,9 @@ impl Keypair {
     /// Sign a 32-byte sighash digest. RFC 6979 deterministic nonce; the
     /// returned signature is normalized to low-S before storage.
     pub fn sign_digest(&self, digest: &Hash256) -> Result<Signature, KeyError> {
-        let sig: EcdsaSignature = PrehashSigner::<EcdsaSignature>::sign_prehash(
-            &self.signing,
-            digest.as_bytes(),
-        )
-        .map_err(|_| KeyError::SignFailed)?;
+        let sig: EcdsaSignature =
+            PrehashSigner::<EcdsaSignature>::sign_prehash(&self.signing, digest.as_bytes())
+                .map_err(|_| KeyError::SignFailed)?;
         Signature::from_ecdsa(sig.normalize_s())
     }
 }
@@ -122,7 +120,11 @@ pub struct PublicKey {
 impl fmt::Debug for PublicKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let bytes = self.to_sec1_bytes();
-        write!(f, "PublicKey({}…)", hex_encode(&bytes[..4.min(bytes.len())]))
+        write!(
+            f,
+            "PublicKey({}…)",
+            hex_encode(&bytes[..4.min(bytes.len())])
+        )
     }
 }
 
@@ -168,7 +170,11 @@ pub struct Signature {
 impl fmt::Debug for Signature {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let der = self.to_der();
-        write!(f, "Signature({}…)", &hex_encode(&der)[..16.min(der.len() * 2)])
+        write!(
+            f,
+            "Signature({}…)",
+            &hex_encode(&der)[..16.min(der.len() * 2)]
+        )
     }
 }
 
@@ -184,8 +190,7 @@ impl Signature {
     /// bytes, non-minimal INTEGERs, and high-S values are all rejected —
     /// the malleability surface stays closed.
     pub fn from_der(bytes: &[u8]) -> Result<Self, KeyError> {
-        let sig =
-            EcdsaSignature::from_der(bytes).map_err(|e| KeyError::BadDer(e.to_string()))?;
+        let sig = EcdsaSignature::from_der(bytes).map_err(|e| KeyError::BadDer(e.to_string()))?;
         Self::from_ecdsa(sig)
     }
 
@@ -211,8 +216,7 @@ impl Signature {
         }
         let mut arr = [0u8; 64];
         arr.copy_from_slice(bytes);
-        let sig = EcdsaSignature::from_slice(&arr)
-            .map_err(|e| KeyError::BadDer(e.to_string()))?;
+        let sig = EcdsaSignature::from_slice(&arr).map_err(|e| KeyError::BadDer(e.to_string()))?;
         Self::from_ecdsa(sig)
     }
 }
@@ -312,9 +316,9 @@ mod tests {
 
     /// secp256k1 group order n, as 32 big-endian bytes.
     const CURVE_ORDER: [u8; 32] = [
-        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-        0xff, 0xfe, 0xba, 0xae, 0xdc, 0xe6, 0xaf, 0x48, 0xa0, 0x3b, 0xbf, 0xd2, 0x5e, 0x8c,
-        0xd0, 0x36, 0x41, 0x41,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xfe, 0xba, 0xae, 0xdc, 0xe6, 0xaf, 0x48, 0xa0, 0x3b, 0xbf, 0xd2, 0x5e, 0x8c, 0xd0, 0x36,
+        0x41, 0x41,
     ];
 
     /// `a - b` on 32-byte big-endian integers (a ≥ b). Test-only helper.
@@ -374,10 +378,7 @@ mod tests {
         // The malleated twin: s' = n - s_low is always > n/2 → must be rejected.
         let s_high = sub_be(&CURVE_ORDER, &s_low);
         let forged = der_encode_sig(&r, &s_high);
-        assert!(matches!(
-            Signature::from_der(&forged),
-            Err(KeyError::HighS)
-        ));
+        assert!(matches!(Signature::from_der(&forged), Err(KeyError::HighS)));
         // Sanity: the low-S original parses and verifies.
         assert!(kp.public_key().verify_digest(&digest, &sig));
     }
@@ -390,12 +391,13 @@ mod tests {
         assert!(Signature::from_der(&der[..der.len() - 1]).is_err());
         let mut padded = der.clone();
         padded.push(0x00);
-        assert!(Signature::from_der(&padded).is_err(), "trailing bytes must fail");
+        assert!(
+            Signature::from_der(&padded).is_err(),
+            "trailing bytes must fail"
+        );
         // Non-minimal INTEGER encoding (unnecessary leading zero) — strict
         // DER must reject it even though the scalars are in range.
-        let non_minimal = [
-            0x30, 0x08, 0x02, 0x02, 0x00, 0x01, 0x02, 0x02, 0x00, 0x01,
-        ];
+        let non_minimal = [0x30, 0x08, 0x02, 0x02, 0x00, 0x01, 0x02, 0x02, 0x00, 0x01];
         assert!(Signature::from_der(&non_minimal).is_err());
         assert!(Signature::from_der(b"").is_err());
     }

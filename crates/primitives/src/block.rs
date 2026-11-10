@@ -7,7 +7,7 @@
 //! hash to the same root (CVE-2012-2459). We detect that case explicitly
 //! and reject the block rather than picking a winner arbitrarily.
 
-use minibtc_crypto::{double_sha256, Hash256};
+use minibtc_crypto::{Hash256, double_sha256};
 use serde::{Deserialize, Serialize};
 
 use crate::de::{ReadError, Reader};

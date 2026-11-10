@@ -113,7 +113,11 @@ macro_rules! hash_newtype {
 
         impl fmt::Debug for $name {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                write!(f, concat!(stringify!($name), "({}…)"), &self.to_hex()[..16.min($len * 2)])
+                write!(
+                    f,
+                    concat!(stringify!($name), "({}…)"),
+                    &self.to_hex()[..16.min($len * 2)]
+                )
             }
         }
 
@@ -230,6 +234,9 @@ mod tests {
         let mut b = Hash256::ZERO;
         a.0[31] = 1;
         b.0[0] = 1;
-        assert!(b > a, "a hash with a high first byte must exceed one with only the last set");
+        assert!(
+            b > a,
+            "a hash with a high first byte must exceed one with only the last set"
+        );
     }
 }

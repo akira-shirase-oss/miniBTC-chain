@@ -12,6 +12,7 @@ minibtc-crypto = { path = "../crypto" }
 minibtc-primitives = { path = "../primitives" }
 minibtc-consensus = { path = "../consensus" }
 minibtc-mempool = { path = "../mempool" }
+minibtc-script = { path = "../script" }
 thiserror.workspace = true
 serde.workspace = true
 tracing.workspace = true

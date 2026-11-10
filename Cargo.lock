@@ -1025,7 +1025,6 @@ dependencies = [
  "minibtc-crypto",
  "minibtc-primitives",
  "minibtc-script",
- "minibtc-storage",
  "serde",
  "thiserror",
 ]
@@ -1130,6 +1129,7 @@ dependencies = [
  "minibtc-crypto",
  "minibtc-mempool",
  "minibtc-primitives",
+ "minibtc-script",
  "serde",
  "thiserror",
  "tracing",
@@ -1220,10 +1220,14 @@ dependencies = [
 name = "minibtc-storage"
 version = "0.1.0"
 dependencies = [
+ "minibtc-chainstate",
+ "minibtc-consensus",
  "minibtc-crypto",
  "minibtc-primitives",
+ "minibtc-script",
  "redb",
  "serde",
+ "tempfile",
  "thiserror",
  "tracing",
 ]

@@ -17,7 +17,7 @@
 //! [`MAX_SCRIPT_SIZE`] bytes per script, [`MAX_OPS_PER_SCRIPT`] non-push
 //! opcodes, [`MAX_STACK_SIZE`] stack elements, [`MAX_PUSH_SIZE`] per push.
 
-use minibtc_crypto::{double_sha256, hash160, Hash256, KeyError, PublicKey, Signature};
+use minibtc_crypto::{Hash256, KeyError, PublicKey, Signature, double_sha256, hash160};
 use minibtc_primitives::Transaction;
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -223,7 +223,10 @@ impl<'a> Vm<'a> {
     }
 
     fn top(&self) -> Result<&[u8], ScriptError> {
-        self.stack.last().map(Vec::as_slice).ok_or(ScriptError::Underflow)
+        self.stack
+            .last()
+            .map(Vec::as_slice)
+            .ok_or(ScriptError::Underflow)
     }
 
     fn cast_bool(b: &[u8]) -> bool {
@@ -337,13 +340,14 @@ impl<'a> Vm<'a> {
         let der = &sig_item[..sig_item.len() - 1];
         let pubkey = PublicKey::from_sec1_bytes(&pubkey_bytes)
             .map_err(|e| ScriptError::SigCheck(format!("pubkey: {e}")))?;
-        let sig = Signature::from_der(der)
-            .map_err(|e| ScriptError::SigCheck(format!("sig: {e}")))?;
+        let sig =
+            Signature::from_der(der).map_err(|e| ScriptError::SigCheck(format!("sig: {e}")))?;
         if hashtype != SIGHASH_ALL {
             self.push(Vec::new())?;
             return Ok(());
         }
-        let digest = sighash::signature_hash(self.ctx.tx, self.ctx.input_index, self.ctx.script_code);
+        let digest =
+            sighash::signature_hash(self.ctx.tx, self.ctx.input_index, self.ctx.script_code);
         let ok = pubkey.verify_digest(&digest, &sig);
         self.push(if ok { vec![1] } else { Vec::new() })?;
         Ok(())
@@ -383,7 +387,8 @@ fn read_push_len(script: &[u8], pc: usize, op: u8) -> Result<(usize, usize), Scr
             if pc.saturating_add(4) > script.len() {
                 return Err(ScriptError::Malformed("pushdata4 truncated"));
             }
-            let n = u32::from_le_bytes([script[pc], script[pc + 1], script[pc + 2], script[pc + 3]]);
+            let n =
+                u32::from_le_bytes([script[pc], script[pc + 1], script[pc + 2], script[pc + 3]]);
             // A u32 can exceed usize on 16-bit targets; on 64-bit it's fine,
             // and MAX_PUSH_SIZE rejects anything huge right after anyway.
             Ok((n as usize, 4))

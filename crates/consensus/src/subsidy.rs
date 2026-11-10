@@ -36,7 +36,9 @@ pub fn max_coinbase_value(
     height: u64,
     fees: Sats,
 ) -> Result<Sats, SubsidyError> {
-    subsidy_at(params, height)?.checked_add(fees).ok_or(SubsidyError::Overflow)
+    subsidy_at(params, height)?
+        .checked_add(fees)
+        .ok_or(SubsidyError::Overflow)
 }
 
 #[cfg(test)]
@@ -49,7 +51,10 @@ mod tests {
         assert_eq!(subsidy_at(&p, 0).unwrap(), Sats(50 * 100_000_000));
         assert_eq!(subsidy_at(&p, 149).unwrap(), Sats(50 * 100_000_000));
         assert_eq!(subsidy_at(&p, 150).unwrap(), Sats(25 * 100_000_000));
-        assert_eq!(subsidy_at(&p, 300).unwrap(), Sats(12 * 100_000_000 + 50_000_000));
+        assert_eq!(
+            subsidy_at(&p, 300).unwrap(),
+            Sats(12 * 100_000_000 + 50_000_000)
+        );
         assert_eq!(subsidy_at(&p, 100_000).unwrap(), Sats::ZERO);
     }
 
