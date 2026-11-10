@@ -95,9 +95,42 @@ User-directed scope addition after P12 close-out. Two parts:
    (never persisted, never logged), per-session CSRF tokens on every
    POST, SameSite=Strict HttpOnly cookies, localhost bind by default,
    audit log with no secrets, and seeds/xprvs/keys can never appear in
-   any response. Wallet create/restore stays CLI-only — the UI manages
-   existing wallets; showing a seed in a browser is exactly the risk
-   the keystore exists to prevent.
+   any response. **Amended (user request):** wallet create and restore
+   are now UI flows too — but with the same discipline the CLI uses:
+   create is two-step (generate → seed shown ONCE behind an explicit
+   "I saved it" gate → only then encrypt+save+unlock; the pending seed
+   lives in a `Zeroizing` buffer with a 10-min TTL and writes nothing
+   if abandoned), restore validates the mnemonic checksum then takes
+   the identical encrypt+save+session path. The passphrase is asked
+   twice during create (once to stage, once at the confirm gate) and
+   is never stored.
+
+### D-012 — Seed entropy source (Coldcard-class hardening)
+
+`generate_mnemonic` delegates to the `bip39` crate, which draws
+entropy from `rand_core`'s OS CSPRNG (`getrandom` → OS entropy pool).
+That is the correct source — the Nov-2025 Coldcard disclosure (~1,816
+BTC stolen; TRM Labs) was a *build-config* failure: a weak software
+RNG path produced seeds with ~40 effective bits on older devices. The
+encoding (128-bit BIP39 words) looked wide while the source was
+narrow — silent entropy deficit.
+
+MiniBTC's posture:
+
+- Entropy comes only from the OS CSPRNG — never a seeded PRNG, never
+  time/PID mixing.
+- `tests/attacks/tests/wallet_entropy.rs` proves both directions:
+  a simulated 32-bit-entropy source produces duplicate mnemonics at
+  the birthday bound (8 collisions in 200k draws), while 8,192 real
+  generated mnemonics are all unique with an unbiased first-word
+  distribution.
+- Honest limit, recorded: ~8k samples cannot distinguish 128-bit
+  from ~40-bit entropy — that needs ~2^20 draws. The defense is the
+  dependency choice itself, plus `cargo audit`/`cargo deny` in the
+  verification chain for supply-chain drift.
+- `mnemonic_from_entropy` exists as a legitimate restore path and as
+  the attack lab's simulation hook — it performs only the spec'd
+  encoding and does not assess entropy quality.
 
 ## Open questions
 

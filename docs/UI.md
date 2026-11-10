@@ -30,8 +30,8 @@ always escaped before rendering.
 
 ## Wallet UI (`minibtc-wallet-ui`)
 
-Default bind `127.0.0.1:18448`. Wallet create/restore stays CLI-only —
-the UI manages existing `<datadir>/wallets/*.wallet` files.
+Default bind `127.0.0.1:18448`. Manages `<datadir>/wallets/*.wallet`
+files; create/restore are UI flows (see below).
 
 ### Session model
 
@@ -65,15 +65,34 @@ the UI manages existing `<datadir>/wallets/*.wallet` files.
 4. `POST /wallet/send/confirm` → CSRF check → `sendrawtransaction` →
    result page. Pending draft is consumed either way.
 
-### Other routes
+### Wallet lifecycle (create / restore / unlock)
 
-- `GET /wallet` — dashboard: mature/immature balance, indices, UTXO
-  table (txid, vout, value, confirmations, coinbase/immature flags),
-  recent addresses, actions (new address, send, lock). Rescans on load.
-- `GET /wallet/addresses` — all issued receive addresses.
-- `POST /wallet/address/new` — fresh receive address; indices
-  persisted to `<name>.state.json`.
-- `GET /healthz`.
+- `GET /` — landing: unlock form + links to create/restore; bounces
+  to `/wallet` when a live session exists.
+- `GET /new` → `POST /new` (name, passphrase ×2) → generates a
+  12-word mnemonic, stages a `PendingCreate` (seed+phrase in
+  `Zeroizing`, 10-min TTL, cap 8) → `GET /seed?t=` shows the phrase
+  **once** with an explicit backup gate.
+- `POST /seed/confirm` requires passphrase (re-asked) + `saved=yes`
+  checkbox → only then `Keystore::encrypt` (0600) + `state.json` +
+  session + redirect `/wallet`. `POST /seed/cancel` abandons —
+  nothing is written.
+- `GET /restore` → `POST /restore` (name, phrase, passphrase) →
+  mnemonic checksum-validated → same encrypt+save+session path.
+  Verified: restoring a phrase derives the identical first address.
+- `POST /unlock` — existing wallets (rate-limited, audited).
+
+### Authed pages
+
+- `GET /wallet` — dashboard: confirmed/immature balance hero, action
+  bar (receive/send/addresses/activity), latest receive address, UTXO
+  table. Rescans on every load.
+- `GET /wallet/receive` — address front-and-center + new-address
+  action. `GET /wallet/addresses` — all issued receive addresses.
+- `GET /wallet/activity` — balance stats + UTXO list.
+- `GET /wallet/send` → `POST /wallet/send` → `GET /wallet/review` →
+  `POST /wallet/send/confirm` (broadcast) / `POST /wallet/send/cancel`.
+- `POST /wallet/address/new`, `POST /wallet/lock`, `GET /healthz`.
 
 ### Audit
 
@@ -84,7 +103,11 @@ the UI manages existing `<datadir>/wallets/*.wallet` files.
 
 ## Live verification (this machine, devnet)
 
-- Unlock `webtest` → dashboard showed 150 BTC mature / 500 BTC immature.
+- Create `webui2` via UI → seed shown once → confirm gate → keystore
+  0600 + session; restore `webui2b` from the same phrase derived the
+  identical first address `mwqgJfaQ…`; funded 2 BTC via CLI →
+  dashboard showed 2.00000000 BTC / 1 UTXO. Earlier: unlock `webtest`
+  → 150 BTC mature.
 - Send 5 BTC → review (fee 1 sat, 1 input, txid `30d1d5de…facd`) →
   confirm → mempool → **confirmed in block** (`confirmations: 1`).
 - Negative paths verified: wrong CSRF → mutation rejected; wrong

@@ -18,9 +18,11 @@ minibtc-mempool = { path = "../../crates/mempool" }
 minibtc-p2p = { path = "../../crates/p2p" }
 minibtc-miner = { path = "../../crates/miner" }
 minibtc-wallet = { path = "../../crates/wallet" }
+bip39.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tempfile.workspace = true

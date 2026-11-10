@@ -1,7 +1,7 @@
 # MiniBTC
 
 > **Status — complete + UI expansion (P13).** All phases P0–P12 per
-> `docs/ROADMAP.md` are built and verified: 15/15 attack scenarios, ~26M fuzz
+> `docs/ROADMAP.md` are built and verified: 15/15 blueprint attack scenarios + wallet-entropy hardening tests, ~26M fuzz
 > executions with zero crashes, 9/9 property invariants, 6M load ops all
 > passing, and a 17/17-phase three-node devnet demo (fork reorg + two-wallet
 > payment). P13 adds the enriched read-only explorer (search, pagination,
@@ -39,7 +39,7 @@ wins unless a `D-NNN` in `docs/DECISIONS.md` says otherwise.
 | `apps/minibtc-explorer` | Read-only web explorer (search, pagination, dashboard) |
 | `apps/minibtc-wallet-ui` | Local web wallet: unlock sessions, send flow, audit (D-011) |
 | `apps/minibtc-mcp` | MCP server for AI assistants |
-| `tests/attacks` | The attack lab — one test per historic bug/attack |
+| `tests/attacks` | The attack lab — one test per historic bug/attack (+ wallet-entropy suite) |
 | `perf/` | Load scenarios and committed results (machine + commit) |
 
 ## What counts as done

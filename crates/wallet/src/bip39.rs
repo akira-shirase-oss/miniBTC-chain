@@ -62,6 +62,20 @@ pub fn generate_mnemonic() -> Result<Mnemonic, Bip39Error> {
     })
 }
 
+/// Build a mnemonic from raw BIP39 entropy (16/20/24/28/32 bytes).
+///
+/// Legitimate use: restoring from an entropy backup. Also used by the
+/// attack lab to simulate weak-entropy sources (the Coldcard-class
+/// failure: a PRNG with far fewer effective bits than the encoding
+/// implies). The entropy slice's *actual* unpredictability is the
+/// caller's responsibility — this function only performs the spec'd
+/// entropy→words+checksum encoding.
+pub fn mnemonic_from_entropy(entropy: &[u8]) -> Result<Mnemonic, Bip39Error> {
+    Ok(Mnemonic {
+        inner: Bip39Mnemonic::from_entropy_in(Language::English, entropy)?,
+    })
+}
+
 /// Parse + validate a mnemonic phrase (checksum enforced).
 pub fn mnemonic_from_phrase(phrase: &str) -> Result<Mnemonic, Bip39Error> {
     Ok(Mnemonic {
@@ -97,6 +111,21 @@ mod tests {
         assert_eq!(seed1, seed2, "PBKDF2 is deterministic");
         // Different passphrase → different seed.
         assert_ne!(seed1, m.to_seed("different"));
+    }
+
+    #[test]
+    fn entropy_roundtrip_encodes_valid_mnemonic() {
+        // 16 bytes → 12 words; deterministic and checksum-valid.
+        let entropy = [0x42u8; 16];
+        let m = mnemonic_from_entropy(&entropy).unwrap_or_else(|_| panic!());
+        assert_eq!(m.word_count(), 12);
+        let phrase = m.phrase();
+        // Re-parse must succeed (checksum intact).
+        let m2 = mnemonic_from_phrase(&phrase).unwrap_or_else(|_| panic!());
+        assert_eq!(m2.phrase(), phrase);
+        // Different entropy → different phrase.
+        let other = mnemonic_from_entropy(&[0x43u8; 16]).unwrap_or_else(|_| panic!());
+        assert_ne!(other.phrase(), phrase);
     }
 
     #[test]

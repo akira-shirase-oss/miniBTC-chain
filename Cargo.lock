@@ -1235,6 +1235,7 @@ name = "minibtc-attacks"
 version = "0.1.0"
 dependencies = [
  "assert_cmd",
+ "bip39",
  "minibtc-chainstate",
  "minibtc-consensus",
  "minibtc-crypto",
@@ -1249,6 +1250,7 @@ dependencies = [
  "proptest",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror",
  "tokio",
@@ -1546,6 +1548,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]
