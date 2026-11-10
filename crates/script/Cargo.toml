@@ -1,0 +1,17 @@
+[package]
+name = "minibtc-script"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "MiniBTC script engine: a bounded stack machine with P2PKH and sighash."
+
+[dependencies]
+minibtc-crypto = { path = "../crypto" }
+minibtc-primitives = { path = "../primitives" }
+thiserror.workspace = true
+serde.workspace = true
+
+[lints]
+workspace = true

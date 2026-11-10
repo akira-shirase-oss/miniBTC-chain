@@ -1,0 +1,19 @@
+[package]
+name = "minibtc-mempool"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "MiniBTC mempool: fee-rate ordering, policy limits, conflict handling, bounded orphans."
+
+[dependencies]
+minibtc-crypto = { path = "../crypto" }
+minibtc-primitives = { path = "../primitives" }
+minibtc-consensus = { path = "../consensus" }
+thiserror.workspace = true
+serde.workspace = true
+indexmap = "2"
+
+[lints]
+workspace = true

@@ -1,0 +1,16 @@
+[package]
+name = "minibtc-primitives"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "MiniBTC data types: OutPoint, Transaction, Block, canonical serialization."
+
+[dependencies]
+minibtc-crypto = { path = "../crypto" }
+serde.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

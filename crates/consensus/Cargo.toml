@@ -1,0 +1,18 @@
+[package]
+name = "minibtc-consensus"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "MiniBTC consensus rules and chain parameters — pure functions, no I/O, no clocks."
+
+[dependencies]
+minibtc-crypto = { path = "../crypto" }
+minibtc-primitives = { path = "../primitives" }
+minibtc-script = { path = "../script" }
+thiserror.workspace = true
+serde.workspace = true
+
+[lints]
+workspace = true

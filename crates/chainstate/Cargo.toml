@@ -1,0 +1,21 @@
+[package]
+name = "minibtc-chainstate"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "MiniBTC chain state: UTXO set, block index, connect/disconnect, reorgs."
+
+[dependencies]
+minibtc-crypto = { path = "../crypto" }
+minibtc-primitives = { path = "../primitives" }
+minibtc-script = { path = "../script" }
+minibtc-consensus = { path = "../consensus" }
+minibtc-storage = { path = "../storage" }
+thiserror.workspace = true
+serde.workspace = true
+indexmap = "2"
+
+[lints]
+workspace = true

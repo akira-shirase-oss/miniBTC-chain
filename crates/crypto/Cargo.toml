@@ -1,0 +1,21 @@
+[package]
+name = "minibtc-crypto"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "MiniBTC crypto core: hashes, keys, signatures, address encoding. Audited crates only."
+
+[dependencies]
+sha2.workspace = true
+ripemd.workspace = true
+k256.workspace = true
+bs58.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+rand_core = "0.6"
+
+[lints]
+workspace = true

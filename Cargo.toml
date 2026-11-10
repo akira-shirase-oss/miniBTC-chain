@@ -1,0 +1,110 @@
+[workspace]
+members = [
+    "crates/crypto",
+    "crates/primitives",
+    "crates/script",
+    "crates/consensus",
+    "crates/chainstate",
+    "crates/storage",
+    "crates/mempool",
+    "crates/p2p",
+    "crates/miner",
+    "crates/wallet",
+    "crates/rpc",
+    "apps/minibtc-node",
+    "apps/minibtc-cli",
+    "apps/minibtc-explorer",
+    "apps/minibtc-mcp",
+    "tests/attacks",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.96"
+license = "Apache-2.0 OR MIT"
+publish = false
+
+[workspace.dependencies]
+# --- async / networking ---
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync", "io-util", "io-std"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+futures = "0.3"
+# --- http ---
+axum = "0.8"
+tower = "0.5"
+tower-http = { version = "0.7", features = ["trace", "timeout", "limit", "catch-panic"] }
+# --- serialization / errors / logging ---
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# --- crypto (audited; never hand-rolled) ---
+sha2 = "0.11"
+ripemd = "0.2"
+k256 = { version = "0.14", features = ["ecdsa", "sha256"] }
+hmac = "0.13"
+pbkdf2 = "0.13"
+bip39 = { version = "3", default-features = false, features = ["std", "rand_core", "zeroize"] }
+bs58 = "0.5"
+hex = "0.4"
+secrecy = "0.10"
+zeroize = "1"
+# --- storage ---
+redb = "4"
+# --- cli ---
+clap = { version = "4", features = ["derive"] }
+# --- mcp ---
+rmcp = { version = "3", features = ["server", "transport-async-rw", "macros"] }
+# --- testing ---
+proptest = "1"
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+unused_must_use = "deny"
+rust_2018_idioms = { level = "warn", priority = -1 }
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+module_name_repetitions = "allow"
+dbg_macro = "deny"
+todo = "deny"
+unwrap_used = "warn"
+expect_used = "warn"
+undocumented_unsafe_blocks = "deny"
+arithmetic_side_effects = "warn"
+allow_attributes_without_reason = "warn"
+
+[workspace.lints.rustdoc]
+broken_intra_doc_links = "deny"
+private_intra_doc_links = "deny"
+bare_urls = "deny"
+
+[profile.dev]
+opt-level = 0
+debug = true
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = "line-tables-only"
+panic = "unwind"
+
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = "none"

@@ -1,0 +1,19 @@
+[package]
+name = "minibtc-storage"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "MiniBTC durable storage: redb-backed block store, UTXO set and indexes with crash safety."
+
+[dependencies]
+minibtc-crypto = { path = "../crypto" }
+minibtc-primitives = { path = "../primitives" }
+redb.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

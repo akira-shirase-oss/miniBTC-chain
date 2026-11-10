@@ -1,0 +1,33 @@
+[package]
+name = "minibtc-node"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "MiniBTC full node daemon: validates, stores, serves RPC, mines, and peers."
+
+[dependencies]
+minibtc-crypto = { path = "../../crates/crypto" }
+minibtc-primitives = { path = "../../crates/primitives" }
+minibtc-script = { path = "../../crates/script" }
+minibtc-consensus = { path = "../../crates/consensus" }
+minibtc-chainstate = { path = "../../crates/chainstate" }
+minibtc-storage = { path = "../../crates/storage" }
+minibtc-mempool = { path = "../../crates/mempool" }
+minibtc-p2p = { path = "../../crates/p2p" }
+minibtc-miner = { path = "../../crates/miner" }
+minibtc-wallet = { path = "../../crates/wallet" }
+minibtc-rpc = { path = "../../crates/rpc" }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+futures.workspace = true
+
+[lints]
+workspace = true
