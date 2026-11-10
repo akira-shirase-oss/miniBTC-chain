@@ -1,0 +1,47 @@
+[package]
+name = "minibtc-attacks-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+minibtc-primitives = { path = "../../../crates/primitives" }
+minibtc-p2p = { path = "../../../crates/p2p" }
+minibtc-script = { path = "../../../crates/script" }
+minibtc-consensus = { path = "../../../crates/consensus" }
+minibtc-crypto = { path = "../../../crates/crypto" }
+
+# Detach from the parent workspace — fuzz targets build under nightly.
+[workspace]
+
+[[bin]]
+name = "tx_decode"
+path = "fuzz_targets/tx_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "block_decode"
+path = "fuzz_targets/block_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wire_payload"
+path = "fuzz_targets/wire_payload.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "script_exec"
+path = "fuzz_targets/script_exec.rs"
+test = false
+doc = false
+bench = false

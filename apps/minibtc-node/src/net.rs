@@ -30,6 +30,10 @@ const STALL_TIMEOUT: Duration = Duration::from_secs(120);
 const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 /// Redial interval for the address book.
 const REDIAL_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Ping interval per session — keeps `last_msg` fresh on idle links so
+/// the 35s read timeout and 120s stall sweep never fire on a live peer.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
 /// Our protocol version (MiniBTC wire version).
 pub const PROTOCOL_VERSION: i32 = 70_015;
 /// User agent string.
@@ -50,6 +54,18 @@ pub async fn run(node: Node, listen: SocketAddr, connect: Vec<SocketAddr>) {
         }
     };
     tracing::info!(%listen, "p2p listening");
+
+    // Seed the addrbook with explicit peers so `redial_addrbook`
+    // retries them after a dropped session — otherwise a --connect
+    // peer that times out is gone until restart.
+    {
+        let mut inner = node.inner.lock().unwrap_or_else(|e| e.into_inner());
+        for addr in &connect {
+            if !inner.addrbook.contains(addr) && inner.addrbook.len() < ADDRBOOK_CAP {
+                inner.addrbook.push(*addr);
+            }
+        }
+    }
 
     // Outbound dials for explicit seeds.
     for addr in connect {
@@ -151,7 +167,7 @@ async fn redial_addrbook(node: &Node) {
             .addrbook
             .iter()
             .copied()
-            .filter(|a| !connected.contains(a))
+            .filter(|a| !connected.contains(a) && !inner.dialing.contains(a))
             .take(4)
             .collect()
     };
@@ -166,21 +182,39 @@ async fn redial_addrbook(node: &Node) {
 /// Outbound dial → session. Admission checks happen before dialing.
 async fn dial_and_session(node: Node, addr: SocketAddr) {
     {
-        let inner = node.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut inner = node.inner.lock().unwrap_or_else(|e| e.into_inner());
         if inner.peers.is_banned(&addr.ip()) {
             return;
         }
+        // One dial per address, end to end: registered peers and
+        // in-flight dials both block a duplicate.
+        if inner.peers.get(&addr).is_some() || !inner.dialing.insert(addr) {
+            return;
+        }
         if let Err(e) = inner.peers.admit(addr, true) {
+            inner.dialing.remove(&addr);
             tracing::debug!(%addr, "dial rejected: {e}");
             return;
         }
     }
     let stream = match timeout(Duration::from_secs(10), TcpStream::connect(addr)).await {
         Ok(Ok(s)) => s,
-        _ => return,
+        _ => {
+            node.inner
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .dialing
+                .remove(&addr);
+            return;
+        }
     };
     let _ = stream.set_nodelay(true);
-    session(node, stream, addr, true).await;
+    session(node.clone(), stream, addr, true).await;
+    node.inner
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .dialing
+        .remove(&addr);
 }
 
 /// Inbound accept path.
@@ -311,14 +345,35 @@ async fn session(node: Node, stream: TcpStream, addr: SocketAddr, outbound: bool
         .insert(addr, tx.clone());
 
     // Writer task owns `wr` (params cloned — reader keeps its own).
+    // Keepalive: ping every KEEPALIVE_INTERVAL of writer-idle time so
+    // quiet sessions stay alive (pong refreshes the peer's last_msg).
     let writer_params = params.clone();
     let writer = tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            if codec::write_message(&mut wr, &msg, &writer_params)
-                .await
-                .is_err()
-            {
-                break;
+        let mut keepalive = tokio::time::interval_at(
+            tokio::time::Instant::now() + KEEPALIVE_INTERVAL,
+            KEEPALIVE_INTERVAL,
+        );
+        let mut nonce: u64 = 1;
+        loop {
+            tokio::select! {
+                msg = rx.recv() => {
+                    let Some(msg) = msg else { break };
+                    if codec::write_message(&mut wr, &msg, &writer_params)
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                _ = keepalive.tick() => {
+                    if codec::write_message(&mut wr, &Message::Ping(nonce), &writer_params)
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    nonce = nonce.wrapping_add(1);
+                }
             }
         }
     });

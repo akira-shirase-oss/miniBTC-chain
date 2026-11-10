@@ -95,6 +95,10 @@ pub struct NodeInner {
     /// Highest block height each peer has claimed (via version or a
     /// headers batch) — drives continued getheaders until caught up.
     pub claimed: HashMap<SocketAddr, u32>,
+    /// Outbound dials in flight (TCP connect → handshake → session end).
+    /// Dedupes redial/--connect races that would otherwise open parallel
+    /// sessions to the same address and burn the per-IP peer budget.
+    pub dialing: HashSet<SocketAddr>,
 }
 
 /// The node handle shared by RPC, P2P sessions and the mining loop.
@@ -166,6 +170,7 @@ pub fn open(datadir: &Path, params: ChainParams, reindex: bool) -> Result<Node, 
         txindex,
         pending: PendingBlocks::default(),
         claimed: HashMap::new(),
+        dialing: HashSet::new(),
     };
     Ok(Node {
         params,
