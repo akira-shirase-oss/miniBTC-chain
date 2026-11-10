@@ -1527,6 +1527,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "minibtc-wallet-ui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "minibtc-chainstate",
+ "minibtc-consensus",
+ "minibtc-crypto",
+ "minibtc-primitives",
+ "minibtc-rpc",
+ "minibtc-script",
+ "minibtc-wallet",
+ "rand 0.10.3",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "mio"
 version = "1.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

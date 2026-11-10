@@ -6,12 +6,13 @@
 
 use anyhow::{Context, Result};
 use axum::Router;
-use axum::extract::{Path as AxumPath, State};
-use axum::response::Html;
+use axum::extract::{Path as AxumPath, Query, State};
+use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::get;
 use clap::Parser;
 use minibtc_rpc::client::RpcClient;
 use serde_json::Value;
+use std::collections::HashMap;
 
 /// MiniBTC block explorer (read-only).
 #[derive(Parser, Debug)]
@@ -50,6 +51,7 @@ async fn main() -> Result<()> {
         .route("/tx/{txid}", get(tx_page))
         .route("/address/{addr}", get(address_page))
         .route("/mempool", get(mempool_page))
+        .route("/search", get(search_page))
         .route("/healthz", get(|| async { "ok" }))
         .with_state(App { rpc });
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
@@ -163,16 +165,22 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 
 // ---------- pages ----------
 
-async fn index(State(app): State<App>) -> Html<String> {
+async fn index(State(app): State<App>, q: Query<HashMap<String, String>>) -> Html<String> {
     let info = match app.rpc.getblockchaininfo().await {
         Ok(v) => v,
         Err(e) => return err_page(&format!("node unreachable: {e}")),
     };
     let tip_h = info["blocks"].as_u64().unwrap_or(0) as u32;
-    // Fetch the last 25 blocks by height (bounded).
+    // ?start=<height> pages backwards through history; default = tip.
+    let end_h =
+        q.0.get("start")
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(|h| (h as u32).min(tip_h))
+            .unwrap_or(tip_h);
+    // Fetch up to 25 blocks ending at end_h (bounded).
     let mut rows = String::new();
-    let start = tip_h.saturating_sub(24);
-    for h in (start..=tip_h).rev() {
+    let start = end_h.saturating_sub(24);
+    for h in (start..=end_h).rev() {
         let hash = match app.rpc.getblockhash(h as u64).await {
             Ok(s) => s,
             Err(_) => continue,
@@ -197,15 +205,41 @@ async fn index(State(app): State<App>) -> Html<String> {
     let supply = info["money_supply_sats"].as_u64().unwrap_or(0);
     let net = app.rpc.getnetworkinfo().await.unwrap_or(Value::Null);
     let peers = net["connections"].as_u64().unwrap_or(0);
+    let mp = app.rpc.getmempoolinfo().await.unwrap_or(Value::Null);
+    let mp_txs = mp["size"].as_u64().unwrap_or(0);
+    let mp_bytes = mp["bytes"].as_u64().unwrap_or(0);
+    let minfee = mp["mempoolminfee"]["sats"].as_u64().unwrap_or(0);
+    let diff = info["difficulty"].as_f64().unwrap_or(0.0);
+    // Pager: "older" walks back 25, "newer" walks forward.
+    let mut pager = String::new();
+    if start > 0 {
+        pager.push_str(&format!(
+            "<a href=\"/?start={}\">&larr; older</a> ",
+            start.saturating_sub(1)
+        ));
+    }
+    if end_h < tip_h {
+        pager.push_str(&format!(
+            "<a href=\"/?start={}\">newer &rarr;</a> ",
+            (end_h + 24).min(tip_h)
+        ));
+    }
+    pager.push_str("<a href=\"/\">latest</a>");
     page(
-        "latest blocks",
+        "blocks",
         &format!(
-            "<p>chain: <b>{}</b> — tip height {} — money supply {} sats — peers: {} — <a href=\"/mempool\">mempool</a></p>\
+            "<p>chain: <b>{}</b> — tip height {} — supply {} sats — difficulty {:.4} — peers {} — mempool {} txs / {} bytes / min fee {} sat — <a href=\"/mempool\">mempool</a></p>\
+<p class=\"dim\">{}</p>\
 <table><tr><th>hash</th><th>height</th><th>time</th><th>txs</th><th>bits</th></tr>{}</table>",
             esc(info["chain"].as_str().unwrap_or("?")),
             tip_h,
             supply,
+            diff,
             peers,
+            mp_txs,
+            mp_bytes,
+            minfee,
+            pager,
             rows
         ),
     )
@@ -336,6 +370,7 @@ async fn tx_page(State(app): State<App>, AxumPath(txid): AxumPath<String>) -> Ht
 <tr><td>version</td><td>{}</td></tr>\
 <tr><td>locktime</td><td>{}</td></tr>\
 <tr><td>fee</td><td>{}</td></tr>\
+<tr><td>fee rate</td><td>{}</td></tr>\
 <tr><td>confirmations</td><td>{}</td></tr>\
 </table>\
 <h2>inputs</h2><table><tr><th>prevout</th><th>scriptSig</th></tr>{}</table>\
@@ -348,6 +383,15 @@ async fn tx_page(State(app): State<App>, AxumPath(txid): AxumPath<String>) -> Ht
                 .as_u64()
                 .map(|n| n.to_string())
                 .unwrap_or_else(|| "—".into()),
+            {
+                let fee = v["fee"]["sats"].as_u64().unwrap_or(0);
+                let size = v["size"].as_u64().unwrap_or(1).max(1);
+                if fee > 0 {
+                    format!("{:.2} sat/kvB", fee as f64 * 1000.0 / size as f64)
+                } else {
+                    "—".to_string()
+                }
+            },
             v["confirmations"]
                 .as_u64()
                 .map(|n| n.to_string())
@@ -373,6 +417,16 @@ async fn address_page(State(app): State<App>, AxumPath(addr): AxumPath<String>) 
         return err_page("address query failed (bad address or node error)");
     };
     let balance = info["balance_sats"].as_u64().unwrap_or(0);
+    // Received/spent totals from history (outputs to this address).
+    let (mut recv, mut spent_n) = (0u64, 0u64);
+    if let Some(arr) = hist["outputs"].as_array() {
+        for o in arr {
+            recv = recv.saturating_add(o["value_sats"].as_u64().unwrap_or(0));
+            if o["spent"].as_bool().unwrap_or(false) {
+                spent_n += 1;
+            }
+        }
+    }
     // UTXO table.
     let mut urows = String::new();
     if let Some(arr) = utxos.as_array() {
@@ -419,6 +473,8 @@ async fn address_page(State(app): State<App>, AxumPath(addr): AxumPath<String>) 
 <tr><td>address</td><td><code>{}</code></td></tr>\
 <tr><td>balance</td><td>{} sats ({:.8} BTC)</td></tr>\
 <tr><td>utxos</td><td>{}</td></tr>\
+<tr><td>total received</td><td>{} sats</td></tr>\
+<tr><td>outputs spent</td><td>{}</td></tr>\
 <tr><td>outputs ever</td><td>{}</td></tr>\
 </table>\
 <h2>unspent outputs</h2>\
@@ -429,6 +485,8 @@ async fn address_page(State(app): State<App>, AxumPath(addr): AxumPath<String>) 
             balance,
             balance as f64 / 100_000_000.0,
             utxos.as_array().map(|a| a.len()).unwrap_or(0),
+            recv,
+            spent_n,
             hist["count"].as_u64().unwrap_or(0),
             urows,
             hrows
@@ -444,11 +502,14 @@ async fn mempool_page(State(app): State<App>) -> Html<String> {
     let mut rows = String::new();
     if let Value::Object(map) = &v {
         for (txid, t) in map.iter().take(500) {
+            let size = t["size"].as_u64().unwrap_or(0).max(1);
+            let fee = t["fee"]["sats"].as_u64().unwrap_or(0);
             rows.push_str(&format!(
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{:.2}</td><td>{}</td></tr>",
                 link_tx(txid),
-                t["size"].as_u64().unwrap_or(0),
-                t["fee"]["sats"].as_u64().unwrap_or(0),
+                size,
+                fee,
+                fee as f64 * 1000.0 / size as f64,
                 t["vin"].as_array().map(|a| a.len()).unwrap_or(0)
             ));
         }
@@ -458,13 +519,58 @@ async fn mempool_page(State(app): State<App>) -> Html<String> {
         "mempool",
         &format!(
             "<p><a href=\"/\">← blocks</a> — {} txs, {} bytes, min relay fee {} sats/kvB</p>\
-<table><tr><th>txid</th><th>size</th><th>fee sats</th><th>inputs</th></tr>{}</table>",
+<table><tr><th>txid</th><th>size</th><th>fee sats</th><th>sat/kvB</th><th>inputs</th></tr>{}</table>",
             info["size"].as_u64().unwrap_or(0),
             info["bytes"].as_u64().unwrap_or(0),
             info["mempoolminfee"]["sats"].as_u64().unwrap_or(0),
             rows
         ),
     )
+}
+
+// ---------- search ----------
+
+/// Classify a search query → a site path, or None if unrecognized.
+/// Order matters: 64-hex is ambiguous (block hash vs txid) — the caller
+/// probes block first, then tx.
+fn classify_query(q: &str) -> Option<&'static str> {
+    if q.is_empty() || q.len() > 128 || q.chars().any(|c| c.is_whitespace()) {
+        return None;
+    }
+    if q.chars().all(|c| c.is_ascii_digit()) {
+        return Some("block");
+    }
+    if q.len() == 64 && q.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Some("hash");
+    }
+    // base58check-ish: alnum only, starts with a network prefix char.
+    if (26..=62).contains(&q.len())
+        && q.chars().all(|c| c.is_ascii_alphanumeric())
+        && matches!(q.chars().next(), Some('m' | 'n' | '1' | '3'))
+    {
+        return Some("address");
+    }
+    None
+}
+
+async fn search_page(State(app): State<App>, Query(p): Query<HashMap<String, String>>) -> Response {
+    let q = p.get("q").map(|s| s.trim().to_string()).unwrap_or_default();
+    match classify_query(&q) {
+        Some("block") => Redirect::to(&format!("/block/{q}")).into_response(),
+        Some("address") => Redirect::to(&format!("/address/{q}")).into_response(),
+        Some("hash") => {
+            // Probe block first, then transaction.
+            if app.rpc.getblock(&q, 0).await.is_ok() {
+                Redirect::to(&format!("/block/{q}")).into_response()
+            } else if app.rpc.getrawtransaction(&q, false).await.is_ok() {
+                Redirect::to(&format!("/tx/{q}")).into_response()
+            } else {
+                err_page("no block or transaction with that hash").into_response()
+            }
+        }
+        _ => err_page("unrecognized query — try a txid, block hash, height, or address")
+            .into_response(),
+    }
 }
 
 #[cfg(test)]
@@ -482,6 +588,19 @@ mod tests {
         assert_eq!(esc("plain-123"), "plain-123");
         // Attribute-context safety: quotes are escaped.
         assert!(!esc("\"").contains('"'));
+    }
+
+    #[test]
+    fn classify_query_routes() {
+        assert_eq!(classify_query("12345"), Some("block"));
+        assert_eq!(classify_query(&"ab".repeat(32)), Some("hash"));
+        assert_eq!(
+            classify_query("mzwwLHjAaiMq1D1NK93dfSCRnzngzfS9H5"),
+            Some("address")
+        );
+        assert_eq!(classify_query("not a query!!"), None);
+        assert_eq!(classify_query(""), None);
+        assert_eq!(classify_query(&"zz".repeat(32)), None); // 64 non-hex
     }
 
     #[test]
