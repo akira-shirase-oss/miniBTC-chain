@@ -10,6 +10,8 @@ description = "MiniBTC MCP server: lets AI assistants inspect and (gated) operat
 [dependencies]
 minibtc-rpc = { path = "../../crates/rpc" }
 minibtc-primitives = { path = "../../crates/primitives" }
+minibtc-consensus = { path = "../../crates/consensus" }
+minibtc-crypto = { path = "../../crates/crypto" }
 minibtc-wallet = { path = "../../crates/wallet" }
 rmcp.workspace = true
 serde.workspace = true

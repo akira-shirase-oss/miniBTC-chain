@@ -27,7 +27,7 @@ publish = false
 
 [workspace.dependencies]
 # --- async / networking ---
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync", "io-util", "io-std"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync", "io-util", "io-std", "process"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 futures = "0.3"
 # --- http ---
@@ -61,7 +61,7 @@ redb = "4"
 # --- cli ---
 clap = { version = "4", features = ["derive"] }
 # --- mcp ---
-rmcp = { version = "3", features = ["server", "transport-async-rw", "macros"] }
+rmcp = { version = "3", features = ["server", "transport-async-rw", "transport-io", "macros"] }
 # --- testing ---
 proptest = "1"
 assert_cmd = "2"

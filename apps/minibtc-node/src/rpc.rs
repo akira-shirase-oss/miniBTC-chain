@@ -101,6 +101,8 @@ impl RpcBackend for NodeBackend {
                 let money_sum = inner.money_supply();
                 Ok(json!({
                     "chain": self.node.params.name,
+                    "devnet": self.node.params.devnet,
+                    "coinbase_maturity": self.node.params.coinbase_maturity,
                     "blocks": tip_h,
                     "headers": tip_h,
                     "bestblockhash": inner.chain.tip.to_hex(),
@@ -465,6 +467,8 @@ impl RpcBackend for NodeBackend {
                 }
                 Ok(json!({
                     "chain": self.node.params.name,
+                    "devnet": self.node.params.devnet,
+                    "coinbase_maturity": self.node.params.coinbase_maturity,
                     "tip_height": tip,
                     "count": out.len(),
                     "utxos": out,

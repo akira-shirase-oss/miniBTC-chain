@@ -137,6 +137,10 @@ enum WalletCmd {
         /// Fee rate in sats/kvB.
         #[arg(long, default_value_t = 5)]
         fee_rate: u64,
+        /// Build and sign only — print the transaction hex + summary,
+        /// do NOT broadcast. Used by the MCP draft/payment gate.
+        #[arg(long)]
+        draft: bool,
         #[arg(long)]
         passphrase: Option<String>,
     },
@@ -603,6 +607,7 @@ async fn wallet_cmd(
             to,
             amount,
             fee_rate,
+            draft,
             passphrase,
         } => {
             let sats = parse_amount(&amount)?;
@@ -619,6 +624,42 @@ async fn wallet_cmd(
             // Local sanity re-validation before broadcasting.
             let txid = tx.txid();
             let hex = hex_encode(&tx.encode());
+            if draft {
+                // Fee = sum(inputs) - sum(outputs); inputs resolve via
+                // the wallet's scanned UTXO set.
+                let mut in_sum = 0u64;
+                for inp in &tx.inputs {
+                    if let Some(u) = w.utxos().iter().find(|u| u.outpoint == inp.prev) {
+                        in_sum = in_sum.saturating_add(u.output.value.sats());
+                    }
+                }
+                let out_sum: u64 = tx.outputs.iter().map(|o| o.value.sats()).sum();
+                let outs: Vec<Value> = tx
+                    .outputs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, o)| {
+                        json!({
+                            "n": i,
+                            "value_sats": o.value.sats(),
+                            "script_pubkey_hex": hex_encode(&o.script_pubkey),
+                        })
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    json!({
+                        "draft": true,
+                        "txid": txid.to_hex(),
+                        "hex": hex,
+                        "fee_sats": in_sum.saturating_sub(out_sum),
+                        "inputs": tx.inputs.len(),
+                        "outputs": outs,
+                        "note": "signed but NOT broadcast — review before sending",
+                    })
+                );
+                return Ok(());
+            }
             match client.sendrawtransaction(&hex).await {
                 Ok(ret) => {
                     if json_out {
