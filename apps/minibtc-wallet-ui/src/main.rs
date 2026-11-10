@@ -399,30 +399,48 @@ fn esc(s: &str) -> String {
         .replace('\'', "&#39;")
 }
 
-const CSS: &str = "body{font-family:ui-monospace,Menlo,monospace;margin:0;color:#e6e6e6;background:#101216}\
-header{background:#171a20;border-bottom:1px solid #2a2e35;padding:.7em 1.5em;display:flex;gap:1.5em;align-items:baseline}\
-header a{color:#8ab4ff;text-decoration:none}header .brand{color:#e6e6e6;font-weight:700}\
+const CSS: &str = "*{box-sizing:border-box}\
+body{font-family:ui-sans-serif,system-ui,-apple-system,'Segoe UI',sans-serif;margin:0;color:#e6e9ef;background:#0f1115;line-height:1.55}\
+header{background:#171a21;border-bottom:1px solid #262b34;padding:.7em 1.5em;display:flex;gap:1.5em;align-items:baseline}\
+header a{color:#9db4d8;text-decoration:none}header .brand{color:#f0f2f5;font-weight:700;font-size:1.05rem}\
 main{max-width:64em;margin:1.5em auto;padding:0 1em}\
-table{border-collapse:collapse;width:100%;margin:.6em 0}\
-td,th{border-bottom:1px solid #23272e;padding:.3em .6em;text-align:left;font-size:.85em}\
-th{color:#8a93a3;font-weight:600}\
-.dim{color:#8a93a3}.warn{color:#e0a050}.ok{color:#7dd87d}.err{color:#e07070}\
-form{margin:.8em 0}input,button,textarea{background:#1d2126;color:#ddd;border:1px solid #3a4048;padding:.4em .7em;font:inherit}\
-button{cursor:pointer;background:#2a4a2a;border-color:#3f6a3f}\
-button.danger{background:#4a2a2a;border-color:#6a3f3f}\
-.card{background:#161a20;border:1px solid #262b33;border-radius:6px;padding:1em 1.2em;margin:1em 0}\
+h1{font-size:1.3rem;font-weight:650;color:#f0f2f5;margin:.4rem 0 .8rem}\
+h2{font-size:1rem;color:#9db4d8;margin:0 0 .6rem}\
+table{border-collapse:collapse;width:100%;margin:.6em 0;font-size:.86rem}\
+td,th{border-bottom:1px solid #232833;padding:.4em .7em;text-align:left}\
+th{color:#8a93a5;font-weight:600;font-size:.75rem;text-transform:uppercase;letter-spacing:.05em}\
+tbody tr:hover{background:#171b23}\
+.dim{color:#8a93a5}.warn{color:#e0a050}.ok{color:#7dd87d}.err{color:#e07070}\
+a{color:#7ea8d8;text-decoration:none}a:hover{color:#a8c8f0;text-decoration:underline}\
+form{margin:.8em 0}\
+input,button,textarea{background:#1d2129;color:#e6e9ef;border:1px solid #3a4150;border-radius:6px;padding:.42em .75em;font:inherit;font-size:.9rem}\
+input:focus,textarea:focus{outline:none;border-color:#5a7fb8;box-shadow:0 0 0 2px rgba(90,127,184,.25)}\
+button{cursor:pointer;background:#2a4a6a;color:#cfe0f5;border-color:#3f5a78}\
+button:hover{background:#34557e}\
+button.danger{background:#4a2a2a;border-color:#6a3f3f;color:#f0c8c8}\
+button.danger:hover{background:#5e3636}\
+label{color:#b9c2cf;font-size:.88rem}\
+.card{background:#161a21;border:1px solid #262c38;border-radius:8px;padding:1em 1.2em;margin:1em 0}\
+.card h2{margin-bottom:.4em}\
 \
-.mono{font-family:ui-monospace,monospace;word-break:break-all}\
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;word-break:break-all}\
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(15em,1fr));gap:1em}\
-.stat{background:#161a20;border:1px solid #262b33;border-radius:6px;padding:.9em 1.1em}\
-.stat .v{font-size:1.5em;font-weight:700}.stat .k{color:#8a93a3;font-size:.8em}\
-.seed{background:#1a1408;border:1px solid #5a4a20;border-radius:6px;padding:1em;font-size:1.15em;line-height:2;letter-spacing:.05em}\
-.pill{display:inline-block;padding:.1em .6em;border-radius:1em;font-size:.75em;border:1px solid #3a4048}\
+.stat{background:#161a21;border:1px solid #262c38;border-radius:8px;padding:.9em 1.1em}\
+.stat .v{font-size:1.5em;font-weight:700;color:#f0f2f5}.stat .k{color:#8a93a5;font-size:.78rem;text-transform:uppercase;letter-spacing:.05em}\
+.stat.hero .v{font-size:2.1em;color:#7dd87d}\
+.seed{background:#1a1408;border:1px solid #5a4a20;border-radius:8px;padding:1em;font-size:1.1em;line-height:2.1;letter-spacing:.06em;color:#f0e6c8}\
+.pill{display:inline-block;padding:.12em .65em;border-radius:1em;font-size:.75rem;border:1px solid #3a4150;color:#9db4d8}\
 .pill.ok{color:#7dd87d;border-color:#3f6a3f}.pill.warn{color:#e0a050;border-color:#6a5a3f}\
 .actions{display:flex;gap:.6em;flex-wrap:wrap;margin:.8em 0}\
-.actions a{display:inline-block;background:#2a4a2a;color:#cfe8cf;padding:.5em 1em;border-radius:5px;text-decoration:none;border:1px solid #3f6a3f}\
-.actions a.ghost{background:#1d2126;color:#8ab4ff;border-color:#3a4048}\
-.breadcrumb{margin:.5em 0;font-size:.9em}";
+.actions a{display:inline-block;background:#2a4a6a;color:#cfe0f5;padding:.5em 1.1em;border-radius:6px;text-decoration:none;border:1px solid #3f5a78;font-size:.9rem}\
+.actions a:hover{background:#34557e;color:#eaf2fc;text-decoration:none}\
+.actions a.ghost{background:#1d2330;color:#9db4d8;border-color:#3a4150}\
+.actions a.ghost:hover{background:#273349;color:#cfe0f5}\
+.breadcrumb{margin:.5em 0;font-size:.9rem;color:#8a93a5}\
+.breadcrumb a{color:#9db4d8}\
+.choice{border:1px solid #2a4a6a;border-radius:8px;padding:1em 1.2em;background:#141a24;transition:border-color .15s}\
+.choice:hover{border-color:#5a7fb8}\
+.choice h2{color:#cfe0f5}";
 
 fn page(title: &str, body: &str) -> Html<String> {
     Html(format!(
@@ -552,7 +570,7 @@ async fn index(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
 <label>passphrase<br><input type=\"password\" name=\"passphrase\" required size=26 autocomplete=\"off\"></label><br><br>\
 <button type=submit>unlock</button></form>\
 <p class=dim>wallets on disk:</p><table>{}</table></div>\
-<div class=card><h2>New here?</h2>\
+<div class=\"card choice\"><h2>New here?</h2>\
 <p><a href=\"/new\">Create a new wallet</a> — generates a seed phrase you must back up.</p>\
 <p><a href=\"/restore\">Restore from seed phrase</a> — rebuild a wallet from 12/24 words.</p>\
 <p class=dim>sessions are in-memory only · idle timeout {} min · nothing is broadcast without your confirm</p></div>\
@@ -981,10 +999,10 @@ async fn wallet_page(State(app): State<Arc<App>>, headers: HeaderMap) -> Respons
         &name,
         &format!(
             "{}\
-<div class=stat style=\"max-width:30em\"><div class=k>confirmed balance</div>\
+<div class=grid><div class=\"stat hero\"><div class=k>confirmed balance</div>\
 <div class=v>{} BTC</div><div class=dim>{} sats · {} UTXOs</div></div>\
-<div class=stat style=\"max-width:30em\"><div class=k>immature (coinbase &lt; {} confs)</div>\
-<div class=v style=\"font-size:1.1em\">{}</div></div>\
+<div class=stat><div class=k>immature (coinbase &lt; {} confs)</div>\
+<div class=v>{}</div></div></div>\
 <div class=actions>\
 <a href=\"/wallet/receive\">receive</a>\
 <a href=\"/wallet/send\">send</a>\

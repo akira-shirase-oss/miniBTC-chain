@@ -78,23 +78,52 @@ fn esc(s: &str) -> String {
     out
 }
 
+const CSS: &str = "*{box-sizing:border-box}\
+body{font-family:ui-sans-serif,system-ui,-apple-system,'Segoe UI',sans-serif;margin:0;color:#e2e5ea;background:#0f1115;line-height:1.5}\
+.wrap{max-width:72rem;margin:0 auto;padding:0 1rem}\
+header.top{background:#171a21;border-bottom:1px solid #262b34;padding:.6rem 1rem;display:flex;gap:1.25rem;align-items:center;flex-wrap:wrap}\
+header.top .brand{color:#f0f2f5;font-weight:700;font-size:1.05rem;letter-spacing:.02em;text-decoration:none}\
+header.top nav{display:flex;gap:1rem;align-items:center;flex-wrap:wrap}\
+header.top nav a{color:#9db4d8;text-decoration:none;font-size:.9rem}\
+header.top nav a:hover{color:#cfe0f5}\
+header.top form{margin-left:auto;display:flex;gap:.4rem}\
+header.top input{background:#1d2129;color:#e6e9ef;border:1px solid #3a4150;border-radius:6px;padding:.38rem .6rem;font-size:.85rem;width:19rem;max-width:55vw}\
+header.top input:focus{outline:none;border-color:#5a7fb8;box-shadow:0 0 0 2px rgba(90,127,184,.25)}\
+header.top button{background:#2a4a6a;color:#cfe0f5;border:1px solid #3f5a78;border-radius:6px;padding:.38rem .8rem;font-size:.85rem;cursor:pointer}\
+header.top button:hover{background:#34557e}\
+main{padding:1.5rem 1rem 3rem}\
+h1{font-size:1.35rem;font-weight:650;margin:.4rem 0 1rem;color:#f0f2f5}\
+h2{font-size:1rem;color:#9db4d8;margin:1.4rem 0 .5rem}\
+table{border-collapse:collapse;width:100%;margin:.6rem 0;font-size:.86rem}\
+td,th{border-bottom:1px solid #232833;padding:.45rem .7rem;text-align:left}\
+th{color:#8a93a5;font-weight:600;font-size:.78rem;text-transform:uppercase;letter-spacing:.05em}\
+tbody tr:hover{background:#171b23}\
+a{color:#7ea8d8;text-decoration:none}a:hover{color:#a8c8f0;text-decoration:underline}\
+code{background:#1a1e26;padding:.12em .35em;border-radius:4px;font-size:.85em;color:#c8d3e0}\
+.dim{color:#8a93a5}.err{color:#e07070}\
+.stats{display:flex;gap:.7rem;flex-wrap:wrap;margin:.8rem 0 1.2rem}\
+.stat{background:#161a21;border:1px solid #262c38;border-radius:8px;padding:.7rem 1rem;min-width:8.5rem}\
+.stat .k{color:#8a93a5;font-size:.72rem;text-transform:uppercase;letter-spacing:.05em}\
+.stat .v{font-size:1.15rem;font-weight:700;color:#f0f2f5;margin-top:.15rem}\
+.pager{display:flex;gap:.6rem;align-items:center;margin:1rem 0;font-size:.88rem}\
+.pager a{background:#1d2330;border:1px solid #333b4d;color:#9db4d8;padding:.3rem .8rem;border-radius:6px;text-decoration:none}\
+.pager a:hover{background:#273349;color:#cfe0f5}\
+.card{background:#161a21;border:1px solid #262c38;border-radius:8px;padding:1rem 1.2rem;margin:1rem 0}\
+.tag{display:inline-block;padding:.08em .55em;border-radius:1em;font-size:.72rem;border:1px solid #3a4150;color:#9db4d8}\
+.tag.ok{color:#7dd87d;border-color:#3f6a3f}.tag.warn{color:#e0a050;border-color:#6a5a3f}\
+@media(max-width:640px){.stat{min-width:7rem}.stat .v{font-size:1rem}header.top form input{width:12rem}}";
+
 fn page(title: &str, body: &str) -> Html<String> {
     Html(format!(
         "<!doctype html><html><head><meta charset=\"utf-8\">\
-<title>{} — MiniBTC Explorer</title>\
-<style>body{{font-family:ui-monospace,Menlo,monospace;max-width:1100px;margin:2em auto;padding:0 1em;color:#222}}\
-h1{{font-size:1.3em;border-bottom:2px solid #444;padding-bottom:.3em}}\
-table{{border-collapse:collapse;width:100%}}\
-td,th{{border:1px solid #ccc;padding:.3em .6em;text-align:left;font-size:.85em}}\
-th{{background:#f4f4f4}}\
-a{{color:#0645ad}}code{{background:#f6f6f6;padding:.1em .3em}}\
-.nav a{{margin-right:1em}}.dim{{color:#777}}.err{{color:#a00}}</style></head>\
-<body><div class=\"nav\"><a href=\"/\">blocks</a><a href=\"/mempool\">mempool</a>\
-<form method=\"get\" action=\"/search\" style=\"display:inline;margin-left:1em\">\
-<input name=\"q\" size=\"42\" placeholder=\"search txid / block / height / address\">\
-<button type=\"submit\">go</button></form></div>\
-<h1>{}</h1>{}</body></html>",
+<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+<title>{} — MiniBTC Explorer</title><style>{}</style></head>\
+<body><header class=\"top\"><a class=\"brand\" href=\"/\">◈ minibtc explorer</a>\
+<nav><a href=\"/\">blocks</a><a href=\"/mempool\">mempool</a></nav>\
+<form method=\"get\" action=\"/search\"><input name=\"q\" placeholder=\"txid / block / height / address\"><button type=\"submit\">search</button></form></header>\
+<main><h1>{}</h1>{}</main></body></html>",
         esc(title),
+        CSS,
         esc(title),
         body
     ))
@@ -231,19 +260,30 @@ async fn index(State(app): State<App>, q: Query<HashMap<String, String>>) -> Htm
     page(
         "blocks",
         &format!(
-            "<p>chain: <b>{}</b> — tip height {} — supply {} sats — difficulty {:.4} — peers {} — mempool {} txs / {} bytes / min fee {} sat — <a href=\"/mempool\">mempool</a></p>\
-<p class=\"dim\">{}</p>\
-<table><tr><th>hash</th><th>height</th><th>time</th><th>txs</th><th>bits</th></tr>{}</table>",
+            "<div class=\"stats\">\
+<div class=\"stat\"><div class=\"k\">chain</div><div class=\"v\">{}</div></div>\
+<div class=\"stat\"><div class=\"k\">tip height</div><div class=\"v\">{}</div></div>\
+<div class=\"stat\"><div class=\"k\">supply</div><div class=\"v\">{:.2} BTC</div></div>\
+<div class=\"stat\"><div class=\"k\">difficulty</div><div class=\"v\">{:.4}</div></div>\
+<div class=\"stat\"><div class=\"k\">peers</div><div class=\"v\">{}</div></div>\
+<div class=\"stat\"><div class=\"k\">mempool</div><div class=\"v\">{} txs</div></div>\
+<div class=\"stat\"><div class=\"k\">mempool size</div><div class=\"v\">{:.1} KB</div></div>\
+<div class=\"stat\"><div class=\"k\">min fee</div><div class=\"v\">{} sat</div></div>\
+</div>\
+<div class=\"pager\">{}</div>\
+<table><thead><tr><th>hash</th><th>height</th><th>time</th><th>txs</th><th>bits</th></tr></thead><tbody>{}</tbody></table>\
+<div class=\"pager\">{}</div>",
             esc(info["chain"].as_str().unwrap_or("?")),
             tip_h,
-            supply,
+            supply as f64 / 100_000_000.0,
             diff,
             peers,
             mp_txs,
-            mp_bytes,
+            mp_bytes as f64 / 1024.0,
             minfee,
             pager,
-            rows
+            rows,
+            pager
         ),
     )
 }
