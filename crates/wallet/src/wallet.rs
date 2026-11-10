@@ -19,9 +19,9 @@
 use crate::bip32::{ChildNumber, DerivationPath, Xpriv};
 use crate::bip39;
 use minibtc_consensus::UtxoView;
-use minibtc_crypto::{hash160, Address, Keypair};
+use minibtc_crypto::{Address, Keypair, hash160};
 use minibtc_primitives::{OutPoint, Sats, Transaction, TxInput, TxOutput};
-use minibtc_script::{sighash, Script};
+use minibtc_script::{Script, sighash};
 use std::collections::HashMap;
 use thiserror::Error;
 
@@ -84,7 +84,9 @@ pub struct WalletUtxo {
 impl WalletUtxo {
     /// Confirmations = tip − height + 1.
     pub fn confirmations(&self) -> u32 {
-        self.tip_height.saturating_sub(self.height).saturating_add(1)
+        self.tip_height
+            .saturating_sub(self.height)
+            .saturating_add(1)
     }
 
     /// Spendable given coinbase maturity `m`.
@@ -167,7 +169,14 @@ impl Wallet {
         maturity: u32,
     ) -> Result<Self, WalletError> {
         let seed = bip39::seed_from_mnemonic(phrase, bip39_passphrase)?;
-        Self::from_seed(&seed, bip39_passphrase, coin_type, account, address_version, maturity)
+        Self::from_seed(
+            &seed,
+            bip39_passphrase,
+            coin_type,
+            account,
+            address_version,
+            maturity,
+        )
     }
 
     /// New wallet from a raw 64-byte seed.
@@ -223,7 +232,10 @@ impl Wallet {
         // Path from account: /chain/index — chain is itself an index.
         let path = DerivationPath {
             children: vec![
-                ChildNumber { index: u32::from(chain), hardened: false },
+                ChildNumber {
+                    index: u32::from(chain),
+                    hardened: false,
+                },
                 child,
             ],
         };
@@ -264,13 +276,41 @@ impl Wallet {
         Ok(address)
     }
 
+    /// Issuance counters `(next_receive, next_change)` — persisted by the
+    /// wallet-file layer so reloads resume where they left off.
+    pub fn indices(&self) -> (u32, u32) {
+        (self.next_receive, self.next_change)
+    }
+
+    /// Restore issuance counters (wallet-file load path). Only the
+    /// wallet-file owner should call this — skipping indices orphans
+    /// addresses that may already have funds.
+    pub fn set_indices(&mut self, receive: u32, change: u32) {
+        self.next_receive = receive;
+        self.next_change = change;
+    }
+
+    /// Pre-derive receive+change addresses for indices
+    /// `[0, next+gap)` on both chains so `scan` sees the full
+    /// used+lookahead window. Does NOT advance issuance counters —
+    /// `new_address` still hands out `next_receive` fresh.
+    pub fn prime_lookahead(&mut self, gap: u32) -> Result<(), WalletError> {
+        let r_end = self.next_receive.saturating_add(gap);
+        for i in 0..r_end {
+            let entry = self.derive_address(0, i)?;
+            self.addresses.insert(entry.script.clone(), entry);
+        }
+        let c_end = self.next_change.saturating_add(gap);
+        for i in 0..c_end {
+            let entry = self.derive_address(1, i)?;
+            self.addresses.insert(entry.script.clone(), entry);
+        }
+        Ok(())
+    }
+
     /// All addresses we've issued (receive chain).
     pub fn addresses(&self) -> Vec<Address> {
-        let mut v: Vec<&AddressEntry> = self
-            .addresses
-            .values()
-            .filter(|e| e.chain == 0)
-            .collect();
+        let mut v: Vec<&AddressEntry> = self.addresses.values().filter(|e| e.chain == 0).collect();
         v.sort_by_key(|e| e.index);
         v.into_iter().map(|e| e.address.clone()).collect()
     }
@@ -287,7 +327,10 @@ impl Wallet {
         self.utxos.clear();
         let mut found = 0usize;
         for (op, entry) in view.utxo_iter() {
-            if self.addresses.contains_key(entry.output.script_pubkey.as_slice()) {
+            if self
+                .addresses
+                .contains_key(entry.output.script_pubkey.as_slice())
+            {
                 self.utxos.push(WalletUtxo {
                     outpoint: *op,
                     output: entry.output.clone(),
@@ -332,7 +375,11 @@ impl Wallet {
     /// Select coins to cover `target` (payment + estimated fee) using a
     /// greedy-largest-first strategy. Returns the selection or
     /// InsufficientFunds.
-    pub fn select_coins(&self, target: Sats, fee_estimate: Sats) -> Result<CoinSelection, WalletError> {
+    pub fn select_coins(
+        &self,
+        target: Sats,
+        fee_estimate: Sats,
+    ) -> Result<CoinSelection, WalletError> {
         let need = target
             .checked_add(fee_estimate)
             .ok_or(WalletError::Overflow)?;
@@ -345,7 +392,9 @@ impl Wallet {
                 break;
             }
             selected.push(u.clone());
-            total = total.checked_add(u.output.value).ok_or(WalletError::Overflow)?;
+            total = total
+                .checked_add(u.output.value)
+                .ok_or(WalletError::Overflow)?;
         }
         if total < need {
             return Err(WalletError::InsufficientFunds {
@@ -438,7 +487,7 @@ impl Wallet {
             let script = u.output.script_pubkey.clone();
             inputs.push(TxInput {
                 prev: u.outpoint,
-                script_sig: vec![], // filled after signing
+                script_sig: vec![],    // filled after signing
                 sequence: 0xffff_fffe, // signal RBF
             });
             let _ = script;
@@ -498,11 +547,15 @@ fn estimate_fee(fee_rate: u64, n_inputs: usize, n_outputs: usize) -> u64 {
 /// UtxoSet and by storage scans.
 pub trait IterableUtxos {
     /// Iterate (outpoint, entry) pairs.
-    fn utxo_iter(&self) -> Box<dyn Iterator<Item = (&OutPoint, &minibtc_chainstate::UtxoEntry)> + '_>;
+    fn utxo_iter(
+        &self,
+    ) -> Box<dyn Iterator<Item = (&OutPoint, &minibtc_chainstate::UtxoEntry)> + '_>;
 }
 
 impl IterableUtxos for minibtc_chainstate::UtxoSet {
-    fn utxo_iter(&self) -> Box<dyn Iterator<Item = (&OutPoint, &minibtc_chainstate::UtxoEntry)> + '_> {
+    fn utxo_iter(
+        &self,
+    ) -> Box<dyn Iterator<Item = (&OutPoint, &minibtc_chainstate::UtxoEntry)> + '_> {
         Box::new(self.iter())
     }
 }

@@ -1,8 +1,8 @@
 //! RPC server integration: auth, dispatch, error mapping, bounds.
 
 use minibtc_rpc::server::CookieAuth;
-use minibtc_rpc::{serve, JsonRpcResponse, RpcBackend, RpcError, NODE_METHODS};
-use serde_json::{json, Value};
+use minibtc_rpc::{JsonRpcResponse, NODE_METHODS, RpcBackend, RpcError, serve};
+use serde_json::{Value, json};
 use std::sync::Arc;
 
 /// Fixture backend: echoes method+params, errors on "fail".

@@ -158,6 +158,8 @@ pub fn param_u64_opt(params: &[Value], i: usize, default: u64) -> Result<u64, Rp
         Some(v) => {
             if let Some(n) = v.as_u64() {
                 Ok(n)
+            } else if let Some(b) = v.as_bool() {
+                Ok(u64::from(b))
             } else if let Some(s) = v.as_str() {
                 s.parse::<u64>()
                     .map_err(|_| RpcError::InvalidParams("bad integer param".into()))

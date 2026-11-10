@@ -17,7 +17,7 @@ pub mod render;
 pub mod server;
 pub mod types;
 
-pub use backend::{RpcBackend, SharedBackend, NODE_METHODS};
+pub use backend::{NODE_METHODS, RpcBackend, SharedBackend};
 pub use client::RpcClient;
-pub use server::{serve, CookieAuth};
+pub use server::{CookieAuth, serve};
 pub use types::{JsonRpcRequest, JsonRpcResponse, RpcError};

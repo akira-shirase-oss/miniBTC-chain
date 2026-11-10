@@ -4,7 +4,7 @@
 
 use crate::server::CookieAuth;
 use crate::types::{JsonRpcRequest, JsonRpcResponse, RpcError};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -51,9 +51,8 @@ impl RpcClient {
     /// Connect using the node's `.cookie` file inside `datadir`.
     pub fn from_datadir(datadir: &Path, port: u16) -> Result<Self, RpcError> {
         let cookie_path = datadir.join(".cookie");
-        let contents = std::fs::read_to_string(&cookie_path).map_err(|e| {
-            RpcError::App(format!("cannot read {}: {e}", cookie_path.display()))
-        })?;
+        let contents = std::fs::read_to_string(&cookie_path)
+            .map_err(|e| RpcError::App(format!("cannot read {}: {e}", cookie_path.display())))?;
         let auth = CookieAuth::from_cookie_file(&contents)?;
         Self::new("127.0.0.1", port, auth)
     }
@@ -93,7 +92,8 @@ impl RpcClient {
                 _ => RpcError::App(err.message),
             });
         }
-        body.result.ok_or_else(|| RpcError::Internal("empty rpc result".into()))
+        body.result
+            .ok_or_else(|| RpcError::Internal("empty rpc result".into()))
     }
 
     /// Call with a custom timeout (mining).
@@ -128,7 +128,8 @@ impl RpcClient {
         if let Some(err) = body.error {
             return Err(RpcError::App(err.message));
         }
-        body.result.ok_or_else(|| RpcError::Internal("empty rpc result".into()))
+        body.result
+            .ok_or_else(|| RpcError::Internal("empty rpc result".into()))
     }
 
     // ---- Typed conveniences ----
@@ -163,11 +164,8 @@ impl RpcClient {
 
     /// `getblock` by hash or height.
     pub async fn getblock(&self, ref_or_height: &str, verbosity: u8) -> Result<Value, RpcError> {
-        self.call(
-            "getblock",
-            json!([ref_or_height, verbosity]),
-        )
-        .await
+        self.call("getblock", json!([ref_or_height, verbosity]))
+            .await
     }
 
     /// `getrawtransaction txid [verbose]`.
@@ -219,16 +217,8 @@ impl RpcClient {
     }
 
     /// `generatetoaddress nblocks address` (devnet only) — long timeout.
-    pub async fn generatetoaddress(
-        &self,
-        nblocks: u64,
-        address: &str,
-    ) -> Result<Value, RpcError> {
-        self.call_timeout(
-            "generatetoaddress",
-            json!([nblocks, address]),
-            MINE_TIMEOUT,
-        )
-        .await
+    pub async fn generatetoaddress(&self, nblocks: u64, address: &str) -> Result<Value, RpcError> {
+        self.call_timeout("generatetoaddress", json!([nblocks, address]), MINE_TIMEOUT)
+            .await
     }
 }

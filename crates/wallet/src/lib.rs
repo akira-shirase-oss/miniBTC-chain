@@ -17,6 +17,6 @@ pub mod keystore;
 pub mod wallet;
 
 pub use bip32::{ChildNumber, DerivationPath, Xpriv};
-pub use bip39::{generate_mnemonic, mnemonic_from_phrase, seed_from_mnemonic, Mnemonic};
-pub use keystore::{decrypt_keystore, encrypt_keystore, Keystore};
+pub use bip39::{Mnemonic, generate_mnemonic, mnemonic_from_phrase, seed_from_mnemonic};
+pub use keystore::{Keystore, decrypt_keystore, encrypt_keystore};
 pub use wallet::{CoinSelection, Wallet, WalletError};

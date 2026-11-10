@@ -4,13 +4,11 @@
 //! Every peer is untrusted: bounded channels, handshake + stall timeouts,
 //! peer-manager scoring/ban/diversity limits, and dedup'd relay.
 
-use crate::core::{Node, NodeInner, ADDRBOOK_CAP};
+use crate::core::{ADDRBOOK_CAP, Node, NodeInner};
 use minibtc_consensus::ChainParams;
 use minibtc_crypto::Hash256;
 use minibtc_p2p::codec::{self, Message};
-use minibtc_p2p::peer::{
-    SCORE_BAD_BLOCK, SCORE_BAD_MESSAGE, SCORE_GOOD_BLOCK, SCORE_TIMEOUT,
-};
+use minibtc_p2p::peer::{SCORE_BAD_BLOCK, SCORE_BAD_MESSAGE, SCORE_GOOD_BLOCK, SCORE_TIMEOUT};
 use minibtc_primitives::Block;
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -236,14 +234,13 @@ async fn session(node: Node, stream: TcpStream, addr: SocketAddr, outbound: bool
         inner.chain.height().min(i32::MAX as u32) as i32
     };
     let our_version = our_version_msg(&params, our_height);
-    if codec::write_message(&mut wr, &our_version, &params).await.is_err() {
+    if codec::write_message(&mut wr, &our_version, &params)
+        .await
+        .is_err()
+    {
         return;
     }
-    let their_version = match timeout(
-        codec::HANDSHAKE_TIMEOUT,
-        codec::recv(&mut rd, &params),
-    )
-    .await
+    let their_version = match timeout(codec::HANDSHAKE_TIMEOUT, codec::recv(&mut rd, &params)).await
     {
         Ok(Ok(m @ Message::Version { .. })) => m,
         _ => return,
@@ -259,7 +256,10 @@ async fn session(node: Node, stream: TcpStream, addr: SocketAddr, outbound: bool
     }
 
     // Verack exchange.
-    if codec::write_message(&mut wr, &Message::Verack, &params).await.is_err() {
+    if codec::write_message(&mut wr, &Message::Verack, &params)
+        .await
+        .is_err()
+    {
         cleanup(&node, addr).await;
         return;
     }
@@ -305,8 +305,7 @@ async fn session(node: Node, stream: TcpStream, addr: SocketAddr, outbound: bool
     // --- Message loop ---
     // Outbound queue: RPC/P2P producers push; the writer drains.
     let (tx, mut rx) = mpsc::channel::<Message>(PEER_QUEUE);
-    node
-        .peer_tx
+    node.peer_tx
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .insert(addr, tx.clone());
@@ -315,7 +314,10 @@ async fn session(node: Node, stream: TcpStream, addr: SocketAddr, outbound: bool
     let writer_params = params.clone();
     let writer = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
-            if codec::write_message(&mut wr, &msg, &writer_params).await.is_err() {
+            if codec::write_message(&mut wr, &msg, &writer_params)
+                .await
+                .is_err()
+            {
                 break;
             }
         }
@@ -323,8 +325,11 @@ async fn session(node: Node, stream: TcpStream, addr: SocketAddr, outbound: bool
 
     // Reader loop.
     loop {
-        match timeout(codec::IO_TIMEOUT + Duration::from_secs(5), codec::recv(&mut rd, &params))
-            .await
+        match timeout(
+            codec::IO_TIMEOUT + Duration::from_secs(5),
+            codec::recv(&mut rd, &params),
+        )
+        .await
         {
             Ok(Ok(msg)) => {
                 {
@@ -351,8 +356,7 @@ async fn session(node: Node, stream: TcpStream, addr: SocketAddr, outbound: bool
     }
 
     // --- Cleanup ---
-    node
-        .peer_tx
+    node.peer_tx
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&addr);
@@ -443,27 +447,28 @@ async fn handle_message(
         }
 
         Message::Block(block) => {
-            handle_block(node, addr, block).await;
+            handle_block(node, addr, block, reply).await;
             true
         }
 
         Message::Headers { headers, .. } => {
             let mut inner = node.inner.lock().unwrap_or_else(|e| e.into_inner());
+            // Headers extend our tip sequentially (on_headers enforces
+            // linkage), so the batch's last header sits at
+            // tip_height_at_receipt + len(headers).
+            let base_h = inner.chain.height();
             match inner.sync.on_headers(addr, &headers) {
                 Ok(_) => {
-                    // Queue wanted blocks and request the next batch.
-                    let want = inner.sync.next_getdata(&addr);
+                    let claimed_h = base_h.saturating_add(headers.len() as u32);
+                    inner
+                        .claimed
+                        .entry(addr)
+                        .and_modify(|c| *c = (*c).max(claimed_h))
+                        .or_insert(claimed_h);
+                    // Drain the whole wanted queue — chunked getdata.
+                    let want = drain_wanted(&mut inner, addr);
                     drop(inner);
-                    if !want.is_empty() {
-                        let _ = reply.try_send(Message::GetData(
-                            want.into_iter()
-                                .map(|h| minibtc_p2p::codec::InvItem {
-                                    kind: minibtc_p2p::codec::InvType::Block,
-                                    hash: h,
-                                })
-                                .collect(),
-                        ));
-                    }
+                    send_getdata(reply, want);
                 }
                 Err(e) => {
                     tracing::debug!(%addr, "bad headers: {e}");
@@ -573,7 +578,7 @@ async fn handle_getdata(
 }
 
 /// Queue an inbound block and drain whatever became connectable.
-async fn handle_block(node: &Node, addr: SocketAddr, block: Block) {
+async fn handle_block(node: &Node, addr: SocketAddr, block: Block, reply: &mpsc::Sender<Message>) {
     {
         let mut inner = node.inner.lock().unwrap_or_else(|e| e.into_inner());
         // sync.on_block marks `have` (headers dedup) and per-peer progress;
@@ -585,13 +590,13 @@ async fn handle_block(node: &Node, addr: SocketAddr, block: Block) {
             return; // queue full — already counted as `have`
         }
     }
-    drain_pending(node, addr).await;
+    drain_pending(node, addr, reply).await;
 }
 
 /// Connect pending blocks whose parents are known, in arrival order.
 /// Stops at the first unconnectable gap — later arrivals retry on the
 /// next block/headers event.
-async fn drain_pending(node: &Node, origin: SocketAddr) {
+async fn drain_pending(node: &Node, origin: SocketAddr, reply: &mpsc::Sender<Message>) {
     loop {
         let next = {
             let mut inner = node.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -617,6 +622,58 @@ async fn drain_pending(node: &Node, origin: SocketAddr) {
                 inner.peers.score(&origin, SCORE_BAD_BLOCK);
                 break;
             }
+        }
+    }
+    // Pending drained — pull the next wanted batch, and if the peer
+    // claims more height than we have, ask for the next headers batch.
+    let (want, need_headers) = {
+        let mut inner = node.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let want = drain_wanted(&mut inner, origin);
+        let our_h = inner.chain.height();
+        let claimed = inner.claimed.get(&origin).copied().unwrap_or(0);
+        (want, claimed > our_h)
+    };
+    send_getdata(reply, want);
+    if need_headers {
+        let locator = {
+            let inner = node.inner.lock().unwrap_or_else(|e| e.into_inner());
+            sync_locator(&inner)
+        };
+        let _ = reply.try_send(Message::GetHeaders {
+            locator,
+            stop: Hash256::ZERO,
+        });
+    }
+}
+
+/// Pop all wanted block hashes for `peer`, chunked for getdata.
+fn drain_wanted(inner: &mut NodeInner, peer: SocketAddr) -> Vec<Hash256> {
+    let mut out = Vec::new();
+    loop {
+        let batch = inner.sync.next_getdata(&peer);
+        if batch.is_empty() {
+            break;
+        }
+        out.extend(batch);
+        if out.len() >= 8_192 {
+            break; // sanity cap — wanted is already window-bounded
+        }
+    }
+    out
+}
+
+/// Send wanted hashes as GetData messages (500 per message — bounded).
+fn send_getdata(reply: &mpsc::Sender<Message>, want: Vec<Hash256>) {
+    for chunk in want.chunks(500) {
+        let items: Vec<minibtc_p2p::codec::InvItem> = chunk
+            .iter()
+            .map(|h| minibtc_p2p::codec::InvItem {
+                kind: minibtc_p2p::codec::InvType::Block,
+                hash: *h,
+            })
+            .collect();
+        if reply.try_send(Message::GetData(items)).is_err() {
+            break;
         }
     }
 }
@@ -653,7 +710,9 @@ fn active_headers(
     let mut chain_hdrs: Vec<minibtc_primitives::BlockHeader> = Vec::new();
     let mut cur = inner.chain.tip;
     loop {
-        let Some(rec) = inner.chain.blocks.get(&cur) else { break };
+        let Some(rec) = inner.chain.blocks.get(&cur) else {
+            break;
+        };
         if rec.status != minibtc_chainstate::BlockStatus::Active {
             break;
         }

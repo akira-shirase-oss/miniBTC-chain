@@ -72,8 +72,7 @@ async fn main() -> Result<()> {
 
     // Params: custom file or devnet preset.
     let params: ChainParams = match &args.params {
-        Some(p) => ChainParams::load(p)
-            .with_context(|| format!("load params {}", p.display()))?,
+        Some(p) => ChainParams::load(p).with_context(|| format!("load params {}", p.display()))?,
         None => ChainParams::devnet(),
     };
     if !params.devnet {
@@ -81,8 +80,7 @@ async fn main() -> Result<()> {
     }
 
     // Node: open store, load/reindex chain.
-    let node = core::open(&args.datadir, params.clone(), args.reindex)
-        .context("open node")?;
+    let node = core::open(&args.datadir, params.clone(), args.reindex).context("open node")?;
     tracing::info!(
         datadir = %args.datadir.display(),
         tip = %node_tip(&node),
@@ -91,11 +89,7 @@ async fn main() -> Result<()> {
 
     // RPC auth cookie — written into datadir, never logged.
     let auth = minibtc_rpc::server::CookieAuth::generate();
-    std::fs::write(
-        args.datadir.join(".cookie"),
-        auth.to_cookie_file(),
-    )
-    .context("write .cookie")?;
+    std::fs::write(args.datadir.join(".cookie"), auth.to_cookie_file()).context("write .cookie")?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -178,18 +172,17 @@ fn node_tip(node: &core::Node) -> String {
 /// Runs until cancel. Each iteration re-reads mempool + tip fresh.
 async fn mine_loop(node: core::Node, address: Option<String>) {
     let payout = match address {
-        Some(a) => match minibtc_crypto::Address::from_base58(
-            &a,
-            Some(node.params.address_version),
-        ) {
-            Ok(addr) => minibtc_script::Script::p2pkh(&addr.hash160)
-                .as_bytes()
-                .to_vec(),
-            Err(e) => {
-                tracing::error!("bad --mining-address: {e}");
-                return;
+        Some(a) => {
+            match minibtc_crypto::Address::from_base58(&a, Some(node.params.address_version)) {
+                Ok(addr) => minibtc_script::Script::p2pkh(&addr.hash160)
+                    .as_bytes()
+                    .to_vec(),
+                Err(e) => {
+                    tracing::error!("bad --mining-address: {e}");
+                    return;
+                }
             }
-        },
+        }
         None => vec![0x51], // OP_TRUE anyone-can-spend (shouldn't happen — clap requires)
     };
     tracing::info!("mining enabled");

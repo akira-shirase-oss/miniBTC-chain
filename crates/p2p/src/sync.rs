@@ -24,7 +24,7 @@ use std::net::SocketAddr;
 /// more (Bitcoin uses 2000).
 pub const HEADERS_BATCH: usize = 2_000;
 /// Max blocks we'll request from one peer at once (in-flight window).
-pub const BLOCK_WINDOW: usize = 16;
+pub const BLOCK_WINDOW: usize = 4_096;
 /// Max tx invs gossiped per relay event.
 pub const RELAY_FANOUT: usize = 8;
 /// How many recent inv hashes we remember for dedup (bounded).

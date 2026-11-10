@@ -15,8 +15,8 @@
 
 use hmac::digest::KeyInit;
 use hmac::{Hmac, Mac};
-use k256::elliptic_curve::sec1::ToSec1Point;
 use k256::elliptic_curve::PrimeField;
+use k256::elliptic_curve::sec1::ToSec1Point;
 use k256::{AffinePoint, ProjectivePoint, Scalar, SecretKey};
 use minibtc_crypto::hash160;
 use sha2::Sha512;
@@ -71,7 +71,10 @@ impl ChildNumber {
         if index >= HARDENED {
             return Err(Bip32Error::BadPath(s.to_string()));
         }
-        Ok(Self { index, hardened: hard })
+        Ok(Self {
+            index,
+            hardened: hard,
+        })
     }
 }
 
@@ -108,21 +111,36 @@ impl DerivationPath {
     pub fn bip44_account(coin_type: u32, account: u32) -> Self {
         Self {
             children: vec![
-                ChildNumber { index: 44, hardened: true },
-                ChildNumber { index: coin_type, hardened: true },
-                ChildNumber { index: account, hardened: true },
+                ChildNumber {
+                    index: 44,
+                    hardened: true,
+                },
+                ChildNumber {
+                    index: coin_type,
+                    hardened: true,
+                },
+                ChildNumber {
+                    index: account,
+                    hardened: true,
+                },
             ],
         }
     }
 
     /// BIP44 external-chain receive address index.
     pub fn receive(index: u32) -> ChildNumber {
-        ChildNumber { index, hardened: false }
+        ChildNumber {
+            index,
+            hardened: false,
+        }
     }
 
     /// BIP44 internal-chain change address index.
     pub fn change(index: u32) -> ChildNumber {
-        ChildNumber { index, hardened: false }
+        ChildNumber {
+            index,
+            hardened: false,
+        }
     }
 }
 
@@ -417,7 +435,8 @@ impl Xpub {
         ir.copy_from_slice(&i[32..]);
 
         // child_point = IL*G + Kpar
-        let tweak = Option::<Scalar>::from(Scalar::from_repr(field_bytes(&il))).ok_or(Bip32Error::InvalidKey)?;
+        let tweak = Option::<Scalar>::from(Scalar::from_repr(field_bytes(&il)))
+            .ok_or(Bip32Error::InvalidKey)?;
         let tweak_point = ProjectivePoint::mul_by_generator(&tweak);
         let parent_point = projective_from_compressed(&self.pub_key)?;
         let child_point = tweak_point + parent_point;
@@ -497,7 +516,11 @@ mod tests {
         let seed = [9u8; 64];
         let x = Xpriv::master(&seed).unwrap();
         let dbg = format!("{:?}", x);
-        let hex: String = x.secret_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        let hex: String = x
+            .secret_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
         assert!(!dbg.contains(&hex[..16]));
     }
 
@@ -513,8 +536,14 @@ mod tests {
         // receive index 0, non-hardened → public derivation OK.
         let path = DerivationPath {
             children: vec![
-                ChildNumber { index: 0, hardened: false },
-                ChildNumber { index: 0, hardened: false },
+                ChildNumber {
+                    index: 0,
+                    hardened: false,
+                },
+                ChildNumber {
+                    index: 0,
+                    hardened: false,
+                },
             ],
         };
         let priv_child = xpriv_acct.derive_path(&path).unwrap();
@@ -532,7 +561,10 @@ mod tests {
         let master = Xpriv::master(&seed).unwrap();
         let xpub = master.to_xpub().unwrap();
         assert!(matches!(
-            xpub.derive(ChildNumber { index: 0, hardened: true }),
+            xpub.derive(ChildNumber {
+                index: 0,
+                hardened: true
+            }),
             Err(Bip32Error::HardenedPub)
         ));
     }

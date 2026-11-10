@@ -253,7 +253,10 @@ mod tests {
         // ciphertext bytes shouldn't trivially appear — Debug prints
         // struct fields but ciphertext is Vec<u8> which WILL print.
         // That's acceptable (it's encrypted), but seed must not appear.
-        let seed_hex = [7u8; SEED_LEN].iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let seed_hex = [7u8; SEED_LEN]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
         assert!(!dbg.contains(&seed_hex));
     }
 
@@ -265,6 +268,9 @@ mod tests {
         assert_ne!(a.nonce, b.nonce);
         assert_ne!(a.ciphertext, b.ciphertext);
         // Both decrypt to same seed.
-        assert_eq!(a.decrypt("pw").unwrap().expose(), b.decrypt("pw").unwrap().expose());
+        assert_eq!(
+            a.decrypt("pw").unwrap().expose(),
+            b.decrypt("pw").unwrap().expose()
+        );
     }
 }

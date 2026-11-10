@@ -256,14 +256,8 @@ impl Store {
                         height: rec.height,
                         coinbase: is_cb,
                     };
-                    let op = OutPoint {
-                        txid,
-                        vout: vout32,
-                    };
-                    utxos.insert(
-                        outpoint_key(&op).as_slice(),
-                        encode_utxo(&entry).as_slice(),
-                    )?;
+                    let op = OutPoint { txid, vout: vout32 };
+                    utxos.insert(outpoint_key(&op).as_slice(), encode_utxo(&entry).as_slice())?;
                 }
             }
             // Advance the recorded tip.
@@ -298,10 +292,7 @@ impl Store {
                     let _ = utxos.remove(outpoint_key(op).as_slice())?;
                 }
                 for (op, entry) in &u.spent {
-                    utxos.insert(
-                        outpoint_key(op).as_slice(),
-                        encode_utxo(entry).as_slice(),
-                    )?;
+                    utxos.insert(outpoint_key(op).as_slice(), encode_utxo(entry).as_slice())?;
                 }
             }
             let mut new_tip = None;
@@ -447,7 +438,11 @@ impl Store {
         // Tip = recorded tip when it names a stored block, else most work.
         chain.tip = recorded_tip
             .filter(|t| *t == genesis_hash || chain.blocks.contains_key(t))
-            .unwrap_or(if max_work.0 > 0 { max_work.1 } else { genesis_hash });
+            .unwrap_or(if max_work.0 > 0 {
+                max_work.1
+            } else {
+                genesis_hash
+            });
         // Recompute active status: mark only the active-chain blocks.
         mark_active(&mut chain);
         Ok(Some(chain))

@@ -7,9 +7,9 @@
 //! intentional and documented; it is never used for real value.
 
 use crate::ChainParams;
-use minibtc_crypto::{double_sha256, Keypair};
+use minibtc_crypto::{Keypair, double_sha256};
 use minibtc_primitives::{
-    merkle_root, Block, BlockHeader, OutPoint, Sats, Transaction, TxInput, TxOutput,
+    Block, BlockHeader, OutPoint, Sats, Transaction, TxInput, TxOutput, merkle_root,
 };
 use minibtc_script::Script;
 

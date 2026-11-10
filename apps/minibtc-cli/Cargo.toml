@@ -13,6 +13,8 @@ minibtc-primitives = { path = "../../crates/primitives" }
 minibtc-wallet = { path = "../../crates/wallet" }
 minibtc-rpc = { path = "../../crates/rpc" }
 minibtc-consensus = { path = "../../crates/consensus" }
+minibtc-chainstate = { path = "../../crates/chainstate" }
+minibtc-script = { path = "../../crates/script" }
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true

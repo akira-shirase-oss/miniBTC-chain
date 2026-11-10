@@ -2,14 +2,14 @@
 //! spawn_blocking dispatch so slow methods never stall the executor.
 
 use crate::backend::SharedBackend;
-use crate::types::{params_array, JsonRpcRequest, JsonRpcResponse, RpcError};
+use crate::types::{JsonRpcRequest, JsonRpcResponse, RpcError, params_array};
 use axum::{
+    Json, Router,
     body::Bytes,
     extract::State,
-    http::{header, HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
-    Json, Router,
 };
 use base64::Engine;
 use serde_json::Value;
@@ -153,11 +153,7 @@ fn unauthorized() -> Response {
         .into_response()
 }
 
-async fn rpc_handler(
-    State(st): State<ServerState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
+async fn rpc_handler(State(st): State<ServerState>, headers: HeaderMap, body: Bytes) -> Response {
     if !authorized(&headers, &st.auth) {
         return unauthorized();
     }

@@ -2,10 +2,10 @@
 //! result payloads. Hashes display in internal byte order (our canonical
 //! hex); amounts are integer sats plus an 8-decimal string — never floats.
 
-use minibtc_consensus::{pow, ChainParams};
+use minibtc_consensus::{ChainParams, pow};
 use minibtc_crypto::{Address, Hash160, Hash256};
 use minibtc_primitives::{Block, BlockHeader, OutPoint, Sats, Transaction, TxOutput};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Sats → `{ "sats": n, "amount": "x.yyyyyyyy" }` (8 decimals, BTC-style).
 pub fn money(sats: Sats) -> Value {

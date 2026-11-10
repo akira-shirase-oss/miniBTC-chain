@@ -4,10 +4,10 @@
 //! how consensus code dies, and a devnet does not need finer granularity.
 
 use minibtc_chainstate::Chain;
-use minibtc_consensus::{genesis_block, validate_tx, ChainParams};
+use minibtc_consensus::{ChainParams, genesis_block, validate_tx};
 use minibtc_crypto::Hash256;
 use minibtc_mempool::{Mempool, MempoolPolicy};
-use minibtc_p2p::codec::{Message, InvItem, InvType};
+use minibtc_p2p::codec::{InvItem, InvType, Message};
 use minibtc_p2p::peer::PeerManager;
 use minibtc_p2p::sync::Sync;
 use minibtc_primitives::{OutPoint, Sats, Transaction};
@@ -92,6 +92,9 @@ pub struct NodeInner {
     pub txindex: HashMap<Hash256, Hash256>,
     /// Out-of-order block download queue.
     pub pending: PendingBlocks,
+    /// Highest block height each peer has claimed (via version or a
+    /// headers batch) — drives continued getheaders until caught up.
+    pub claimed: HashMap<SocketAddr, u32>,
 }
 
 /// The node handle shared by RPC, P2P sessions and the mining loop.
@@ -124,11 +127,7 @@ pub enum ConnectOutcome {
 ///
 /// - `reindex`: replay all stored blocks through validation, discarding
 ///   derived state.
-pub fn open(
-    datadir: &Path,
-    params: ChainParams,
-    reindex: bool,
-) -> Result<Node, NodeError> {
+pub fn open(datadir: &Path, params: ChainParams, reindex: bool) -> Result<Node, NodeError> {
     std::fs::create_dir_all(datadir)?;
     let store = Store::open(datadir)?;
     let genesis = genesis_block(&params);
@@ -166,6 +165,7 @@ pub fn open(
         addrbook: Vec::new(),
         txindex,
         pending: PendingBlocks::default(),
+        claimed: HashMap::new(),
     };
     Ok(Node {
         params,
@@ -228,7 +228,10 @@ impl Node {
     /// Connect a block through the full pipeline: validate → connect or
     /// reorg → persist → refresh mempool → update sync tip. Returns the
     /// outcome; the caller relays the inv announcement.
-    pub fn connect_block(&self, block: minibtc_primitives::Block) -> Result<ConnectOutcome, NodeError> {
+    pub fn connect_block(
+        &self,
+        block: minibtc_primitives::Block,
+    ) -> Result<ConnectOutcome, NodeError> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let hash = block.header.block_hash();
         if inner.chain.blocks.contains_key(&hash) {
@@ -279,16 +282,13 @@ impl Node {
         inner: &NodeInner,
         tx: &Transaction,
     ) -> Result<Sats, String> {
-        let fee = validate_tx(tx, &inner.chain.utxos, &self.params)
-            .map_err(|e| e.to_string())?;
+        let fee = validate_tx(tx, &inner.chain.utxos, &self.params).map_err(|e| e.to_string())?;
         // Coinbase maturity is a connect-time rule; mempool enforces it
         // early so miners never template an unminable tx.
         let tip_h = inner.chain.height();
         for inp in &tx.inputs {
             if let Some(e) = inner.chain.utxos.get(&inp.prev) {
-                if e.coinbase
-                    && tip_h.saturating_sub(e.height) < self.params.coinbase_maturity
-                {
+                if e.coinbase && tip_h.saturating_sub(e.height) < self.params.coinbase_maturity {
                     return Err(format!(
                         "immature coinbase (depth {} < {})",
                         tip_h.saturating_sub(e.height),
@@ -315,9 +315,7 @@ impl Node {
         let fee = self
             .validate_for_mempool(&inner, &tx)
             .map_err(AcceptError::Invalid)?;
-        let NodeInner {
-            mempool, chain, ..
-        } = &mut *inner;
+        let NodeInner { mempool, chain, .. } = &mut *inner;
         mempool
             .admit(tx.clone(), fee, &chain.utxos, &self.params, replace)
             .map_err(|e| match e {
@@ -406,11 +404,7 @@ impl Node {
 
     /// Build + mine + connect `n` blocks paying `payout_script`.
     /// Devnet-gated by the caller (RPC checks `params.devnet`).
-    pub fn generate(
-        &self,
-        n: u64,
-        payout_script: &[u8],
-    ) -> Result<Vec<Hash256>, NodeError> {
+    pub fn generate(&self, n: u64, payout_script: &[u8]) -> Result<Vec<Hash256>, NodeError> {
         let mut hashes = Vec::with_capacity(n as usize);
         for _ in 0..n {
             if self.cancel.load(Ordering::Relaxed) {
@@ -454,15 +448,12 @@ impl Node {
                 }
                 ConnectOutcome::SideBranch => {
                     // Shouldn't happen mining on tip — treat as failure.
-                    return Err(NodeError::Chain(
-                        minibtc_chainstate::ChainError::NotTip,
-                    ));
+                    return Err(NodeError::Chain(minibtc_chainstate::ChainError::NotTip));
                 }
             }
         }
         Ok(hashes)
     }
-
 }
 
 /// Why a tx was refused — consensus failures are peer-faultworthy,
@@ -486,7 +477,8 @@ fn candidate_time(inner: &NodeInner) -> u32 {
         .get(&inner.chain.tip)
         .map(|r| r.block.header.time)
         .unwrap_or(0);
-    now.max(mtp.saturating_add(1)).max(tip_time.saturating_add(1))
+    now.max(mtp.saturating_add(1))
+        .max(tip_time.saturating_add(1))
 }
 
 /// Bits for the next block: prev bits, retargeted at period boundaries.
@@ -516,9 +508,11 @@ fn next_bits(
         target_span,
         inner.chain.params.pow_clamp_factor,
     )
-    .map_err(|e| NodeError::Chain(minibtc_chainstate::ChainError::InvalidBlock(
-        minibtc_consensus::BlockError::Pow(e),
-    )))
+    .map_err(|e| {
+        NodeError::Chain(minibtc_chainstate::ChainError::InvalidBlock(
+            minibtc_consensus::BlockError::Pow(e),
+        ))
+    })
 }
 
 impl NodeInner {
@@ -535,11 +529,7 @@ impl NodeInner {
 /// Compute a tx's fee by resolving inputs through the tx index +
 /// stored blocks. Bounded: skips fee when inputs exceed the cap or a
 /// prev tx is unresolvable.
-pub fn tx_fee(
-    node: &Node,
-    inner: &NodeInner,
-    tx: &Transaction,
-) -> Option<Sats> {
+pub fn tx_fee(node: &Node, inner: &NodeInner, tx: &Transaction) -> Option<Sats> {
     const MAX_FEE_INPUTS: usize = 1_000;
     if tx.inputs.len() > MAX_FEE_INPUTS {
         return None;
@@ -564,11 +554,7 @@ pub fn tx_fee(
 
 /// Locate a transaction by txid: mempool → txindex → block scan.
 /// Caller holds the inner lock.
-pub fn find_tx(
-    node: &Node,
-    inner: &NodeInner,
-    txid: &Hash256,
-) -> Option<Transaction> {
+pub fn find_tx(node: &Node, inner: &NodeInner, txid: &Hash256) -> Option<Transaction> {
     // Mempool first (unconfirmed).
     if let Some(e) = inner.mempool.get(txid) {
         return Some(e.tx.clone());
@@ -610,4 +596,3 @@ pub fn tx_confirmations(inner: &NodeInner, txid: &Hash256) -> Option<u64> {
         h = h.saturating_sub(1);
     }
 }
-

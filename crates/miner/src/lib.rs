@@ -12,13 +12,13 @@
 //! - [`next_bits`] — difficulty retarget per params (clamped ×4).
 
 use minibtc_consensus::{ChainParams, retarget_bits};
+#[cfg(test)]
+use minibtc_crypto::Keypair;
 use minibtc_primitives::{
     Block, BlockHeader, OutPoint, Sats, Transaction, TxInput, TxOutput, merkle_root,
 };
 #[cfg(test)]
 use minibtc_script::Script;
-#[cfg(test)]
-use minibtc_crypto::Keypair;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Errors building or mining a block.

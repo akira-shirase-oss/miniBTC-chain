@@ -7,11 +7,11 @@ use crate::core::{self, Node, NodeInner};
 use minibtc_crypto::hash::hex_decode;
 use minibtc_crypto::{Address, Hash256};
 use minibtc_primitives::{OutPoint, Sats, Transaction};
+use minibtc_rpc::NODE_METHODS;
 use minibtc_rpc::backend::RpcBackend;
 use minibtc_rpc::render;
-use minibtc_rpc::types::{param_str, param_u64, param_u64_opt, RpcError};
-use minibtc_rpc::NODE_METHODS;
-use serde_json::{json, Value};
+use minibtc_rpc::types::{RpcError, param_str, param_u64, param_u64_opt};
+use serde_json::{Value, json};
 use std::sync::Arc;
 
 /// Cap on `getrawmempool` / address-history style listings.
@@ -40,15 +40,13 @@ impl NodeBackend {
     fn address_script(&self, addr_s: &str) -> Result<Vec<u8>, RpcError> {
         let a = Address::from_base58(addr_s, Some(self.node.params.address_version))
             .map_err(|e| RpcError::InvalidParams(format!("bad address: {e}")))?;
-        Ok(minibtc_script::Script::p2pkh(&a.hash160).as_bytes().to_vec())
+        Ok(minibtc_script::Script::p2pkh(&a.hash160)
+            .as_bytes()
+            .to_vec())
     }
 
     /// Parse a txid-or-height block reference.
-    fn block_ref(
-        &self,
-        inner: &NodeInner,
-        s: &str,
-    ) -> Result<Hash256, RpcError> {
+    fn block_ref(&self, inner: &NodeInner, s: &str) -> Result<Hash256, RpcError> {
         if let Ok(h) = u64::from_str_radix(s, 10) {
             return core::block_at_height(inner, h as u32)
                 .ok_or_else(|| RpcError::App(format!("no block at height {h}")));
@@ -88,7 +86,6 @@ impl NodeBackend {
             h = h.saturating_sub(1);
         }
     }
-
 }
 
 impl RpcBackend for NodeBackend {
@@ -172,8 +169,7 @@ impl RpcBackend for NodeBackend {
                     .ok_or_else(|| RpcError::App(format!("tx not found: {txid_s}")))?;
                 let conf = core::tx_confirmations(&inner, &txid);
                 if verbose {
-                    let fee = core::tx_fee(&self.node, &inner, &tx)
-                        .map(|f| f.sats());
+                    let fee = core::tx_fee(&self.node, &inner, &tx).map(|f| f.sats());
                     Ok(render::tx_json(
                         &tx,
                         self.node.params.address_version,
@@ -240,12 +236,7 @@ impl RpcBackend for NodeBackend {
             "getmempoolinfo" => {
                 let inner = self.inner();
                 let entries = inner.mempool.len();
-                let bytes: usize = inner
-                    .mempool
-                    .by_fee_rate()
-                    .iter()
-                    .map(|e| e.size)
-                    .sum();
+                let bytes: usize = inner.mempool.by_fee_rate().iter().map(|e| e.size).sum();
                 Ok(json!({
                     "size": entries,
                     "bytes": bytes,
@@ -266,7 +257,12 @@ impl RpcBackend for NodeBackend {
                         let fee = e.fee.sats();
                         out.insert(
                             e.txid.to_hex(),
-                            render::tx_json(&e.tx, self.node.params.address_version, Some(fee), None),
+                            render::tx_json(
+                                &e.tx,
+                                self.node.params.address_version,
+                                Some(fee),
+                                None,
+                            ),
                         );
                     }
                     Ok(Value::Object(out))
@@ -314,6 +310,28 @@ impl RpcBackend for NodeBackend {
                 Ok(Value::Array(peers))
             }
 
+            "banpeer" => {
+                let ip_s = param_str(params, 0, "ip")?;
+                let ip: std::net::IpAddr = ip_s
+                    .parse()
+                    .map_err(|_| RpcError::InvalidParams("bad ip".into()))?;
+                let mut inner = self.inner();
+                inner.peers.ban(ip);
+                // Also drop any live session from that IP.
+                let addrs: Vec<std::net::SocketAddr> = inner
+                    .peers
+                    .snapshot()
+                    .into_iter()
+                    .map(|(a, _)| a)
+                    .filter(|a| a.ip() == ip)
+                    .collect();
+                drop(inner);
+                for a in addrs {
+                    self.node.peer_tx.lock().ok().map(|mut m| m.remove(&a));
+                }
+                Ok(json!({ "banned": ip_s }))
+            }
+
             "getnetworkinfo" => {
                 let inner = self.inner();
                 Ok(json!({
@@ -329,6 +347,56 @@ impl RpcBackend for NodeBackend {
                     "relayfee": 0.0,
                     "incrementalfee": 0.0,
                     "localaddresses": [],
+                }))
+            }
+
+            "getaddressutxos" => {
+                let addr_s = param_str(params, 0, "address")?;
+                let script = self.address_script(addr_s)?;
+                let inner = self.inner();
+                let tip = inner.chain.height();
+                let mut out = Vec::new();
+                for (op, e) in inner.chain.utxos.iter() {
+                    if e.output.script_pubkey == script {
+                        out.push(render::utxo_json(
+                            op,
+                            e.output.value,
+                            &e.output.script_pubkey,
+                            e.height,
+                            e.coinbase,
+                            u64::from(tip.saturating_sub(e.height)) + 1,
+                            self.node.params.address_version,
+                        ));
+                    }
+                }
+                Ok(Value::Array(out))
+            }
+
+            "scantxoutset" => {
+                // Full UTXO dump for wallet scanning — devnet scale,
+                // hard-capped so a hostile/buggy caller can't OOM us.
+                let inner = self.inner();
+                let tip = inner.chain.height();
+                let mut out = Vec::new();
+                for (op, e) in inner.chain.utxos.iter() {
+                    if out.len() >= 1_000_000 {
+                        break;
+                    }
+                    out.push(json!({
+                        "txid": op.txid.to_hex(),
+                        "vout": op.vout,
+                        "value": e.output.value.sats(),
+                        "scriptPubKey": minibtc_crypto::hex_encode(&e.output.script_pubkey),
+                        "height": e.height,
+                        "coinbase": e.coinbase,
+                        "confirmations": u64::from(tip.saturating_sub(e.height)) + 1,
+                    }));
+                }
+                Ok(json!({
+                    "chain": self.node.params.name,
+                    "tip_height": tip,
+                    "count": out.len(),
+                    "utxos": out,
                 }))
             }
 
@@ -354,9 +422,7 @@ impl RpcBackend for NodeBackend {
 
             "generatetoaddress" => {
                 if !self.node.params.devnet {
-                    return Err(RpcError::App(
-                        "generatetoaddress is devnet-only".into(),
-                    ));
+                    return Err(RpcError::App("generatetoaddress is devnet-only".into()));
                 }
                 let n = param_u64(params, 0, "nblocks")?;
                 let addr = param_str(params, 1, "address")?;
