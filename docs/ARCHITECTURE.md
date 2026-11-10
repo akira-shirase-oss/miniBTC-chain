@@ -20,7 +20,8 @@ the contract; this document records how the pieces fit in *this* workspace.
 | RPC | `crates/rpc` | JSON-RPC 2.0 server + typed client; cookie auth; localhost default. |
 | Node | `apps/minibtc-node` | Wires everything; owns chainstate, mempool, peers, miner, RPC. |
 | CLI | `apps/minibtc-cli` | All blueprint §6 commands; human + `--json` output. |
-| Explorer | `apps/minibtc-explorer` | Read-only axum UI over the node RPC. |
+| Explorer | `apps/minibtc-explorer` | Read-only axum UI over the node RPC (search, pagination, dashboard, watch-only address views). |
+| Wallet UI | `apps/minibtc-wallet-ui` | Key-holding local web UI (D-011): passphrase→in-memory session, CSRF, audit, send flow. Separate binary so the explorer stays read-only. |
 | MCP | `apps/minibtc-mcp` | rmcp server; RPC client only; gated writes; audit log. |
 | Attack lab | `tests/attacks` | One test per blueprint §8 row. |
 

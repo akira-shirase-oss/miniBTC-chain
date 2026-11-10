@@ -80,6 +80,25 @@ nodes name each other; `peers`/`addnode` RPC covers re-seeding. The
 eclipse-resistance limits (per-IP, per-/16, inbound cap) still apply to
 whatever peers do connect.
 
+### D-011 — UI expansion beyond the blueprint's read-only explorer
+
+User-directed scope addition after P12 close-out. Two parts:
+
+1. **Explorer enrichment** (same `minibtc-explorer` binary, still
+   read-only): global search (txid/hash/height/address), paginated block
+   index, dashboard stats, fee-rate columns, richer tx/address pages,
+   watch-only address views. No write paths — unchanged contract.
+2. **`minibtc-wallet-ui`** — a NEW separate binary. The blueprint gives
+   the wallet a CLI, not a web UI; this extends it deliberately. It is
+   key-holding by necessity, so the security contract is stricter than
+   the explorer's: passphrase unlocks into an in-memory session only
+   (never persisted, never logged), per-session CSRF tokens on every
+   POST, SameSite=Strict HttpOnly cookies, localhost bind by default,
+   audit log with no secrets, and seeds/xprvs/keys can never appear in
+   any response. Wallet create/restore stays CLI-only — the UI manages
+   existing wallets; showing a seed in a browser is exactly the risk
+   the keystore exists to prevent.
+
 ## Open questions
 
 - None blocking. Post-v1 candidates if revisited: SegWit/Taproot sighash
