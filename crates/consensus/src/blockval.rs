@@ -63,6 +63,7 @@ pub enum BlockError {
 }
 
 /// Result of validating a block's transactions: total fees collected.
+#[derive(Debug)]
 pub struct BlockValidation {
     /// Sum of fees from all non-coinbase txs (sats).
     pub total_fees: Sats,
