@@ -122,6 +122,13 @@ impl<'a> Reader<'a> {
     }
 
     /// i32 little-endian.
+    pub fn i64(&mut self) -> Result<i64, ReadError> {
+        let b = self.take(8)?;
+        let mut arr = [0u8; 8];
+        arr.copy_from_slice(b);
+        Ok(i64::from_le_bytes(arr))
+    }
+
     pub fn i32(&mut self) -> Result<i32, ReadError> {
         Ok(self.u32()? as i32)
     }

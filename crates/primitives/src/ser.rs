@@ -72,6 +72,10 @@ impl Writer {
     }
 
     /// Signed 32-bit, little-endian (transaction/block versions).
+    pub fn i64(&mut self, v: i64) {
+        self.bytes(&v.to_le_bytes());
+    }
+
     pub fn i32(&mut self, v: i32) {
         self.buf.extend_from_slice(&v.to_le_bytes());
     }

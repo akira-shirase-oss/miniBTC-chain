@@ -54,6 +54,25 @@ impl BlockHeader {
         out
     }
 
+    /// Decode an 80-byte header from a reader (used by the `headers`
+    /// P2P message and block decode).
+    pub fn decode(r: &mut crate::de::Reader<'_>) -> Result<Self, ReadError> {
+        let version = r.i32()?;
+        let prev_hash = r.hash256()?;
+        let merkle_root = r.hash256()?;
+        let time = r.u32()?;
+        let bits = r.u32()?;
+        let nonce = r.u32()?;
+        Ok(Self {
+            version,
+            prev_hash,
+            merkle_root,
+            time,
+            bits,
+            nonce,
+        })
+    }
+
     /// The block hash: `double_sha256(header_encoding)`.
     pub fn block_hash(&self) -> Hash256 {
         double_sha256(&self.encode())
