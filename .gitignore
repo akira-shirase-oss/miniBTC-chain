@@ -9,3 +9,12 @@ var/
 *.wallet
 wallets/
 node-*/
+
+# Fuzzing artifacts — corpus is regenerated locally; crashes are evidence
+# but never committed silently.
+tests/attacks/fuzz/corpus/
+tests/attacks/fuzz/artifacts/
+
+# Fuzzing artifacts - corpus regenerates locally; crashes are evidence, never committed silently.
+tests/attacks/fuzz/corpus/
+tests/attacks/fuzz/artifacts/
