@@ -1,7 +1,9 @@
 # MiniBTC
 
-> **Status — building.** Phases P0–P12 per `docs/ROADMAP.md`; evidence lands
-> under `perf/results/`.
+> **Status — complete.** All phases P0–P12 per `docs/ROADMAP.md` are built and
+> verified: 15/15 attack scenarios, ~26M fuzz executions with zero crashes,
+> 9/9 property invariants, 6M load ops all passing, and a 17/17-phase three-node
+> devnet demo (fork reorg + two-wallet payment). Evidence under `perf/results/`.
 
 A from-scratch Bitcoin-style blockchain in Rust: a full node that validates
 every transaction and block, a P2P network, a miner, an HD wallet, a CLI, a
