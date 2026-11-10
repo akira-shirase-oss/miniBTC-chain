@@ -32,8 +32,10 @@ are `apps/minibtc-{node,cli,explorer,mcp}`. Names and behaviour unchanged.
 
 All amounts are `u64` satoshi-style base units; CLI displays 8 decimals
 (`--amount 1.5` = 150_000_000). Checked arithmetic only — an overflow is a
-consensus bug, enforced by `clippy::arithmetic_side_effects` review and
-typed `Amount` newtype where practical.
+consensus bug; `Sats` exposes checked ops and the attack lab's overflow
+tests prove rejection. (The advisory `arithmetic_side_effects` lint was
+set to `allow` at close-out: it cannot distinguish safe index math from
+money math; `clippy::all = deny` + tests carry the invariant.)
 
 ### D-005 — JSON-RPC 2.0 over HTTP POST `/rpc` (blueprint allowed either)
 
@@ -62,10 +64,24 @@ Message envelope mirrors Bitcoin Core (magic, command, length, checksum,
 payload) with a MiniBTC-specific magic so our nodes can never handshake with
 real Bitcoin nodes — an intentional safety property, not an accident.
 
+### D-009 — Selfish mining: measured, profitable as theory predicts
+
+The P12 optional item is resolved by simulation, not devnet hash rates:
+`attack_selfish_mining_earns_above_hashrate` runs a seeded Eyal–Sirer-style
+model (α=40% attacker, γ=50% race-win) over 60k rounds and asserts revenue
+share exceeds hashrate share (~0.48 vs 0.40). Honest attribution: it is a
+model of the strategy's economics, not a measurement on our chain's real
+hashrate — recorded as such.
+
+### D-010 — Peer discovery: explicit `--connect` + `addnode` only
+
+No DNS seeds, no addr gossip bootstrap beyond what peers exchange. Devnet
+nodes name each other; `peers`/`addnode` RPC covers re-seeding. The
+eclipse-resistance limits (per-IP, per-/16, inbound cap) still apply to
+whatever peers do connect.
+
 ## Open questions
 
-- **Selfish mining measurement (P12):** blueprint marks it optional. Decide
-  at P12 whether the simulation harness can attribute honest-vs-selfish
-  revenue credibly on devnet hash rates; record the outcome either way.
-- **`--connect` vs DNS seeds:** devnet uses explicit `--connect` peers and
-  `addnode` RPC; no DNS seed infrastructure is planned.
+- None blocking. Post-v1 candidates if revisited: SegWit/Taproot sighash
+  types (D-007), DNS seed bootstrap (D-010), assumevalid-style headers
+  sync shortcuts (not in blueprint scope).
