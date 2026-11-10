@@ -1,0 +1,55 @@
+MiniBTC devnet demo — Tue 10 Nov 2026 06:10:30 EST
+commit: 46055ad
+
+=== Phase 0: build binaries ===
+  PASS  cargo build --bins
+
+=== Phase 1: start 3 nodes + first convergence (120 blocks) ===
+  PASS  3 nodes started (p2p 38445/38447/38449, rpc 38446/38448/38450)
+  wallet A address: mjK8tUtSLBmp4KgFN1BNNWj91J9xGUk9qk
+  PASS  mined 120 blocks on N1
+  PASS  N1 tip (height=120)
+  PASS  N2 converged to N1 (height=120)
+  PASS  N3 converged to N1 (height=120)
+  convergence time for 120 blocks + 2 followers: 1s
+  N1 peers: 2
+  N2 peers: 1
+  N3 peers: 1
+
+=== Phase 2: partition N3, extend N1 by 40 ===
+./scripts/devnet-demo.sh: line 83: 92038 Terminated: 15          "$NODE" --datadir "$d" --listen "127.0.0.1:$p" --rpc "127.0.0.1:$r" --connect "$c" --log warn > "$d/node.log" 2>&1
+  PASS  N1 height after +40
+  PASS  N2 followed to 160 (height=160)
+
+=== Phase 3: reconnect N3 — catch-up over 40+ blocks ===
+  PASS  N3 caught up (height=160)
+  N3 catch-up time: 0s for 40 missed blocks
+  note: catch-up was 40 blocks
+
+=== Phase 4: deliberate fork — N3 mines 55 solo, most-work reorg ===
+./scripts/devnet-demo.sh: line 83: 92113 Terminated: 15          "$NODE" --datadir "$d" --listen "127.0.0.1:$p" --rpc "127.0.0.1:$r" --connect "$c" --log warn > "$d/node.log" 2>&1
+  N3 fork tip: height=215 hash=03b4cc204c9c7db711c1d63891477512b9b7eb7e75d3f3d3ad0de682b4000000 (network at 160)
+  PASS  N3 fork is ahead
+./scripts/devnet-demo.sh: line 83: 92142 Terminated: 15          "$NODE" --datadir "$d" --listen "127.0.0.1:$p" --rpc "127.0.0.1:$r" --log warn > "$d/node.log" 2>&1
+  PASS  N1 reorged to N3 fork (height=215)
+  PASS  N2 reorged to N3 fork (height=215)
+  PASS  N3 stable on its chain (height=215)
+  PASS  3-node convergence after most-work fork resolution
+
+=== Phase 5: two-wallet send through the live network ===
+  wallet B address: mtNE93J9Zt4migUFHKj9BZVxAKcKSV4QVL
+  alice balance before: 575000000000 sats
+  send result: {"hex":"01000000017479914e9289e08d4c5dbf62cb1499c494e68f0bc428d2a59db2d54780313199000000006a473044022010372219d2b9152420e9e3eae3d8fd70685c5552fe6fe0620b3887bf5160785a022058bd6a878787b108070aeb07049824031704897965daeb7fd329bae070bfae78012102f1b9859fecf8292c183f0d752fb36e73d0908362cdc4996e16010798307d87adfeffffff0200ca9a3b000000001976a9148cf31e30d9cae0933b9199d60d8cd2cab0e8834588acff276bee000000001976a91499c3c6ca35613645b08b20dc32fc033dd131b1a688ac00000000","signed_txid":"3ba7b8b465a03955357a27bd02c681936dfd9efbd961d131095886834b727630","txid":"3ba7b8b465a03955357a27bd02c681936dfd9efbd961d131095886834b727630"} 
+  txid: 3ba7b8b465a03955357a27bd02c681936dfd9efbd961d131095886834b727630
+  PASS  N2 saw payment block (height=216)
+  PASS  N3 saw payment block (height=216)
+  bob balance after: 1000000000 sats (expected ≥ 1_000_000_000)
+  PASS  wallet B received 10 BTC
+
+=== Summary ===
+  phases passed: 17   failed: 0
+  final height: 216   log: perf/results/devnet-demo-20261110-061030.log
+./scripts/devnet-demo.sh: line 83: 91995 Terminated: 15          "$NODE" --datadir "$d" --listen "127.0.0.1:$p" --rpc "127.0.0.1:$r" --log warn > "$d/node.log" 2>&1
+./scripts/devnet-demo.sh: line 83: 92029 Terminated: 15          "$NODE" --datadir "$d" --listen "127.0.0.1:$p" --rpc "127.0.0.1:$r" --connect "$c" --log warn > "$d/node.log" 2>&1
+./scripts/devnet-demo.sh: line 83: 92282 Terminated: 15          "$NODE" --datadir "$d" --listen "127.0.0.1:$p" --rpc "127.0.0.1:$r" --connect "$c" --log warn > "$d/node.log" 2>&1
+datadir: /tmp/mbtc-demo.JRBSv0  log: perf/results/devnet-demo-20261110-061030.log

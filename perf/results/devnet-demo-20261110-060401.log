@@ -1,0 +1,34 @@
+MiniBTC devnet demo — Tue 10 Nov 2026 06:04:01 EST
+commit: 46055ad
+
+=== Phase 0: build binaries ===
+  PASS  cargo build --bins
+
+=== Phase 1: start 3 nodes + first convergence (120 blocks) ===
+  PASS  3 nodes started (p2p 38445/38447/38449, rpc 38446/38448/38450)
+  wallet A address: mzwwLHjAaiMq1D1NK93dfSCRnzngzfS9H5
+  PASS  mined 120 blocks on N1
+  PASS  N1 tip (height=120)
+  PASS  N2 converged to N1 (height=120)
+  PASS  N3 converged to N1 (height=120)
+  convergence time for 120 blocks + 2 followers: 3s
+  N1 peers: 2
+  N2 peers: 1
+  N3 peers: 1
+
+=== Phase 2: partition N3, extend N1 by 40 ===
+./scripts/devnet-demo.sh: line 83: 90451 Terminated: 15          "$NODE" --datadir "$d" --listen "127.0.0.1:$p" --rpc "127.0.0.1:$r" --connect "$c" --log warn > "$d/node.log" 2>&1
+  PASS  N1 height after +40
+  PASS  N2 followed to 160 (height=160)
+
+=== Phase 3: reconnect N3 — catch-up over 40+ blocks ===
+  PASS  N3 caught up (height=160)
+  N3 catch-up time: 0s for 40 missed blocks
+  note: catch-up was 40 blocks
+
+=== Phase 4: deliberate fork — N3 mines 55 solo, most-work reorg ===
+./scripts/devnet-demo.sh: line 83: 90539 Terminated: 15          "$NODE" --datadir "$d" --listen "127.0.0.1:$p" --rpc "127.0.0.1:$r" --connect "$c" --log warn > "$d/node.log" 2>&1
+Error: internal error: rpc transport: error sending request for url (http://127.0.0.1:38450/)
+./scripts/devnet-demo.sh: line 83: 90432 Terminated: 15          "$NODE" --datadir "$d" --listen "127.0.0.1:$p" --rpc "127.0.0.1:$r" --log warn > "$d/node.log" 2>&1
+./scripts/devnet-demo.sh: line 83: 90441 Terminated: 15          "$NODE" --datadir "$d" --listen "127.0.0.1:$p" --rpc "127.0.0.1:$r" --connect "$c" --log warn > "$d/node.log" 2>&1
+./scripts/devnet-demo.sh: line 83: 90567 Terminated: 15          "$NODE" --datadir "$d" --listen "127.0.0.1:$p" --rpc "127.0.0.1:$r" --log warn > "$d/node.log" 2>&1

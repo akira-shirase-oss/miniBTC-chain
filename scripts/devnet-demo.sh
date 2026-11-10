@@ -37,7 +37,21 @@ bad()  { FAIL=$((FAIL+1)); echo "  FAIL  $*"; }
 check(){ if [ "$2" = "$3" ]; then ok "$1"; else bad "$1 (want $3, got $2)"; fi; }
 
 # cli <datadir> <rpcport> <args...>
-cli() { "$CLI" --datadir "$1" --rpc-port "$2" --json "${@:3}"; }
+# Transport-level flakes (localhost connect resets under load) get 3
+# bounded retries; RPC-level errors (rejected tx, bad auth) fail fast.
+cli() {
+  local attempt=1 out err
+  while :; do
+    err=$(mktemp)
+    if out=$("$CLI" --datadir "$1" --rpc-port "$2" --json "${@:3}" 2>"$err"); then
+      cat "$err" >&2; rm -f "$err"; printf '%s' "$out"; return 0
+    fi
+    if ! grep -qE "rpc transport|error sending request|connection refused|timed out" "$err" || [ "$attempt" -ge 3 ]; then
+      cat "$err" >&2; rm -f "$err"; return 1
+    fi
+    rm -f "$err"; attempt=$((attempt + 1)); sleep 2
+  done
+}
 
 # tip <datadir> <rpcport> → "height hash"
 tip() {
