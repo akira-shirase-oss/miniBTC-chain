@@ -226,10 +226,10 @@ impl Sync {
             return false;
         }
         self.seen.push_back(hash);
-        if self.seen.len() > SEEN_CAPACITY {
-            if let Some(old) = self.seen.pop_front() {
-                self.seen_set.remove(&old);
-            }
+        if self.seen.len() > SEEN_CAPACITY
+            && let Some(old) = self.seen.pop_front()
+        {
+            self.seen_set.remove(&old);
         }
         true
     }

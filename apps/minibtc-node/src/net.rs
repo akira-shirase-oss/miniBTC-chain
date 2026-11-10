@@ -579,13 +579,13 @@ async fn handle_inv(
                         want.push(*item);
                     }
                 }
-                InvType::Block => {
+                InvType::Block
                     if !inner.chain.blocks.contains_key(&item.hash)
-                        && !inner.pending.contains(&item.hash)
-                    {
-                        want.push(*item);
-                    }
+                        && !inner.pending.contains(&item.hash) =>
+                {
+                    want.push(*item);
                 }
+                InvType::Block => {}
                 _ => {}
             }
             if want.len() >= GETDATA_BATCH {
@@ -764,14 +764,11 @@ fn active_headers(
     // Collect the active chain tip→genesis, then reverse to forward order.
     let mut chain_hdrs: Vec<minibtc_primitives::BlockHeader> = Vec::new();
     let mut cur = inner.chain.tip;
-    loop {
-        let Some(rec) = inner.chain.blocks.get(&cur) else {
-            break;
-        };
+    while let Some(rec) = inner.chain.blocks.get(&cur) {
         if rec.status != minibtc_chainstate::BlockStatus::Active {
             break;
         }
-        chain_hdrs.push(rec.block.header.clone());
+        chain_hdrs.push(rec.block.header);
         if rec.block.header.prev_hash == Hash256::ZERO {
             break;
         }
@@ -797,7 +794,7 @@ fn active_headers(
         if h.block_hash() == stop {
             break;
         }
-        out.push(h.clone());
+        out.push(*h);
         if out.len() >= cap {
             break;
         }

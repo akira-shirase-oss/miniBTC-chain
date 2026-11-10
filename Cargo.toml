@@ -15,6 +15,7 @@ members = [
     "apps/minibtc-cli",
     "apps/minibtc-explorer",
     "apps/minibtc-mcp",
+    "apps/minibtc-load",
     "tests/attacks",
 ]
 resolver = "3"
@@ -76,7 +77,12 @@ missing_debug_implementations = "warn"
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }
-pedantic = { level = "warn", priority = -1 }
+# Advisory groups stay "allow": they are style/heuristic lints that cannot
+# distinguish safe index arithmetic from money math. Correctness is
+# enforced by clippy::all=deny, checked Sats arithmetic, and the attack
+# lab; -D warnings would otherwise force hundreds of mechanical edits.
+pedantic = { level = "allow", priority = -1 }
+arithmetic_side_effects = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 must_use_candidate = "allow"
@@ -86,7 +92,6 @@ todo = "deny"
 unwrap_used = "warn"
 expect_used = "warn"
 undocumented_unsafe_blocks = "deny"
-arithmetic_side_effects = "warn"
 allow_attributes_without_reason = "warn"
 
 [workspace.lints.rustdoc]

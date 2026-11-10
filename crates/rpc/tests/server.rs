@@ -1,7 +1,7 @@
 //! RPC server integration: auth, dispatch, error mapping, bounds.
 
 use minibtc_rpc::server::CookieAuth;
-use minibtc_rpc::{JsonRpcResponse, NODE_METHODS, RpcBackend, RpcError, serve};
+use minibtc_rpc::{JsonRpcResponse, NODE_METHODS, RpcBackend, RpcError};
 use serde_json::{Value, json};
 use std::sync::Arc;
 
@@ -27,13 +27,20 @@ async fn spawn() -> (String, CookieAuth, tokio::task::JoinHandle<()>) {
         user: "testuser".into(),
         pass: "testpass".into(),
     };
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap_or_else(|e| panic!("bind failed: {e}"));
+    let port = listener
+        .local_addr()
+        .unwrap_or_else(|e| panic!("local_addr failed: {e}"))
+        .port();
     let backend: Arc<dyn RpcBackend> = Arc::new(Fixture);
     // serve() binds its own listener — instead build router directly.
     let app = minibtc_rpc::server::router(backend, auth.clone());
     let handle = tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
+        axum::serve(listener, app)
+            .await
+            .unwrap_or_else(|e| panic!("serve failed: {e}"));
     });
     (format!("http://127.0.0.1:{port}/"), auth, handle)
 }

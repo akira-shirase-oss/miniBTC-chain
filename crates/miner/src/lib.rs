@@ -1,7 +1,7 @@
 //! # minibtc-miner
 //!
 //! Block production: assemble a candidate block from mempool transactions
-//! + coinbase, then grind the nonce until `hash ≤ target`. Pure functions
+//! and the coinbase, then grind the nonce until `hash ≤ target`. Pure functions
 //! over data — the caller supplies the mempool view, the chain tip, and
 //! the clock. No I/O here so mining is testable and the p2p/node layer
 //! decides *when* to mine.
@@ -164,10 +164,10 @@ pub fn mine(
         if iter >= budget {
             return Err(MineError::BudgetExhausted(iter));
         }
-        if let Some(c) = cancel {
-            if c.load(Ordering::Relaxed) {
-                return Err(MineError::Cancelled);
-            }
+        if let Some(c) = cancel
+            && c.load(Ordering::Relaxed)
+        {
+            return Err(MineError::Cancelled);
         }
         h.nonce = h.nonce.wrapping_add(1);
     }
@@ -210,6 +210,7 @@ pub fn hash_meets_target(header: &BlockHeader, bits: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use minibtc_crypto::Hash256;
 
     fn params() -> ChainParams {
         ChainParams::devnet()

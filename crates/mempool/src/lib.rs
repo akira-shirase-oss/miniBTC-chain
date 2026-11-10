@@ -480,7 +480,6 @@ pub fn compute_fee<V: UtxoView>(tx: &Transaction, view: &V) -> Result<Sats, Stri
 mod tests {
     use super::*;
     use minibtc_crypto::Hash256;
-    use minibtc_crypto::Keypair;
     use minibtc_primitives::{TxInput, TxOutput};
     use std::collections::HashMap;
 

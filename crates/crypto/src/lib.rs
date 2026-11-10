@@ -10,5 +10,7 @@ pub mod hash;
 pub mod key;
 
 pub use address::{Address, AddressError};
-pub use hash::{Hash160, Hash256, HexError, double_sha256, hash160, hex_decode, hex_encode, sha256};
+pub use hash::{
+    Hash160, Hash256, HexError, double_sha256, hash160, hex_decode, hex_encode, sha256,
+};
 pub use key::{KeyError, Keypair, PublicKey, Signature};

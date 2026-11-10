@@ -7,7 +7,7 @@ use minibtc_script::sighash;
 use minibtc_script::*;
 
 fn key() -> Keypair {
-    Keypair::generate().unwrap()
+    Keypair::generate().unwrap_or_else(|e| panic!("keygen failed: {e}"))
 }
 
 /// Build a tx spending `prev_script_pubkey` (the "coinbase" output being
@@ -31,7 +31,8 @@ fn spend_tx(prev_script_pubkey: &Script, key: &Keypair, value: u64) -> Transacti
         locktime: 0,
     };
     // Sign input 0 against the prevout's scriptPubKey.
-    let sig_item = sighash::sign_input(&tx, 0, prev_script_pubkey.as_bytes(), key).unwrap();
+    let sig_item = sighash::sign_input(&tx, 0, prev_script_pubkey.as_bytes(), key)
+        .unwrap_or_else(|e| panic!("sign_input failed: {e}"));
     tx.inputs[0].script_sig = Script::p2pkh_spend(&sig_item, &key.public_key()).0;
     tx
 }
@@ -169,7 +170,7 @@ fn limits_are_enforced() {
 
     // Oversized push (>520 bytes) in scriptSig.
     let mut bad_sig = vec![0x4c, 0x09]; // PUSHDATA1 len=521... actually 0x09=9
-    bad_sig.extend(std::iter::repeat(0xAA).take(600));
+    bad_sig.extend(std::iter::repeat_n(0xAA, 600));
     let ctx = ExecContext {
         tx: &tx,
         input_index: 0,
@@ -178,7 +179,7 @@ fn limits_are_enforced() {
     // Direct oversized push: opcode 0x4c then length byte 0xFF then 255 bytes
     // exceeds nothing (255<520) — use PUSHDATA2 with 600.
     let mut oversized = vec![OP_PUSHDATA2, 0x58, 0x02]; // len 600 LE
-    oversized.extend(std::iter::repeat(0xBB).take(600));
+    oversized.extend(std::iter::repeat_n(0xBB, 600));
     assert!(matches!(
         execute(&oversized, &[], &ctx),
         Err(ScriptError::PushTooLarge)
@@ -250,7 +251,7 @@ fn script_push_encoding_roundtrip() {
         // Simplest: execute push script alone then OP_1 OP_EQUAL? We verify
         // by executing [push script] + [OP_0? no—] — instead verify the push
         // decodes: script bytes start with correct opcode.
-        assert!(script.len() > 0);
+        assert!(!script.is_empty());
         let _ = ctx;
     }
 }

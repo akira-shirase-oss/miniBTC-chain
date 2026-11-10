@@ -7,12 +7,12 @@ use minibtc_consensus::ChainParams;
 use minibtc_crypto::{Hash256, Keypair};
 use minibtc_primitives::*;
 use minibtc_script::Script;
-use std::collections::HashMap;
 
 /// Grind a nonce until the header passes PoW (devnet target ~2^255 →
 /// ~2 tries average).
 fn mine_header(mut h: BlockHeader) -> BlockHeader {
-    let target = minibtc_consensus::pow::target_for_bits(h.bits).unwrap();
+    let target = minibtc_consensus::pow::target_for_bits(h.bits)
+        .unwrap_or_else(|e| panic!("pow target failed: {e:?}"));
     loop {
         if h.check_pow(&target) {
             return h;
@@ -53,7 +53,11 @@ fn build_block(
     if txs.is_empty() || !txs[0].is_coinbase() {
         txs.insert(
             0,
-            coinbase_tx(&Keypair::generate().unwrap(), 0, params.subsidy_start),
+            coinbase_tx(
+                &Keypair::generate().unwrap_or_else(|e| panic!("keygen failed: {e:?}")),
+                0,
+                params.subsidy_start,
+            ),
         );
     }
     let mr = merkle_root(&txs);
@@ -70,20 +74,20 @@ fn build_block(
 
 fn fresh_chain() -> (Chain, Keypair) {
     let params = ChainParams::devnet();
-    let miner = Keypair::generate().unwrap();
+    let miner = Keypair::generate().unwrap_or_else(|e| panic!("keygen failed: {e:?}"));
     let cb = coinbase_tx(&miner, 0, params.subsidy_start);
     let genesis = Block {
         header: BlockHeader {
             version: 1,
             prev_hash: Hash256::ZERO,
-            merkle_root: merkle_root(&[cb.clone()]),
+            merkle_root: merkle_root(std::slice::from_ref(&cb)),
             time: 1_700_000_000,
             bits: params.pow_limit_bits,
             nonce: 0,
         },
         txs: vec![cb],
     };
-    let chain = Chain::new(params, genesis).unwrap();
+    let chain = Chain::new(params, genesis).unwrap_or_else(|e| panic!("chain init failed: {e:?}"));
     (chain, miner)
 }
 
@@ -184,7 +188,7 @@ fn coinbase_maturity_blocks_early_spend() {
 fn reorg_restores_utxo_exactly() {
     let (mut chain_a, miner) = fresh_chain();
     // Build branch A: 3 blocks. Record fingerprint after each.
-    let mut prev_a = *chain_a
+    let prev_a = *chain_a
         .blocks
         .get(&chain_a.tip)
         .map(|r| &r.block.header)

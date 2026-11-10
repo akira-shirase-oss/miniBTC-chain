@@ -39,9 +39,11 @@ pub fn hex_decode(s: &str) -> Result<Vec<u8>, HexError> {
         return Err(HexError::OddLength);
     }
     let mut out = Vec::with_capacity(bytes.len() / 2);
-    for (i, pair) in bytes.chunks_exact(2).enumerate() {
-        let hi = hex_val(pair[0]).ok_or(HexError::InvalidChar(i * 2))?;
-        let lo = hex_val(pair[1]).ok_or(HexError::InvalidChar(i * 2 + 1))?;
+    let mut idx = 0usize;
+    for pair in bytes.as_chunks::<2>().0 {
+        let hi = hex_val(pair[0]).ok_or(HexError::InvalidChar(idx))?;
+        let lo = hex_val(pair[1]).ok_or(HexError::InvalidChar(idx + 1))?;
+        idx += 2;
         out.push((hi << 4) | lo);
     }
     Ok(out)

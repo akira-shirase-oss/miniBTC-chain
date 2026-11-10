@@ -190,7 +190,7 @@ pub fn merkle_root_from_txids(txids: &[Hash256]) -> Hash256 {
     }
     let mut level: Vec<Hash256> = txids.to_vec();
     while level.len() > 1 {
-        let mut next = Vec::with_capacity((level.len() + 1) / 2);
+        let mut next = Vec::with_capacity(level.len().div_ceil(2));
         let mut i = 0;
         while i < level.len() {
             let left = level[i];
@@ -232,10 +232,10 @@ pub fn check_merkle_root(header: &BlockHeader, txs: &[Transaction]) -> Result<()
                 first.script_sig[0] ^= 0x01;
             } else {
                 // No scriptSig to mutate — mutate an output script instead.
-                if let Some(out) = mutated.outputs.first_mut() {
-                    if !out.script_pubkey.is_empty() {
-                        out.script_pubkey[0] ^= 0x01;
-                    }
+                if let Some(out) = mutated.outputs.first_mut()
+                    && !out.script_pubkey.is_empty()
+                {
+                    out.script_pubkey[0] ^= 0x01;
                 }
             }
         }

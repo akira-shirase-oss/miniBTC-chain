@@ -260,7 +260,7 @@ impl Wallet {
         let i = self.next_receive;
         let entry = self.derive_address(0, i)?;
         let script = entry.script.clone();
-        let address = entry.address.clone();
+        let address = entry.address;
         self.addresses.insert(script, entry);
         self.next_receive = i.saturating_add(1);
         Ok(address)
@@ -270,7 +270,7 @@ impl Wallet {
     pub fn new_change_address(&mut self) -> Result<Address, WalletError> {
         let i = self.next_change;
         let entry = self.derive_address(1, i)?;
-        let address = entry.address.clone();
+        let address = entry.address;
         self.addresses.insert(entry.script.clone(), entry);
         self.next_change = i.saturating_add(1);
         Ok(address)
@@ -312,7 +312,7 @@ impl Wallet {
     pub fn addresses(&self) -> Vec<Address> {
         let mut v: Vec<&AddressEntry> = self.addresses.values().filter(|e| e.chain == 0).collect();
         v.sort_by_key(|e| e.index);
-        v.into_iter().map(|e| e.address.clone()).collect()
+        v.into_iter().map(|e| e.address).collect()
     }
 
     /// Look up the key entry for a script_pubkey (our addresses only).
@@ -384,7 +384,7 @@ impl Wallet {
             .checked_add(fee_estimate)
             .ok_or(WalletError::Overflow)?;
         let mut candidates: Vec<&WalletUtxo> = self.spendable_utxos();
-        candidates.sort_by(|a, b| b.output.value.cmp(&a.output.value));
+        candidates.sort_by_key(|c| std::cmp::Reverse(c.output.value));
         let mut selected: Vec<WalletUtxo> = Vec::new();
         let mut total = Sats::ZERO;
         for u in candidates {

@@ -111,7 +111,7 @@ impl RpcError {
 }
 
 /// Extract positional params as a slice, or reject non-array params.
-pub fn params_array<'a>(params: &'a Value) -> Result<&'a [Value], RpcError> {
+pub fn params_array(params: &Value) -> Result<&[Value], RpcError> {
     match params {
         Value::Array(a) => Ok(a.as_slice()),
         Value::Null => Ok(&[]),

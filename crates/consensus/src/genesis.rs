@@ -71,7 +71,7 @@ pub fn genesis_block(params: &ChainParams) -> Block {
     let mut header = BlockHeader {
         version: 1,
         prev_hash: minibtc_crypto::Hash256::ZERO,
-        merkle_root: merkle_root(&[coinbase.clone()]),
+        merkle_root: merkle_root(std::slice::from_ref(&coinbase)),
         time: GENESIS_TIME,
         bits: params.pow_limit_bits,
         nonce: 0,
@@ -79,16 +79,16 @@ pub fn genesis_block(params: &ChainParams) -> Block {
     // On instant-difficulty networks, grind the genesis nonce so even the
     // genesis header satisfies its own PoW check (nice invariant; real
     // networks can't afford this and skip it).
-    if params.instant_difficulty {
-        if let Ok(target) = crate::pow::target_for_bits(header.bits) {
-            let mut n = 0u32;
-            loop {
-                header.nonce = n;
-                if header.check_pow(&target) || n >= 1_000_000 {
-                    break;
-                }
-                n = n.wrapping_add(1);
+    if params.instant_difficulty
+        && let Ok(target) = crate::pow::target_for_bits(header.bits)
+    {
+        let mut n = 0u32;
+        loop {
+            header.nonce = n;
+            if header.check_pow(&target) || n >= 1_000_000 {
+                break;
             }
+            n = n.wrapping_add(1);
         }
     }
     Block {

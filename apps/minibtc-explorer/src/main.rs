@@ -5,10 +5,10 @@
 //! before rendering — chain data is untrusted input.
 
 use anyhow::{Context, Result};
+use axum::Router;
 use axum::extract::{Path as AxumPath, State};
 use axum::response::Html;
 use axum::routing::get;
-use axum::Router;
 use clap::Parser;
 use minibtc_rpc::client::RpcClient;
 use serde_json::Value;
@@ -42,8 +42,8 @@ async fn main() -> Result<()> {
         .with_target(false)
         .init();
     let args = Args::parse();
-    let rpc = RpcClient::from_datadir(&args.datadir, args.rpc_port)
-        .context("connect to node RPC")?;
+    let rpc =
+        RpcClient::from_datadir(&args.datadir, args.rpc_port).context("connect to node RPC")?;
     let app = Router::new()
         .route("/", get(index))
         .route("/block/{id}", get(block_page))
@@ -96,10 +96,7 @@ a{{color:#0645ad}}code{{background:#f6f6f6;padding:.1em .3em}}\
 }
 
 fn err_page(msg: &str) -> Html<String> {
-    page(
-        "error",
-        &format!("<p class=\"err\">{}</p>", esc(msg)),
-    )
+    page("error", &format!("<p class=\"err\">{}</p>", esc(msg)))
 }
 
 fn sats(v: &Value) -> String {
@@ -119,7 +116,11 @@ fn short_hash(h: &str) -> String {
 }
 
 fn link_tx(txid: &str) -> String {
-    format!("<a href=\"/tx/{}\"><code>{}</code></a>", esc(txid), esc(&short_hash(txid)))
+    format!(
+        "<a href=\"/tx/{}\"><code>{}</code></a>",
+        esc(txid),
+        esc(&short_hash(txid))
+    )
 }
 
 fn link_addr(addr: &str) -> String {
@@ -210,10 +211,7 @@ async fn index(State(app): State<App>) -> Html<String> {
     )
 }
 
-async fn block_page(
-    State(app): State<App>,
-    AxumPath(id): AxumPath<String>,
-) -> Html<String> {
+async fn block_page(State(app): State<App>, AxumPath(id): AxumPath<String>) -> Html<String> {
     // id may be a hash or a decimal height.
     let v = match app.rpc.getblock(&id, 1).await {
         Ok(v) => v,
@@ -225,7 +223,10 @@ async fn block_page(
     if let Some(txs) = v["tx"].as_array() {
         for t in txs {
             let txid = t["txid"].as_str().unwrap_or("");
-            let fee = t["fee"]["sats"].as_u64().map(|n| format!("{}", n)).unwrap_or_default();
+            let fee = t["fee"]["sats"]
+                .as_u64()
+                .map(|n| format!("{}", n))
+                .unwrap_or_default();
             rows.push_str(&format!(
                 "<tr><td>{}</td><td>{}</td><td>{}</td></tr>",
                 link_tx(txid),
@@ -255,12 +256,16 @@ async fn block_page(
 <table><tr><th>txid</th><th>size</th><th>fee sats</th></tr>{}</table>",
             esc(&hash),
             height,
-            &{
+            {
                 let p = v["previousblockhash"].as_str().unwrap_or("");
                 if p.is_empty() || p.chars().all(|c| c == '0') {
                     "genesis".to_string()
                 } else {
-                    format!("<a href=\"/block/{}\"><code>{}</code></a>", esc(p), esc(&short_hash(p)))
+                    format!(
+                        "<a href=\"/block/{}\"><code>{}</code></a>",
+                        esc(p),
+                        esc(&short_hash(p))
+                    )
                 }
             },
             esc(v["merkleroot"].as_str().unwrap_or("")),
@@ -275,10 +280,7 @@ async fn block_page(
     )
 }
 
-async fn tx_page(
-    State(app): State<App>,
-    AxumPath(txid): AxumPath<String>,
-) -> Html<String> {
+async fn tx_page(State(app): State<App>, AxumPath(txid): AxumPath<String>) -> Html<String> {
     let v = match app.rpc.getrawtransaction(&txid, true).await {
         Ok(v) => v,
         Err(e) => return err_page(&format!("tx not found: {e}")),
@@ -342,22 +344,31 @@ async fn tx_page(
             v["size"].as_u64().unwrap_or(0),
             v["version"].as_i64().unwrap_or(0),
             v["locktime"].as_u64().unwrap_or(0),
-            v["fee"]["sats"].as_u64().map(|n| n.to_string()).unwrap_or_else(|| "—".into()),
-            v["confirmations"].as_u64().map(|n| n.to_string()).unwrap_or_else(|| "unconfirmed".into()),
+            v["fee"]["sats"]
+                .as_u64()
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "—".into()),
+            v["confirmations"]
+                .as_u64()
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "unconfirmed".into()),
             vin,
             vout
         ),
     )
 }
 
-async fn address_page(
-    State(app): State<App>,
-    AxumPath(addr): AxumPath<String>,
-) -> Html<String> {
+async fn address_page(State(app): State<App>, AxumPath(addr): AxumPath<String>) -> Html<String> {
     // Balance + utxos + history in parallel-ish (sequential awaits fine).
     let info = app.rpc.getaddressinfo(&addr).await;
-    let utxos = app.rpc.call("getaddressutxos", serde_json::json!([addr])).await;
-    let hist = app.rpc.call("getaddresshistory", serde_json::json!([addr])).await;
+    let utxos = app
+        .rpc
+        .call("getaddressutxos", serde_json::json!([addr]))
+        .await;
+    let hist = app
+        .rpc
+        .call("getaddresshistory", serde_json::json!([addr]))
+        .await;
     let (Ok(info), Ok(utxos), Ok(hist)) = (info, utxos, hist) else {
         return err_page("address query failed (bad address or node error)");
     };
@@ -372,7 +383,11 @@ async fn address_page(
                 u["vout"].as_u64().unwrap_or(0),
                 u["value"].as_u64().unwrap_or(0),
                 u["height"].as_u64().unwrap_or(0),
-                if u["spendable"].as_bool().unwrap_or(true) { "yes" } else { "no (immature)" }
+                if u["spendable"].as_bool().unwrap_or(true) {
+                    "yes"
+                } else {
+                    "no (immature)"
+                }
             ));
         }
     }
@@ -387,7 +402,11 @@ async fn address_page(
                 o["value_sats"].as_u64().unwrap_or(0),
                 o["height"].as_u64().unwrap_or(0),
                 o["confirmations"].as_u64().unwrap_or(0),
-                if o["spent"].as_bool().unwrap_or(false) { "spent" } else { "unspent" }
+                if o["spent"].as_bool().unwrap_or(false) {
+                    "spent"
+                } else {
+                    "unspent"
+                }
             ));
         }
     }
@@ -455,7 +474,10 @@ mod tests {
     /// Every dynamic byte reaching the page must pass through esc().
     #[test]
     fn esc_neutralizes_html() {
-        assert_eq!(esc("<script>alert(1)</script>"), "&lt;script&gt;alert(1)&lt;/script&gt;");
+        assert_eq!(
+            esc("<script>alert(1)</script>"),
+            "&lt;script&gt;alert(1)&lt;/script&gt;"
+        );
         assert_eq!(esc("a&b\"c'd"), "a&amp;b&quot;c&#39;d");
         assert_eq!(esc("plain-123"), "plain-123");
         // Attribute-context safety: quotes are escaped.

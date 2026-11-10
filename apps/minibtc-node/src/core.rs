@@ -292,14 +292,15 @@ impl Node {
         // early so miners never template an unminable tx.
         let tip_h = inner.chain.height();
         for inp in &tx.inputs {
-            if let Some(e) = inner.chain.utxos.get(&inp.prev) {
-                if e.coinbase && tip_h.saturating_sub(e.height) < self.params.coinbase_maturity {
-                    return Err(format!(
-                        "immature coinbase (depth {} < {})",
-                        tip_h.saturating_sub(e.height),
-                        self.params.coinbase_maturity
-                    ));
-                }
+            if let Some(e) = inner.chain.utxos.get(&inp.prev)
+                && e.coinbase
+                && tip_h.saturating_sub(e.height) < self.params.coinbase_maturity
+            {
+                return Err(format!(
+                    "immature coinbase (depth {} < {})",
+                    tip_h.saturating_sub(e.height),
+                    self.params.coinbase_maturity
+                ));
             }
         }
         Ok(fee)
@@ -323,11 +324,9 @@ impl Node {
         let NodeInner { mempool, chain, .. } = &mut *inner;
         mempool
             .admit(tx.clone(), fee, &chain.utxos, &self.params, replace)
-            .map_err(|e| match e {
-                // Policy-class failures: already-have is silent-success
-                // adjacent; the rest are local policy, not peer faults.
-                _ => AcceptError::Policy(e.to_string()),
-            })?;
+            // Policy-class failures: already-have is silent-success
+            // adjacent; the rest are local policy, not peer faults.
+            .map_err(|e| AcceptError::Policy(e.to_string()))?;
         let txid = tx.txid();
         // Relay inv to every connected peer except the originator.
         self.relay_inv_except(
@@ -369,10 +368,10 @@ impl Node {
 
     /// Relay a block inv to all peers (after connect).
     pub fn relay_block(&self, hash: Hash256) {
-        if let Ok(mut inner) = self.inner.lock() {
-            if !inner.sync.should_relay(hash) {
-                return;
-            }
+        if let Ok(mut inner) = self.inner.lock()
+            && !inner.sync.should_relay(hash)
+        {
+            return;
         }
         let msg = Message::Inv(vec![InvItem {
             kind: InvType::Block,
@@ -491,11 +490,11 @@ fn next_bits(
     inner: &NodeInner,
     tip_rec: &minibtc_chainstate::IndexedBlock,
 ) -> Result<u32, NodeError> {
-    let interval = inner.chain.params.pow_target_timespan_blocks as u32;
+    let interval = inner.chain.params.pow_target_timespan_blocks;
     // The block being built sits at tip+1 — retarget iff ITS height is a
     // multiple of the interval (Bitcoin's nHeight+1 rule).
     let new_height = inner.chain.height().saturating_add(1);
-    if interval == 0 || new_height % interval != 0 {
+    if interval == 0 || !new_height.is_multiple_of(interval) {
         return Ok(tip_rec.block.header.bits);
     }
     // Span = tip.time − time of block `interval` back from the new height.
@@ -570,10 +569,10 @@ pub fn find_tx(node: &Node, inner: &NodeInner, txid: &Hash256) -> Option<Transac
             return rec.block.txs.iter().find(|t| t.txid() == *txid).cloned();
         }
         // Block pruned from memory but in store (shouldn't happen).
-        if let Some(store) = &node.store {
-            if let Ok(Some(b)) = store.get_block(bh) {
-                return b.txs.into_iter().find(|t| t.txid() == *txid);
-            }
+        if let Some(store) = &node.store
+            && let Ok(Some(b)) = store.get_block(bh)
+        {
+            return b.txs.into_iter().find(|t| t.txid() == *txid);
         }
     }
     None

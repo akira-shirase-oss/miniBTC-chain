@@ -574,7 +574,7 @@ impl Store {
                     return Err(StoreError::Corrupt("bad addrindex value".into()));
                 }
                 let mut out = Vec::with_capacity(b.len() / 36);
-                for chunk in b.chunks_exact(36) {
+                for chunk in b.as_chunks::<36>().0 {
                     let mut txid = [0u8; 32];
                     txid.copy_from_slice(&chunk[..32]);
                     let vout = u32::from_le_bytes([chunk[32], chunk[33], chunk[34], chunk[35]]);

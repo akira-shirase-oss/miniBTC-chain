@@ -1334,6 +1334,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "minibtc-load"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "minibtc-chainstate",
+ "minibtc-consensus",
+ "minibtc-crypto",
+ "minibtc-mempool",
+ "minibtc-p2p",
+ "minibtc-primitives",
+ "minibtc-rpc",
+ "minibtc-script",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "minibtc-mcp"
 version = "0.1.0"
 dependencies = [

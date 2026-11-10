@@ -265,15 +265,15 @@ impl Chain {
     /// Enforce coinbase maturity for every input of `tx`.
     fn check_maturity(&self, tx: &Transaction, spend_height: u32) -> Result<(), ChainError> {
         for inp in &tx.inputs {
-            if let Some(entry) = self.utxos.get(&inp.prev) {
-                if entry.coinbase {
-                    let depth = spend_height.saturating_sub(entry.height);
-                    if depth < self.params.coinbase_maturity {
-                        return Err(ChainError::ImmatureCoinbase {
-                            depth,
-                            maturity: self.params.coinbase_maturity,
-                        });
-                    }
+            if let Some(entry) = self.utxos.get(&inp.prev)
+                && entry.coinbase
+            {
+                let depth = spend_height.saturating_sub(entry.height);
+                if depth < self.params.coinbase_maturity {
+                    return Err(ChainError::ImmatureCoinbase {
+                        depth,
+                        maturity: self.params.coinbase_maturity,
+                    });
                 }
             }
             // Missing prevouts are validation's job; here we only check

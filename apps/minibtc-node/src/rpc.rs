@@ -47,7 +47,7 @@ impl NodeBackend {
 
     /// Parse a txid-or-height block reference.
     fn block_ref(&self, inner: &NodeInner, s: &str) -> Result<Hash256, RpcError> {
-        if let Ok(h) = u64::from_str_radix(s, 10) {
+        if let Ok(h) = s.parse::<u64>() {
             return core::block_at_height(inner, h as u32)
                 .ok_or_else(|| RpcError::App(format!("no block at height {h}")));
         }
@@ -384,11 +384,11 @@ impl RpcBackend for NodeBackend {
                 let tip = inner.chain.height();
                 let mut ops: Vec<OutPoint> = Vec::new();
                 let mut indexed = false;
-                if let Some(store) = &self.node.store {
-                    if let Ok(v) = store.addr_outpoints(&script) {
-                        ops = v;
-                        indexed = true;
-                    }
+                if let Some(store) = &self.node.store
+                    && let Ok(v) = store.addr_outpoints(&script)
+                {
+                    ops = v;
+                    indexed = true;
                 }
                 if !indexed {
                     for rec in inner.chain.blocks.values() {
@@ -434,9 +434,7 @@ impl RpcBackend for NodeBackend {
                     }));
                 }
                 // Newest first.
-                out.sort_by(|a, b| {
-                    b["height"].as_u64().cmp(&a["height"].as_u64())
-                });
+                out.sort_by(|a, b| b["height"].as_u64().cmp(&a["height"].as_u64()));
                 Ok(json!({
                     "address": addr_s,
                     "indexed": indexed,

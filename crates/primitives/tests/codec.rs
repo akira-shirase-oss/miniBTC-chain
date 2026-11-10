@@ -85,7 +85,7 @@ fn block_roundtrip() {
     let header = BlockHeader {
         version: 1,
         prev_hash: Hash256::ZERO,
-        merkle_root: merkle_root(&[coinbase.clone()]),
+        merkle_root: merkle_root(std::slice::from_ref(&coinbase)),
         time: 1_700_000_000,
         bits: 0x207f_ffff,
         nonce: 42,
@@ -141,7 +141,7 @@ fn block_decode_enforces_size_and_tx_caps() {
     let header = BlockHeader {
         version: 1,
         prev_hash: Hash256::ZERO,
-        merkle_root: merkle_root(&[tx.clone()]),
+        merkle_root: merkle_root(std::slice::from_ref(&tx)),
         time: 0,
         bits: 0,
         nonce: 0,

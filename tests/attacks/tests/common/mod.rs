@@ -1,7 +1,10 @@
 //! Shared fixtures for the attack lab: real PoW-mined devnet blocks,
 //! signed P2PKH spends, and a map-backed UTXO view for tx-level tests.
 
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "shared fixtures: helpers may be unused per test binary"
+)]
 
 use minibtc_chainstate::Chain;
 use minibtc_consensus::ChainParams;
@@ -13,7 +16,8 @@ use std::collections::HashMap;
 
 /// Grind a nonce until the header passes PoW (devnet target ~2^255).
 pub fn mine_header(mut h: BlockHeader) -> BlockHeader {
-    let target = minibtc_consensus::pow::target_for_bits(h.bits).unwrap();
+    let target = minibtc_consensus::pow::target_for_bits(h.bits)
+        .unwrap_or_else(|e| panic!("pow target failed: {e:?}"));
     for _ in 0..1_000_000 {
         if h.check_pow(&target) {
             return h;
@@ -56,7 +60,11 @@ pub fn build_block(
     if txs.is_empty() || !txs[0].is_coinbase() {
         txs.insert(
             0,
-            coinbase_tx(&Keypair::generate().unwrap(), 0, params.subsidy_start),
+            coinbase_tx(
+                &Keypair::generate().unwrap_or_else(|e| panic!("keygen failed: {e:?}")),
+                0,
+                params.subsidy_start,
+            ),
         );
     }
     let mr = merkle_root(&txs);
@@ -74,20 +82,20 @@ pub fn build_block(
 /// Genesis + empty chain with a known miner key.
 pub fn fresh_chain() -> (Chain, Keypair) {
     let params = ChainParams::devnet();
-    let miner = Keypair::generate().unwrap();
+    let miner = Keypair::generate().unwrap_or_else(|e| panic!("keygen failed: {e:?}"));
     let cb = coinbase_tx(&miner, 0, params.subsidy_start);
     let genesis = Block {
         header: BlockHeader {
             version: 1,
             prev_hash: Hash256::ZERO,
-            merkle_root: merkle_root(&[cb.clone()]),
+            merkle_root: merkle_root(std::slice::from_ref(&cb)),
             time: 1_700_000_000,
             bits: params.pow_limit_bits,
             nonce: 0,
         },
         txs: vec![cb],
     };
-    let chain = Chain::new(params, genesis).unwrap();
+    let chain = Chain::new(params, genesis).unwrap_or_else(|e| panic!("chain init failed: {e:?}"));
     (chain, miner)
 }
 
@@ -97,13 +105,15 @@ pub fn mine_empty(chain: &mut Chain, miner: &Keypair, n: u32) {
         .blocks
         .get(&chain.tip)
         .map(|r| &r.block.header)
-        .unwrap();
+        .unwrap_or_else(|| panic!("tip record missing"));
     let mut time = prev.time;
     for h in 1..=(chain.height() + n) {
         time += 31;
         let cb = coinbase_tx(miner, h, chain.params.subsidy_start);
         let blk = build_block(&prev, vec![cb], time, &chain.params);
-        chain.consider_block(blk.clone()).unwrap();
+        chain
+            .consider_block(blk.clone())
+            .unwrap_or_else(|e| panic!("consider_block failed: {e:?}"));
         prev = blk.header;
     }
 }
@@ -132,7 +142,10 @@ pub fn signed_spend(
                 script_pubkey: dest_spk.to_vec(),
             },
             TxOutput {
-                value: prev_value.checked_sub(amount).unwrap().checked_sub(fee).unwrap(),
+                value: prev_value
+                    .checked_sub(amount)
+                    .and_then(|v| v.checked_sub(fee))
+                    .unwrap_or_else(|| panic!("change output underflow")),
                 script_pubkey: Script::p2pkh(&key.public_key().key_hash()).0,
             },
         ],
@@ -145,7 +158,8 @@ pub fn signed_spend(
     if change.map(|c| c.sats() < 546).unwrap_or(true) {
         tx.outputs.pop();
     }
-    let sig = minibtc_script::sighash::sign_input(&tx, 0, prev_spk, key).unwrap();
+    let sig = minibtc_script::sighash::sign_input(&tx, 0, prev_spk, key)
+        .unwrap_or_else(|e| panic!("sign_input failed: {e:?}"));
     tx.inputs[0].script_sig = Script::p2pkh_spend(&sig, &key.public_key()).0;
     tx
 }

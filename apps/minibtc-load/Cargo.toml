@@ -1,0 +1,24 @@
+[package]
+name = "minibtc-load"
+version = "0.1.0"
+edition = "2021"
+description = "Million-op load evidence runner for MiniBTC (perf/results/)"
+
+[[bin]]
+name = "minibtc-load"
+path = "src/main.rs"
+
+[dependencies]
+minibtc-primitives = { path = "../../crates/primitives" }
+minibtc-crypto = { path = "../../crates/crypto" }
+minibtc-script = { path = "../../crates/script" }
+minibtc-consensus = { path = "../../crates/consensus" }
+minibtc-mempool = { path = "../../crates/mempool" }
+minibtc-p2p = { path = "../../crates/p2p" }
+minibtc-rpc = { path = "../../crates/rpc" }
+minibtc-chainstate = { path = "../../crates/chainstate" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }

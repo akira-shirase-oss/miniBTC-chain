@@ -208,9 +208,7 @@ impl NetAddress {
                 ip_bytes[15],
             ))
         } else {
-            IpAddr::V6(Ipv6Addr::from(
-                <[u8; 16]>::try_from(ip_bytes).unwrap_or([0; 16]),
-            ))
+            IpAddr::V6(Ipv6Addr::from(ip_bytes))
         };
         Ok(Self { services, ip, port })
     }
@@ -588,7 +586,6 @@ mod tests {
     #[tokio::test]
     async fn framed_io_roundtrip_over_buffer() {
         use tokio::io::duplex;
-        let p = params();
         let (mut a, mut b) = duplex(4096);
         let msg = Message::Ping(0xdead_beef);
         let writer = tokio::spawn(async move {

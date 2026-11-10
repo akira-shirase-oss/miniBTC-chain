@@ -5,9 +5,9 @@ mod common;
 
 use common::*;
 use minibtc_consensus::ChainParams;
-use minibtc_crypto::{double_sha256, Hash256, Keypair};
+use minibtc_crypto::{Hash256, Keypair, double_sha256};
 use minibtc_primitives::*;
-use minibtc_script::{execute, ExecContext};
+use minibtc_script::{ExecContext, execute};
 use proptest::prelude::*;
 
 // ---------- codec round-trips ----------
@@ -200,8 +200,7 @@ impl minibtc_consensus::UtxoView for EmptyViewProp {
 }
 
 fn arb_tx_strategy() -> impl Strategy<Value = Transaction> {
-    (1i32..2, 0usize..3, 0usize..3, 0u32..10)
-        .prop_map(|(v, i, o, l)| arb_tx(v, i, o, l))
+    (1i32..2, 0usize..3, 0usize..3, 0u32..10).prop_map(|(v, i, o, l)| arb_tx(v, i, o, l))
 }
 
 /// Build a structurally valid tx with the given shape.
@@ -210,7 +209,8 @@ fn arb_tx(version: i32, n_in: usize, n_out: usize, locktime: u32) -> Transaction
     for i in 0..n_in {
         inputs.push(TxInput {
             prev: OutPoint {
-                txid: Hash256::from_hex(&format!("{:064x}", i as u64 + 7)).unwrap(),
+                txid: Hash256::from_hex(&format!("{:064x}", i as u64 + 7))
+                    .unwrap_or_else(|e| panic!("bad txid hex: {e:?}")),
                 vout: i as u32,
             },
             script_sig: vec![],

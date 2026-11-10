@@ -82,10 +82,10 @@ impl Address {
             return Err(AddressError::BadChecksum);
         }
         let version = payload[0];
-        if let Some(want) = expected_version {
-            if version != want {
-                return Err(AddressError::BadVersion(version));
-            }
+        if let Some(want) = expected_version
+            && version != want
+        {
+            return Err(AddressError::BadVersion(version));
         }
         let mut hash = [0u8; 20];
         hash.copy_from_slice(&payload[1..]);
@@ -173,9 +173,8 @@ mod tests {
                 let Ok(m) = std::str::from_utf8(&mutated) else {
                     continue;
                 };
-                match Address::from_base58(m, Some(0x6f)) {
-                    Ok(other) => assert_ne!(other, a, "mutation at {i} decoded to same address"),
-                    Err(_) => {}
+                if let Ok(other) = Address::from_base58(m, Some(0x6f)) {
+                    assert_ne!(other, a, "mutation at {i} decoded to same address");
                 }
             }
         }

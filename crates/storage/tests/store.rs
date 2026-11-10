@@ -10,7 +10,8 @@ use minibtc_storage::Store;
 use std::path::PathBuf;
 
 fn mine_header(mut h: BlockHeader) -> BlockHeader {
-    let target = minibtc_consensus::pow::target_for_bits(h.bits).unwrap();
+    let target = minibtc_consensus::pow::target_for_bits(h.bits)
+        .unwrap_or_else(|e| panic!("pow target failed: {e:?}"));
     loop {
         if h.check_pow(&target) {
             return h;
@@ -41,20 +42,21 @@ fn p2pkh_tx(miner: &Keypair, height: u32, value: u64) -> Transaction {
 
 fn build_chain(nblocks: u32) -> (Chain, Keypair, ChainParams) {
     let params = ChainParams::devnet();
-    let miner = Keypair::generate().unwrap();
+    let miner = Keypair::generate().unwrap_or_else(|e| panic!("keygen failed: {e:?}"));
     let cb = p2pkh_tx(&miner, 0, params.subsidy_start);
     let genesis = Block {
         header: BlockHeader {
             version: 1,
             prev_hash: Hash256::ZERO,
-            merkle_root: merkle_root(&[cb.clone()]),
+            merkle_root: merkle_root(std::slice::from_ref(&cb)),
             time: 1_700_000_000,
             bits: params.pow_limit_bits,
             nonce: 0,
         },
         txs: vec![cb],
     };
-    let mut chain = Chain::new(params.clone(), genesis).unwrap();
+    let mut chain =
+        Chain::new(params.clone(), genesis).unwrap_or_else(|e| panic!("chain init failed: {e:?}"));
     // Mine nblocks empty blocks (coinbase only) — exercises connect path.
     for h in 1..=nblocks {
         let tip = chain.blocks[&chain.tip].block.header;
@@ -63,20 +65,22 @@ fn build_chain(nblocks: u32) -> (Chain, Keypair, ChainParams) {
             header: mine_header(BlockHeader {
                 version: 1,
                 prev_hash: tip.block_hash(),
-                merkle_root: merkle_root(&[cb.clone()]),
+                merkle_root: merkle_root(std::slice::from_ref(&cb)),
                 time: tip.time + 1,
                 bits: params.pow_limit_bits,
                 nonce: 0,
             }),
             txs: vec![cb],
         };
-        chain.connect_tip(block).unwrap();
+        chain
+            .connect_tip(block)
+            .unwrap_or_else(|e| panic!("connect_tip failed: {e:?}"));
     }
     (chain, miner, params)
 }
 
 fn tempdir() -> (PathBuf, tempfile::TempDir) {
-    let d = tempfile::tempdir().unwrap();
+    let d = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir failed: {e}"));
     (d.path().to_path_buf(), d)
 }
 
@@ -176,13 +180,13 @@ fn empty_store_loads_none() {
     let store = Store::open(&dir2).unwrap();
     let params = ChainParams::devnet();
     // Build a throwaway genesis for the call signature.
-    let miner = Keypair::generate().unwrap();
+    let miner = Keypair::generate().unwrap_or_else(|e| panic!("keygen failed: {e:?}"));
     let cb = p2pkh_tx(&miner, 0, params.subsidy_start);
     let genesis = Block {
         header: BlockHeader {
             version: 1,
             prev_hash: Hash256::ZERO,
-            merkle_root: merkle_root(&[cb.clone()]),
+            merkle_root: merkle_root(std::slice::from_ref(&cb)),
             time: 1,
             bits: params.pow_limit_bits,
             nonce: 0,

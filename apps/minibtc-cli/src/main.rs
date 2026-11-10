@@ -351,7 +351,7 @@ fn save_wallet(
     if path.exists() {
         anyhow::bail!("wallet {name} already exists");
     }
-    std::fs::create_dir_all(path.parent().unwrap())?;
+    std::fs::create_dir_all(path.parent().context("wallet path has no parent")?)?;
     let ks = Keystore::encrypt(seed, passphrase).context("encrypt keystore")?;
     ks.save(&path).context("save keystore")?;
     #[cfg(unix)]
@@ -417,7 +417,7 @@ impl UtxoView for RpcView {
 
 impl IterableUtxos for RpcView {
     fn utxo_iter(&self) -> Box<dyn Iterator<Item = (&OutPoint, &UtxoEntry)> + '_> {
-        Box::new(self.map.iter().map(|(k, v)| (k, v)))
+        Box::new(self.map.iter())
     }
 }
 
@@ -801,8 +801,5 @@ fn parse_amount(s: &str) -> Result<u64> {
         let padded = format!("{frac:0<8}");
         padded.parse::<u64>().context("bad fraction")?
     };
-    whole_sats
-        .checked_add(frac_sats)
-        .context("amount overflow")
-        .map_err(Into::into)
+    whole_sats.checked_add(frac_sats).context("amount overflow")
 }

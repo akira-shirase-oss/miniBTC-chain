@@ -9,7 +9,9 @@ use minibtc_wallet::bip32::{ChildNumber, Xpriv};
 
 /// Base58Check-decode → 78-byte payload (version stripped separately).
 fn b58check(s: &str) -> Vec<u8> {
-    let raw = bs58::decode(s).into_vec().unwrap();
+    let raw = bs58::decode(s)
+        .into_vec()
+        .unwrap_or_else(|e| panic!("b58 decode failed for {s}: {e}"));
     assert_eq!(raw.len(), 82, "bad length for {s}");
     let (payload, checksum) = raw.split_at(78);
     let expect = minibtc_crypto::double_sha256(payload);
@@ -53,13 +55,13 @@ fn parse_xpub(payload: &[u8]) -> ([u8; 33], [u8; 32], u8, [u8; 4], u32) {
 }
 
 fn c(s: &str) -> ChildNumber {
-    ChildNumber::parse(s).unwrap()
+    ChildNumber::parse(s).unwrap_or_else(|e| panic!("child number {s}: {e:?}"))
 }
 
 fn hex(s: &str) -> Vec<u8> {
     (0..s.len())
         .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap_or_else(|e| panic!("hex byte: {e}")))
         .collect()
 }
 
@@ -75,7 +77,9 @@ fn assert_xprv(x: &Xpriv, xprv_b58: &str) {
 
 /// Assert an Xpub (from to_xpub) matches a decoded xpub string.
 fn assert_xpub(x: &Xpriv, xpub_b58: &str) {
-    let xpub = x.to_xpub().unwrap();
+    let xpub = x
+        .to_xpub()
+        .unwrap_or_else(|e| panic!("to_xpub failed: {e:?}"));
     let (pk, cc, depth, fp, child) = parse_xpub(&b58check(xpub_b58));
     assert_eq!(
         *xpub.public_key_bytes(),

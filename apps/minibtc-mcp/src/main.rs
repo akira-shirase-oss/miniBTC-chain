@@ -20,12 +20,12 @@ mod mcp;
 use anyhow::{Context, Result};
 use clap::Parser;
 use minibtc_rpc::client::RpcClient;
+use rmcp::ServiceExt;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use rmcp::ServiceExt;
 
 /// Default per-request spend cap: 10 BTC in sats.
 const DEFAULT_MAX_SPEND_SATS: u64 = 1_000_000_000;
@@ -175,10 +175,10 @@ impl Draft {
             if p.extension().and_then(|s| s.to_str()) != Some("json") {
                 continue;
             }
-            if let Ok(bytes) = std::fs::read(&p) {
-                if let Ok(d) = serde_json::from_slice::<Draft>(&bytes) {
-                    out.push(d);
-                }
+            if let Ok(bytes) = std::fs::read(&p)
+                && let Ok(d) = serde_json::from_slice::<Draft>(&bytes)
+            {
+                out.push(d);
             }
         }
         out.sort_by_key(|d| d.created_unix);

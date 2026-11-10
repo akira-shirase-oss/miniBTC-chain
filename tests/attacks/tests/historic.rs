@@ -6,7 +6,7 @@
 mod common;
 
 use common::*;
-use minibtc_consensus::{validate_tx, ChainParams, TxError};
+use minibtc_consensus::{ChainParams, TxError, validate_tx};
 use minibtc_crypto::{Hash256, Keypair};
 use minibtc_primitives::*;
 use minibtc_script::Script;
@@ -61,7 +61,13 @@ fn attack_value_overflow_rejected() {
     // Even before scripts run, output_sum must overflow → ValueOverflow.
     let err = validate_tx(&tx, &view, &params).unwrap_err();
     assert!(
-        matches!(err, TxError::ValueOverflow | TxError::ScriptFailed { .. } | TxError::Overspend { .. } | TxError::ExceedsMaxMoney),
+        matches!(
+            err,
+            TxError::ValueOverflow
+                | TxError::ScriptFailed { .. }
+                | TxError::Overspend { .. }
+                | TxError::ExceedsMaxMoney
+        ),
         "overflow tx must be rejected, got {err:?}"
     );
 
@@ -72,7 +78,10 @@ fn attack_value_overflow_rejected() {
     }];
     let err = validate_tx(&tx, &view, &params).unwrap_err();
     assert!(
-        matches!(err, TxError::ExceedsMaxMoney | TxError::Overspend { .. } | TxError::ScriptFailed { .. }),
+        matches!(
+            err,
+            TxError::ExceedsMaxMoney | TxError::Overspend { .. } | TxError::ScriptFailed { .. }
+        ),
         "over-max-money tx must be rejected, got {err:?}"
     );
 }
@@ -152,7 +161,7 @@ fn attack_merkle_duplication_rejected_honest_block_survives() {
     let cb = coinbase_tx(&miner, 1, params.subsidy_start);
     let honest = build_block(&prev, vec![cb.clone()], time, &params);
     let dup_txs = vec![cb.clone(), cb.clone()];
-    let attack_mr = merkle_root(&[cb.clone()]); // same as honest!
+    let attack_mr = merkle_root(std::slice::from_ref(&cb)); // same as honest!
     let attack_header = mine_header(BlockHeader {
         version: 1,
         prev_hash: prev.block_hash(),
@@ -190,7 +199,10 @@ fn attack_premature_coinbase_spend_rejected() {
         .block
         .txs[0]
         .txid();
-    let op = OutPoint { txid: coinbase_txid, vout: 0 };
+    let op = OutPoint {
+        txid: coinbase_txid,
+        vout: 0,
+    };
     let entry = chain.utxos.get(&op).unwrap();
     assert!(entry.coinbase && entry.height + 100 > chain.height());
 
@@ -209,15 +221,9 @@ fn attack_premature_coinbase_spend_rejected() {
         locktime: 0,
     };
     // Sign it correctly — only maturity should fail.
-    let sig = minibtc_script::sighash::sign_input(
-        &spend,
-        0,
-        &entry.output.script_pubkey,
-        &miner,
-    )
-    .unwrap();
-    spend.inputs[0].script_sig =
-        Script::p2pkh_spend(&sig, &miner.public_key()).0;
+    let sig = minibtc_script::sighash::sign_input(&spend, 0, &entry.output.script_pubkey, &miner)
+        .unwrap();
+    spend.inputs[0].script_sig = Script::p2pkh_spend(&sig, &miner.public_key()).0;
 
     // The chain-level view: chain.utxos marks coinbase entries; the
     // block-validation path checks maturity. Feed a block containing it.
@@ -300,7 +306,7 @@ fn attack_low_work_block_rejected() {
     let mut bad_header = BlockHeader {
         version: 1,
         prev_hash: prev.block_hash(),
-        merkle_root: merkle_root(&[cb.clone()]),
+        merkle_root: merkle_root(std::slice::from_ref(&cb)),
         time: prev.time + 31,
         bits: params.pow_limit_bits,
         nonce: 0,
@@ -361,9 +367,8 @@ fn attack_timestamp_manipulation_rejected() {
 
 /// secp256k1 group order n (32-byte big-endian) — public constant.
 const CURVE_ORDER: [u8; 32] = [
-    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-    0xfe, 0xba, 0xae, 0xdc, 0xe6, 0xaf, 0x48, 0xa0, 0x3b, 0xbf, 0xd2, 0x5e, 0x8c, 0xd0, 0x36,
-    0x41, 0x41,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe,
+    0xba, 0xae, 0xdc, 0xe6, 0xaf, 0x48, 0xa0, 0x3b, 0xbf, 0xd2, 0x5e, 0x8c, 0xd0, 0x36, 0x41, 0x41,
 ];
 
 /// `a - b` on 32-byte big-endian ints (requires a ≥ b).
@@ -457,15 +462,17 @@ fn attack_signature_malleability_rejected() {
     r.copy_from_slice(&compact[..32]);
     s_low.copy_from_slice(&compact[32..]);
     let s_high = sub_be(&CURVE_ORDER, &s_low);
-    assert_ne!(s_high, s_low, "s == n-s would mean s = n/2 (never for valid sigs)");
+    assert_ne!(
+        s_high, s_low,
+        "s == n-s would mean s = n/2 (never for valid sigs)"
+    );
     let forged_der = der_encode_sig(&r, &s_high);
     let mut forged_item = forged_der;
     forged_item.push(hashtype[0]);
 
     // Rebuild the spend with the malleated scriptSig.
     let mut mal_tx = honest.clone();
-    mal_tx.inputs[0].script_sig =
-        Script::p2pkh_spend(&forged_item, &victim.public_key()).0;
+    mal_tx.inputs[0].script_sig = Script::p2pkh_spend(&forged_item, &victim.public_key()).0;
     let err = validate_tx(&mal_tx, &view, &params).unwrap_err();
     assert!(
         matches!(err, TxError::ScriptFailed { .. }),

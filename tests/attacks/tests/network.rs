@@ -7,7 +7,7 @@ mod common;
 
 use common::*;
 use minibtc_chainstate::Chain;
-use minibtc_consensus::{validate_tx, ChainParams, TxError};
+use minibtc_consensus::{ChainParams, TxError, validate_tx};
 use minibtc_crypto::{Hash256, Keypair};
 use minibtc_mempool::{Mempool, MempoolPolicy};
 use minibtc_p2p::codec::{self, Message, NetAddress};
@@ -16,7 +16,11 @@ use minibtc_primitives::*;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 fn tip_header(chain: &Chain) -> BlockHeader {
-    *chain.blocks.get(&chain.tip).map(|r| &r.block.header).unwrap()
+    *chain
+        .blocks
+        .get(&chain.tip)
+        .map(|r| &r.block.header)
+        .unwrap_or_else(|| panic!("tip record missing"))
 }
 
 /// Find the coinbase outpoint+output at a given height.
@@ -25,12 +29,17 @@ fn coinbase_at(chain: &Chain, height: u32) -> (OutPoint, TxOutput) {
         .blocks
         .values()
         .find(|r| r.height == height)
-        .expect("block at height");
+        .unwrap_or_else(|| panic!("block at height"));
     let op = OutPoint {
         txid: rec.block.txs[0].txid(),
         vout: 0,
     };
-    let out = chain.utxos.get(&op).expect("coinbase output unspent").output.clone();
+    let out = chain
+        .utxos
+        .get(&op)
+        .unwrap_or_else(|| panic!("coinbase output unspent"))
+        .output
+        .clone();
     (op, out)
 }
 
@@ -76,8 +85,12 @@ fn attack_double_spend_race_only_one_confirms() {
     // other's mempool, so both admit — the race is live.
     let mut pool_a = Mempool::new(MempoolPolicy::default());
     let mut pool_b = Mempool::new(MempoolPolicy::default());
-    pool_a.admit(tx_a.clone(), Sats(1_000), &chain.utxos, &params, None).unwrap();
-    pool_b.admit(tx_b.clone(), Sats(2_000), &chain.utxos, &params, None).unwrap();
+    pool_a
+        .admit(tx_a.clone(), Sats(1_000), &chain.utxos, &params, None)
+        .unwrap();
+    pool_b
+        .admit(tx_b.clone(), Sats(2_000), &chain.utxos, &params, None)
+        .unwrap();
 
     // Miner includes tx_a (higher fee-rate isn't needed — first seen).
     let mut prev = tip_header(&chain);
@@ -91,7 +104,10 @@ fn attack_double_spend_race_only_one_confirms() {
     // Now tx_b's input is spent on-chain: it can NEVER confirm.
     let err = validate_tx(&tx_b, &chain.utxos, &params).unwrap_err();
     assert!(
-        matches!(err, TxError::MissingInput { .. } | TxError::Overspend { .. }),
+        matches!(
+            err,
+            TxError::MissingInput { .. } | TxError::Overspend { .. }
+        ),
         "double-spend loser must fail validation, got {err:?}"
     );
     // And mempool B must drop it when it learns of the block.
@@ -131,9 +147,16 @@ fn attack_reorg_double_spend_erases_payment() {
     for i in 0..4u32 {
         time += 31;
         let txs = if i == 0 {
-            vec![coinbase_tx(&miner, chain.height() + 1, params.subsidy_start), payment.clone()]
+            vec![
+                coinbase_tx(&miner, chain.height() + 1, params.subsidy_start),
+                payment.clone(),
+            ]
         } else {
-            vec![coinbase_tx(&miner, chain.height() + 1, params.subsidy_start)]
+            vec![coinbase_tx(
+                &miner,
+                chain.height() + 1,
+                params.subsidy_start,
+            )]
         };
         let blk = build_block(&prev, txs, time, &params);
         chain.consider_block(blk.clone()).unwrap();
@@ -150,11 +173,7 @@ fn attack_reorg_double_spend_erases_payment() {
     let fork_start_height = chain_height_at(&chain, fork_point.block_hash());
     for i in 0..5u32 {
         ftime += 31;
-        let cb = coinbase_tx(
-            &attacker,
-            fork_start_height + 1 + i,
-            params.subsidy_start,
-        );
+        let cb = coinbase_tx(&attacker, fork_start_height + 1 + i, params.subsidy_start);
         let blk = build_block(&fprev, vec![cb], ftime, &params);
         chain.consider_block(blk.clone()).unwrap();
         fprev = blk.header;
@@ -172,7 +191,11 @@ fn attack_reorg_double_spend_erases_payment() {
 }
 
 fn chain_height_at(chain: &Chain, hash: Hash256) -> u32 {
-    chain.blocks.get(&hash).map(|r| r.height).unwrap()
+    chain
+        .blocks
+        .get(&hash)
+        .map(|r| r.height)
+        .unwrap_or_else(|| panic!("block record missing"))
 }
 
 // ---------- 6. Majority-work (51%) attack ----------
@@ -230,7 +253,10 @@ fn attack_majority_work_rewrites_history() {
         }
         cur = rec.block.header.prev_hash;
     }
-    assert!(!seen_honest, "honest tip must be orphaned by majority attack");
+    assert!(
+        !seen_honest,
+        "honest tip must be orphaned by majority attack"
+    );
 }
 
 // ---------- 12. Mempool flooding ----------
@@ -280,7 +306,10 @@ fn attack_mempool_flood_bounded_eviction() {
     // Eviction is fee-ordered: the earliest (lowest-fee) admits are gone.
     let survivors = admitted.iter().filter(|t| pool.get(t).is_some()).count();
     assert!(survivors < admitted.len(), "no evictions happened");
-    assert!(pool.get(&admitted[0]).is_none(), "lowest-fee tx should be evicted");
+    assert!(
+        pool.get(&admitted[0]).is_none(),
+        "lowest-fee tx should be evicted"
+    );
     // The highest-fee tail survives.
     let last = admitted.last().unwrap();
     assert!(pool.get(last).is_some(), "highest-fee tx must survive");
@@ -309,19 +338,28 @@ fn attack_malformed_messages_never_panic() {
         ("inv", Message::Inv(vec![inv_item()])),
         ("getdata", Message::GetData(vec![inv_item()])),
         ("addr", Message::Addr(vec![(net_addr(), 1_700_000_000)])),
-        ("reject", Message::Reject {
-            message: "x".into(),
-            code: 1,
-            reason: "y".into(),
-        }),
-        ("getheaders", Message::GetHeaders {
-            locator: vec![Hash256::ZERO],
-            stop: Hash256::ZERO,
-        }),
-        ("headers", Message::Headers {
-            count: 0,
-            headers: vec![],
-        }),
+        (
+            "reject",
+            Message::Reject {
+                message: "x".into(),
+                code: 1,
+                reason: "y".into(),
+            },
+        ),
+        (
+            "getheaders",
+            Message::GetHeaders {
+                locator: vec![Hash256::ZERO],
+                stop: Hash256::ZERO,
+            },
+        ),
+        (
+            "headers",
+            Message::Headers {
+                count: 0,
+                headers: vec![],
+            },
+        ),
         ("tx", Message::Tx(dummy_tx())),
         ("block", Message::Block(dummy_block(&params))),
     ];
@@ -338,9 +376,7 @@ fn attack_malformed_messages_never_panic() {
         // (a) Every truncation point (step to keep it fast on big payloads).
         let step = (payload.len() / 40).max(1);
         for cut in (0..payload.len()).step_by(step) {
-            let r = std::panic::catch_unwind(|| {
-                codec::decode_payload(cmd, &payload[..cut])
-            });
+            let r = std::panic::catch_unwind(|| codec::decode_payload(cmd, &payload[..cut]));
             assert!(r.is_ok(), "decode panicked on truncated {cmd} at {cut}");
             cases += 1;
         }
@@ -348,9 +384,7 @@ fn attack_malformed_messages_never_panic() {
         for off in (0..payload.len()).step_by(step.max(1)) {
             let mut bad = payload.clone();
             bad[off] ^= 0xff;
-            let r = std::panic::catch_unwind(|| {
-                codec::decode_payload(cmd, &bad)
-            });
+            let r = std::panic::catch_unwind(|| codec::decode_payload(cmd, &bad));
             assert!(r.is_ok(), "decode panicked on corrupted {cmd} at {off}");
             cases += 1;
         }
@@ -361,18 +395,14 @@ fn attack_malformed_messages_never_panic() {
             vec![0xff, 0xff, 0xff, 0xff, 0x0f], // huge compactsize
             vec![0x00; 4096],
         ] {
-            let r = std::panic::catch_unwind(|| {
-                codec::decode_payload(cmd, &garbage)
-            });
+            let r = std::panic::catch_unwind(|| codec::decode_payload(cmd, &garbage));
             assert!(r.is_ok(), "decode panicked on garbage {cmd}");
             cases += 1;
         }
     }
     // Also fuzz unknown commands.
     for cmd in ["", "notacommand", "VERSION", "getblocktemplate\x00"] {
-        let r = std::panic::catch_unwind(|| {
-            codec::decode_payload(cmd, &[0xde, 0xad, 0xbe, 0xef])
-        });
+        let r = std::panic::catch_unwind(|| codec::decode_payload(cmd, &[0xde, 0xad, 0xbe, 0xef]));
         assert!(r.is_ok(), "decode panicked on unknown cmd {cmd:?}");
         cases += 1;
     }
@@ -418,12 +448,16 @@ fn dummy_tx() -> Transaction {
 }
 
 fn dummy_block(params: &ChainParams) -> Block {
-    let cb = coinbase_tx(&Keypair::generate().unwrap(), 0, params.subsidy_start);
+    let cb = coinbase_tx(
+        &Keypair::generate().unwrap_or_else(|e| panic!("keygen failed: {e:?}")),
+        0,
+        params.subsidy_start,
+    );
     Block {
         header: BlockHeader {
             version: 1,
             prev_hash: Hash256::ZERO,
-            merkle_root: merkle_root(&[cb.clone()]),
+            merkle_root: merkle_root(std::slice::from_ref(&cb)),
             time: 1_700_000_000,
             bits: params.pow_limit_bits,
             nonce: 0,
@@ -481,10 +515,7 @@ fn attack_eclipse_diversity_limits_hold() {
         pm3.register(addr, false, &mk_ver()).unwrap();
     }
     let fifth: SocketAddr = SocketAddr::from(([172, 16, 9, 9], 18445));
-    assert!(matches!(
-        pm3.admit(fifth, false),
-        Err(PeerError::AddrLimit)
-    ));
+    assert!(matches!(pm3.admit(fifth, false), Err(PeerError::AddrLimit)));
     // A different /16 is still admissible.
     let other: SocketAddr = SocketAddr::from(([172, 17, 0, 1], 18445));
     assert!(pm3.admit(other, false).is_ok());
