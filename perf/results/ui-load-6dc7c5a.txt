@@ -1,0 +1,20 @@
+UI load smoke — P13 explorer + wallet-ui
+machine: Apple M2 Pro (laptop — development observation, not capacity)
+commit: 6dc7c5a3a633a2f8917b40c901fced07a25460c5
+date: 2026-11-10T13:12:43Z
+tool: ApacheBench (ab)
+
+explorer GET /mempool — 100000 req, 50 conns, keepalive:
+  Complete requests: 100000
+  Failed requests:   0
+  Requests/sec:      3051.94
+  Time/request:      16.383 ms mean (0.328 ms across all concurrent)
+
+wallet-ui GET /wallet (authed session; each request runs scantxoutset + full wallet rescan) — 20000 req, 10 conns:
+  Complete requests: 20000
+  Failed requests:   0
+  Requests/sec:      1359.73
+  Time/request:      ~7.4 ms mean
+
+Earlier short runs same session: /mempool 2000req@4117rps, /wallet 500req@2067rps — 0 failures.
+Backend RPC already carries committed 1M-op evidence (perf/results/load-*.json).

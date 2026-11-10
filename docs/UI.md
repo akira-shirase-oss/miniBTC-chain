@@ -102,9 +102,12 @@ check, HTML escaping, session-expiry sweep. Explorer adds
 
 ## Load smoke (ab, this machine — laptop numbers, not capacity)
 
-- Explorer `GET /mempool`: 2000 req, 20 conns — **4,117 req/s**, 0 fail.
+- Explorer `GET /mempool`: **100,000 req, 50 conns — 3,052 req/s, 0
+  failures** (ab, sustained).
 - Wallet-ui `GET /wallet` (authed; full UTXO rescan per request):
-  500 req, 10 conns — **2,067 req/s**, 0 fail.
+  **20,000 req, 10 conns — 1,360 req/s, 0 failures** (ab, sustained).
+- Raw log: `perf/results/ui-load-6dc7c5a.txt`. Short-run spot checks
+  earlier same session: 4,117 req/s explorer, 2,067 req/s wallet-ui.
 - The RPC backend itself carries the committed 1M-req evidence
   (`perf/results/load-*.json`); these runs measure the thin HTML layer
   on top.
