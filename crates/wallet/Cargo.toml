@@ -9,9 +9,12 @@ description = "MiniBTC wallet: BIP39 seeds, BIP32/44 derivation, UTXO tracking, 
 
 [dependencies]
 minibtc-crypto = { path = "../crypto" }
+k256.workspace = true
+bs58.workspace = true
 minibtc-primitives = { path = "../primitives" }
 minibtc-script = { path = "../script" }
 minibtc-consensus = { path = "../consensus" }
+minibtc-chainstate = { path = "../chainstate" }
 bip39.workspace = true
 hmac.workspace = true
 sha2.workspace = true
@@ -21,6 +24,9 @@ thiserror.workspace = true
 tracing.workspace = true
 secrecy.workspace = true
 zeroize.workspace = true
+chacha20poly1305.workspace = true
+getrandom = "0.4"
+pbkdf2.workspace = true
 rand_core = "0.6"
 
 [dev-dependencies]
