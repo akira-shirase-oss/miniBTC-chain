@@ -66,5 +66,5 @@ Run before every commit.
 - Work phase by phase per `docs/ROADMAP.md`; commit at each proof gate.
 - Commits stay local (no push — the remote is not set up yet).
 - The journey is recorded in the build log at
-  https://404human.dev (source: `akira-shirase-oss/minimal-portfolio`,
+  https://404human.dev (source: `akira-shirase-oss/site/minimal-portfolio`,
   `content/minibtc/`). Update it at each milestone.
