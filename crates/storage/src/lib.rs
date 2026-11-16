@@ -270,6 +270,32 @@ impl Store {
         Ok(())
     }
 
+    /// Persist a side-branch block that did not change the active chain:
+    /// its bytes and index meta only (status inactive), O(block). The UTXO
+    /// set, undo data and recorded tip are untouched because they did not
+    /// change. A full [`Self::snapshot`] here let any peer force an O(chain)
+    /// rewrite under the node lock with one cheap side block.
+    pub fn put_side_block(&self, chain: &Chain, hash: &Hash256) -> Result<(), StoreError> {
+        let rec = chain
+            .blocks
+            .get(hash)
+            .ok_or_else(|| StoreError::Corrupt("put_side_block: unknown block".into()))?;
+        let txn = self.db.begin_write()?;
+        {
+            let mut blocks = txn.open_table(BLOCKS)?;
+            let mut meta = txn.open_table(META)?;
+            blocks.insert(hash.as_bytes(), rec.block.encode().as_slice())?;
+            let mut m = Writer::new();
+            m.u32(rec.height);
+            m.bytes(&rec.cum_work.to_le_bytes());
+            m.u8(0); // inactive
+            m.hash256(&rec.block.header.prev_hash);
+            meta.insert(hash.as_bytes(), m.into_bytes().as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
     /// Persist a tip disconnect: restore spent outputs, remove created
     /// ones, mark the block inactive. Call *before* `chain.disconnect_tip`
     /// while the undo record is still in `chain.undos`. Reorgs that

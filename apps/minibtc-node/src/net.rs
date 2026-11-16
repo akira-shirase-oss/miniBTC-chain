@@ -137,10 +137,14 @@ fn disconnect(node: &Node, addr: SocketAddr) {
     // exits; the peer table entry is already gone.
 }
 
-/// Sweep: disconnect stalled + over-handshake-timeout peers.
+/// Sweep: disconnect stalled + over-handshake-timeout peers, and expire
+/// queued orphan blocks and unanswered block requests.
 async fn sweep(node: &Node) {
     let bad: Vec<SocketAddr> = {
-        let inner = node.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut inner = node.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let now = std::time::Instant::now();
+        inner.pending.expire(now);
+        inner.requests.expire(now);
         inner
             .peers
             .snapshot()
@@ -562,14 +566,14 @@ async fn handle_message(
 /// Process an `inv`: request what we don't have (bounded).
 async fn handle_inv(
     node: &Node,
-    _addr: SocketAddr,
+    addr: SocketAddr,
     items: &[minibtc_p2p::codec::InvItem],
     reply: &mpsc::Sender<Message>,
 ) {
     use minibtc_p2p::codec::InvType;
     let mut want: Vec<minibtc_p2p::codec::InvItem> = Vec::new();
     {
-        let inner = node.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut inner = node.inner.lock().unwrap_or_else(|e| e.into_inner());
         for item in items.iter().take(INV_PROCESS_CAP) {
             match item.kind {
                 InvType::Tx => {
@@ -591,6 +595,12 @@ async fn handle_inv(
             if want.len() >= GETDATA_BATCH {
                 break;
             }
+        }
+        // Remember which blocks we asked this peer for: only those may wait
+        // in the out-of-order queue.
+        let now = std::time::Instant::now();
+        for item in want.iter().filter(|i| i.kind == InvType::Block) {
+            inner.requests.note(item.hash, addr, now);
         }
     }
     if !want.is_empty() {
@@ -634,25 +644,35 @@ async fn handle_getdata(
 
 /// Queue an inbound block and drain whatever became connectable.
 async fn handle_block(node: &Node, addr: SocketAddr, block: Block, reply: &mpsc::Sender<Message>) {
-    // Context-free merkle check first (cheap). A mutated block
-    // (CVE-2012-2459) shares the honest block's hash, so it is dropped
-    // here without its hash entering `have` or the pending queue — the
-    // honest copy can still arrive and connect.
-    if let Err(e) = minibtc_primitives::check_merkle_root(&block.header, &block.txs) {
-        tracing::debug!(%addr, "block failed merkle check: {e}");
+    // Context-free checks first (cheap, no lock): merkle root + mutation
+    // and proof of work. A mutated block (CVE-2012-2459) shares the honest
+    // block's hash, so it is dropped here without its hash entering `have`
+    // or the pending queue — the honest copy can still arrive and connect.
+    if let Err(e) = crate::core::precheck_block(&node.params, &block) {
+        tracing::debug!(%addr, "block failed precheck: {e}");
         let mut inner = node.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.peers.score(&addr, SCORE_BAD_BLOCK);
         return;
     }
     {
         let mut inner = node.inner.lock().unwrap_or_else(|e| e.into_inner());
-        // sync.on_block records per-peer progress and returns false for
-        // blocks already connected; `have` is set only after a connect.
-        if !inner.sync.on_block(addr, block.clone()) {
+        let now = std::time::Instant::now();
+        let hash = block.header.block_hash();
+        // Only a block we asked this peer for may wait for its parent; an
+        // unasked block is processed only if it can connect right now.
+        let requested = inner.requests.take(&hash, addr, now);
+        let parent_known = inner.chain.blocks.contains_key(&block.header.prev_hash);
+        if !requested && !parent_known {
+            tracing::debug!(%addr, %hash, "dropping unrequested orphan block");
             return;
         }
-        if !inner.pending.push(block) {
-            return; // queue full — already counted as `have`
+        // sync.on_block records per-peer progress and returns false for
+        // blocks already connected; `have` is set only after a connect.
+        if !inner.sync.on_block(addr, &block) {
+            return;
+        }
+        if !inner.pending.push(block, now) {
+            return; // queue full (count or bytes) or already queued
         }
     }
     drain_pending(node, addr, reply).await;
@@ -711,7 +731,8 @@ async fn drain_pending(node: &Node, origin: SocketAddr, reply: &mpsc::Sender<Mes
     }
 }
 
-/// Pop all wanted block hashes for `peer`, chunked for getdata.
+/// Pop all wanted block hashes for `peer`, chunked for getdata, and
+/// record them as requested from that peer.
 fn drain_wanted(inner: &mut NodeInner, peer: SocketAddr) -> Vec<Hash256> {
     let mut out = Vec::new();
     loop {
@@ -723,6 +744,10 @@ fn drain_wanted(inner: &mut NodeInner, peer: SocketAddr) -> Vec<Hash256> {
         if out.len() >= 8_192 {
             break; // sanity cap — wanted is already window-bounded
         }
+    }
+    let now = std::time::Instant::now();
+    for h in &out {
+        inner.requests.note(*h, peer, now);
     }
     out
 }

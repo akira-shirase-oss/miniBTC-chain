@@ -126,6 +126,8 @@ impl RpcBackend for NodeBackend {
                     "errors": "",
                     "money_supply_sats": money_sum.sats(),
                     "sync_pending_blocks": inner.pending.len(),
+                    "sync_pending_bytes": inner.pending.bytes(),
+                    "sync_block_requests": inner.requests.len(),
                 }))
             }
 

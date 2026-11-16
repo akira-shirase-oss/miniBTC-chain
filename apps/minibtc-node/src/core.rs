@@ -17,7 +17,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
 /// Bounded address-book size.
@@ -28,24 +28,76 @@ const MEMPOOL_REFRESH_CAP: usize = 10_000;
 /// need the cancel flag + bigger budgets).
 const MINE_BUDGET: u64 = 50_000_000;
 
+/// Most blocks the out-of-order queue holds.
+pub(crate) const PENDING_MAX_BLOCKS: usize = 1_024;
+/// Most serialized bytes the out-of-order queue holds (blocks are up to
+/// `max_block_size`, so the count cap alone allowed ~1 GB).
+pub(crate) const PENDING_MAX_BYTES: usize = 32 * 1024 * 1024;
+/// A queued block whose parent never arrives is dropped after this.
+pub(crate) const PENDING_TTL: Duration = Duration::from_secs(10 * 60);
+/// Most block requests (getdata) tracked at once.
+pub(crate) const REQUESTS_MAX: usize = 8_192;
+/// A block request not answered within this is forgotten.
+pub(crate) const REQUEST_TTL: Duration = Duration::from_secs(5 * 60);
+
+/// One queued block plus what the caps need.
+struct PendingEntry {
+    block: minibtc_primitives::Block,
+    hash: Hash256,
+    bytes: usize,
+    queued_at: Instant,
+}
+
 /// Blocks received but not yet connectable (parent unknown) — drained in
-/// order as the chain advances. Bounded; duplicates suppressed.
+/// order as the chain advances. Bounded by count *and* bytes, entries
+/// expire, duplicates are suppressed. Only blocks this node requested (or
+/// whose parent is already known) are queued — see `net::handle_block`.
 #[derive(Default)]
 pub struct PendingBlocks {
-    queue: VecDeque<minibtc_primitives::Block>,
+    queue: VecDeque<PendingEntry>,
     seen: HashSet<Hash256>,
+    bytes: usize,
 }
 
 impl PendingBlocks {
-    /// Push if new and under cap.
-    pub fn push(&mut self, block: minibtc_primitives::Block) -> bool {
-        let h = block.header.block_hash();
-        if self.seen.contains(&h) || self.queue.len() >= 4_096 {
+    /// Queue `block` if it is new and fits under both caps (after dropping
+    /// expired entries). Returns whether it was queued.
+    pub fn push(&mut self, block: minibtc_primitives::Block, now: Instant) -> bool {
+        self.expire(now);
+        let hash = block.header.block_hash();
+        let bytes = block.encode().len();
+        if self.seen.contains(&hash)
+            || self.queue.len() >= PENDING_MAX_BLOCKS
+            || self.bytes.saturating_add(bytes) > PENDING_MAX_BYTES
+        {
             return false;
         }
-        self.seen.insert(h);
-        self.queue.push_back(block);
+        self.seen.insert(hash);
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.queue.push_back(PendingEntry {
+            block,
+            hash,
+            bytes,
+            queued_at: now,
+        });
         true
+    }
+
+    /// Drop entries older than `PENDING_TTL` (the queue is in arrival
+    /// order, so expired entries are at the front).
+    pub fn expire(&mut self, now: Instant) {
+        while let Some(front) = self.queue.front()
+            && now.saturating_duration_since(front.queued_at) > PENDING_TTL
+        {
+            if let Some(e) = self.queue.pop_front() {
+                self.forget(&e);
+            }
+        }
+    }
+
+    fn forget(&mut self, e: &PendingEntry) {
+        self.seen.remove(&e.hash);
+        self.bytes = self.bytes.saturating_sub(e.bytes);
     }
 
     /// Pop the first block whose parent we already index.
@@ -58,10 +110,10 @@ impl PendingBlocks {
         let pos = self
             .queue
             .iter()
-            .position(|b| blocks.contains_key(&b.header.prev_hash))?;
-        let b = self.queue.remove(pos)?;
-        self.seen.remove(&b.header.block_hash());
-        Some(b)
+            .position(|e| blocks.contains_key(&e.block.header.prev_hash))?;
+        let e = self.queue.remove(pos)?;
+        self.forget(&e);
+        Some(e.block)
     }
 
     /// Is this hash already queued?
@@ -73,6 +125,75 @@ impl PendingBlocks {
     pub fn len(&self) -> usize {
         self.queue.len()
     }
+
+    /// Queued bytes for observability.
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+/// Blocks this node asked a peer for (getdata), so a block that arrives
+/// unasked cannot take a slot in the out-of-order queue. Bounded and
+/// expiring.
+#[derive(Default)]
+pub struct BlockRequests {
+    by_hash: HashMap<Hash256, (SocketAddr, Instant)>,
+}
+
+impl BlockRequests {
+    /// Record that `hash` was requested from `peer` at `now`. Silently
+    /// skips when full (the block can still arrive once its parent is
+    /// known, and the request is retried by the next headers round).
+    pub fn note(&mut self, hash: Hash256, peer: SocketAddr, now: Instant) {
+        self.expire(now);
+        if self.by_hash.len() < REQUESTS_MAX || self.by_hash.contains_key(&hash) {
+            self.by_hash.insert(hash, (peer, now));
+        }
+    }
+
+    /// Whether `hash` was requested from `peer` (and not expired);
+    /// consumes the request.
+    pub fn take(&mut self, hash: &Hash256, peer: SocketAddr, now: Instant) -> bool {
+        self.expire(now);
+        match self.by_hash.get(hash) {
+            Some((asked, _)) if *asked == peer => {
+                self.by_hash.remove(hash);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Forget requests older than `REQUEST_TTL`.
+    pub fn expire(&mut self, now: Instant) {
+        self.by_hash
+            .retain(|_, (_, at)| now.saturating_duration_since(*at) <= REQUEST_TTL);
+    }
+
+    /// Outstanding requests for observability.
+    pub fn len(&self) -> usize {
+        self.by_hash.len()
+    }
+}
+
+/// Context-free checks a block must pass before it may touch sync state
+/// or the pending queue: merkle root (with CVE-2012-2459 mutation), a
+/// target that decodes and is not above the pow limit, and a hash that
+/// meets it. Cheap and lock-free; full validation happens at connect.
+pub fn precheck_block(
+    params: &ChainParams,
+    block: &minibtc_primitives::Block,
+) -> Result<(), String> {
+    minibtc_primitives::check_merkle_root(&block.header, &block.txs)
+        .map_err(|e| format!("merkle: {e}"))?;
+    minibtc_consensus::checked_target(block.header.bits, params)
+        .map_err(|e| format!("pow: {e}"))?;
+    let target =
+        minibtc_consensus::target_for_bits(block.header.bits).map_err(|e| format!("pow: {e}"))?;
+    if !block.header.check_pow(&target) {
+        return Err("pow: hash above target".to_string());
+    }
+    Ok(())
 }
 
 /// Everything that mutates together lives here.
@@ -92,6 +213,8 @@ pub struct NodeInner {
     pub txindex: HashMap<Hash256, Hash256>,
     /// Out-of-order block download queue.
     pub pending: PendingBlocks,
+    /// Blocks requested from peers (only these may wait in `pending`).
+    pub requests: BlockRequests,
     /// Highest block height each peer has claimed (via version or a
     /// headers batch) — drives continued getheaders until caught up.
     pub claimed: HashMap<SocketAddr, u32>,
@@ -169,6 +292,7 @@ pub fn open(datadir: &Path, params: ChainParams, reindex: bool) -> Result<Node, 
         addrbook: Vec::new(),
         txindex,
         pending: PendingBlocks::default(),
+        requests: BlockRequests::default(),
         claimed: HashMap::new(),
         dialing: HashSet::new(),
     };
@@ -245,11 +369,14 @@ impl Node {
         let direct = block.header.prev_hash == inner.chain.tip;
         let prev_tip = inner.chain.tip;
         inner.chain.consider_block(block.clone())?;
-        // Persist: incremental for direct extensions, full snapshot for
-        // side branches/reorgs (rare — correctness over speed).
+        // Persist: incremental for a tip extension, block + meta only for a
+        // side branch that changed nothing else, full snapshot only for a
+        // reorg (which needs more work than the tip — it costs PoW).
         if let Some(store) = &self.store {
             if direct {
                 store.append_block(&inner.chain, &hash)?;
+            } else if inner.chain.tip == prev_tip {
+                store.put_side_block(&inner.chain, &hash)?;
             } else {
                 store.snapshot(&inner.chain)?;
             }
@@ -565,5 +692,130 @@ pub fn tx_confirmations(inner: &NodeInner, txid: &Hash256) -> Option<u64> {
         }
         cur = rec.block.header.prev_hash;
         h = h.saturating_sub(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use minibtc_primitives::{Block, BlockHeader, OutPoint, Sats, Transaction, TxInput, TxOutput};
+
+    /// A block of roughly `script_len` bytes with a distinct hash.
+    fn block(seed: u32, script_len: usize) -> Block {
+        Block {
+            header: BlockHeader {
+                version: 1,
+                prev_hash: Hash256([0xEE; 32]), // parent never known
+                merkle_root: Hash256::ZERO,
+                time: seed,
+                bits: 0x207f_ffff,
+                nonce: seed,
+            },
+            txs: vec![Transaction {
+                version: 1,
+                inputs: vec![TxInput {
+                    prev: OutPoint::NULL,
+                    script_sig: vec![0x51],
+                    sequence: 0,
+                }],
+                outputs: vec![TxOutput {
+                    value: Sats(1),
+                    script_pubkey: vec![0x6a; script_len],
+                }],
+                locktime: 0,
+            }],
+        }
+    }
+
+    #[test]
+    fn precheck_refuses_bad_pow_and_mutated_merkle() {
+        let params = ChainParams::devnet();
+        let mut good = block(1, 10);
+        good.header.merkle_root = minibtc_primitives::merkle_root(&good.txs);
+        let target = minibtc_consensus::target_for_bits(good.header.bits).unwrap();
+        while !good.header.check_pow(&target) {
+            good.header.nonce += 1;
+        }
+        assert_eq!(precheck_block(&params, &good), Ok(()));
+
+        let mut bad_pow = good.clone();
+        while bad_pow.header.check_pow(&target) {
+            bad_pow.header.nonce += 1;
+        }
+        assert!(precheck_block(&params, &bad_pow).is_err());
+
+        let mut mutated = good.clone();
+        mutated.txs.push(good.txs[0].clone());
+        mutated.txs.push(good.txs[0].clone());
+        // [t, t, t] keeps no honest root; any list with an identical pair
+        // at a pair position is refused before it can be queued.
+        mutated.header.merkle_root = minibtc_primitives::merkle_root(&mutated.txs);
+        assert!(precheck_block(&params, &mutated).is_err());
+
+        let mut too_easy = good.clone();
+        let mut hard = ChainParams::devnet();
+        hard.pow_limit_bits = 0x1f7f_ffff;
+        too_easy.header.bits = 0x207f_ffff;
+        assert!(precheck_block(&hard, &too_easy).is_err());
+    }
+
+    #[test]
+    fn pending_queue_caps_blocks_and_bytes() {
+        let now = Instant::now();
+        let mut q = PendingBlocks::default();
+        // ~1 MB blocks: the byte cap binds long before the count cap.
+        let mut queued = 0usize;
+        for i in 0..64u32 {
+            if q.push(block(i, 1_000_000), now) {
+                queued += 1;
+            }
+        }
+        assert!(queued < 64, "byte cap must refuse some 1 MB blocks");
+        assert!(q.bytes() <= PENDING_MAX_BYTES);
+        // Small blocks: the count cap binds.
+        let mut q = PendingBlocks::default();
+        for i in 0..(PENDING_MAX_BLOCKS as u32 + 10) {
+            q.push(block(i, 10), now);
+        }
+        assert_eq!(q.len(), PENDING_MAX_BLOCKS);
+    }
+
+    #[test]
+    fn pending_entries_expire() {
+        let t0 = Instant::now();
+        let mut q = PendingBlocks::default();
+        assert!(q.push(block(1, 10), t0));
+        let later = t0 + PENDING_TTL + Duration::from_secs(1);
+        q.expire(later);
+        assert_eq!(q.len(), 0, "orphan must expire");
+        assert_eq!(q.bytes(), 0);
+        assert!(!q.contains(&block(1, 10).header.block_hash()));
+        // Its hash is free again.
+        assert!(q.push(block(1, 10), later));
+    }
+
+    #[test]
+    fn only_requested_blocks_count_as_requested() {
+        let t0 = Instant::now();
+        let a: SocketAddr = "10.0.0.1:1".parse().unwrap();
+        let b: SocketAddr = "10.0.0.2:1".parse().unwrap();
+        let h = Hash256([7; 32]);
+        let mut r = BlockRequests::default();
+        assert!(!r.take(&h, a, t0), "never requested");
+        r.note(h, a, t0);
+        assert!(!r.take(&h, b, t0), "requested from someone else");
+        assert!(r.take(&h, a, t0), "requested from this peer");
+        assert!(!r.take(&h, a, t0), "a request is consumed once");
+        r.note(h, a, t0);
+        let late = t0 + REQUEST_TTL + Duration::from_secs(1);
+        assert!(!r.take(&h, a, late), "requests expire");
+        // Bounded.
+        let mut r = BlockRequests::default();
+        for i in 0..(REQUESTS_MAX + 100) {
+            let mut x = [0u8; 32];
+            x[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            r.note(Hash256(x), a, t0);
+        }
+        assert_eq!(r.len(), REQUESTS_MAX);
     }
 }

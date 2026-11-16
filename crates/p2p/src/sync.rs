@@ -53,8 +53,6 @@ pub struct PeerDownload {
     pub headers: Vec<Hash256>,
     /// Block hashes we're waiting on from this peer.
     pub wanted: VecDeque<Hash256>,
-    /// Blocks received but not yet connected (bounded by window).
-    pub received: VecDeque<Block>,
     /// Last time this peer sent us anything useful.
     pub last_progress: u64,
 }
@@ -168,41 +166,25 @@ impl Sync {
         Ok(to_fetch)
     }
 
-    /// Process an incoming `block`: stash it for the node to connect.
-    /// Returns true if it's new (not already held).
+    /// Note an incoming `block` from `peer` (progress for stall
+    /// detection). Returns true if it's new (not already held). The block
+    /// itself is not kept here — the node queues it (bounded) or connects
+    /// it; a per-peer copy that nothing drained used to hold up to
+    /// 8,192 blocks per peer.
     ///
     /// "Held" means *connected*: the hash enters `have` only through
     /// [`Self::note_have`] after the node accepted the block. Marking it
     /// here, before validation, let a mutated copy (same hash, CVE-2012-2459)
     /// make the node drop the honest block forever.
-    pub fn on_block(&mut self, peer: SocketAddr, block: Block) -> bool {
+    pub fn on_block(&mut self, peer: SocketAddr, block: &Block) -> bool {
         let hash = block.header.block_hash();
         if self.have.contains(&hash) {
             return false;
         }
         if let Some(pd) = self.peers.get_mut(&peer) {
-            pd.received.push_back(block);
             pd.last_progress = now();
-            // Drop oldest if window exceeded (node drains faster than this).
-            while pd.received.len() > BLOCK_WINDOW * 2 {
-                pd.received.pop_front();
-            }
         }
         true
-    }
-
-    /// Take the next batch of received blocks from a peer (for connect).
-    pub fn take_received(&mut self, peer: &SocketAddr, max: usize) -> Vec<Block> {
-        let mut out = Vec::new();
-        if let Some(pd) = self.peers.get_mut(peer) {
-            while out.len() < max {
-                match pd.received.pop_front() {
-                    Some(b) => out.push(b),
-                    None => break,
-                }
-            }
-        }
-        out
     }
 
     /// Blocks this peer still owes us (for getdata retry / stall detect).
@@ -411,16 +393,16 @@ mod tests {
             header: h,
             txs: vec![],
         };
-        assert!(sync.on_block(a, mutated), "first copy delivered");
+        assert!(sync.on_block(a, &mutated), "first copy delivered");
         // The node validated and rejected it (no note_have). The honest
         // copy with the same hash must still be delivered.
         assert!(
-            sync.on_block(a, honest.clone()),
+            sync.on_block(a, &honest),
             "honest block must not be dropped as already held"
         );
         // Once it connects, the hash is held and later copies are dropped.
         sync.note_have(h.block_hash());
-        assert!(!sync.on_block(a, honest), "connected block is held");
+        assert!(!sync.on_block(a, &honest), "connected block is held");
     }
 
     #[test]
@@ -436,11 +418,8 @@ mod tests {
             txs: vec![],
         };
         let hash = block.header.block_hash();
-        assert!(sync.on_block(a, block.clone()));
+        assert!(sync.on_block(a, &block));
         sync.note_have(hash); // the node connected it
-        assert!(!sync.on_block(a, block), "duplicate of a held block");
-        let got = sync.take_received(&a, 10);
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0].header.block_hash(), hash);
+        assert!(!sync.on_block(a, &block), "duplicate of a held block");
     }
 }
