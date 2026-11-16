@@ -63,6 +63,22 @@ pub enum BlockError {
     /// A non-first tx was coinbase-shaped.
     #[error("non-first transaction is coinbase-shaped")]
     StrayCoinbase,
+    /// BIP34: the coinbase scriptSig does not start with the block height
+    /// (Bitcoin Core's `bad-cb-height`).
+    #[error("coinbase does not commit to block height {height}")]
+    BadCoinbaseHeight {
+        /// The block's height.
+        height: u64,
+    },
+    /// BIP30: a transaction creates an outpoint that already exists
+    /// unspent — it would overwrite (destroy) that coin.
+    #[error("tx {index} would overwrite unspent output {outpoint} (BIP30)")]
+    Bip30 {
+        /// Position of the offending tx in the block.
+        index: usize,
+        /// The already-unspent outpoint.
+        outpoint: OutPoint,
+    },
     /// `bits` is not what the retarget schedule requires after the
     /// parent (Bitcoin Core's `bad-diffbits`).
     #[error("bad difficulty bits 0x{got:08x}, schedule requires 0x{expected:08x}")]
@@ -120,6 +136,22 @@ impl<'a, V: UtxoView> BlockView<'a, V> {
             created: HashMap::new(),
             spent: HashSet::new(),
         }
+    }
+
+    /// BIP30: none of `tx`'s outpoints may already exist unspent (in the
+    /// pre-block view or created earlier in this block).
+    fn check_no_overwrite(&self, tx: &Transaction, index: usize) -> Result<(), BlockError> {
+        let txid = tx.txid();
+        for vout in 0..tx.outputs.len() {
+            let outpoint = OutPoint {
+                txid,
+                vout: vout as u32,
+            };
+            if self.get(&outpoint).is_some() {
+                return Err(BlockError::Bip30 { index, outpoint });
+            }
+        }
+        Ok(())
     }
 
     /// Record a validated transaction: its inputs are spent for every
@@ -236,23 +268,33 @@ fn validate_block_inner<V: UtxoView>(
     if !coinbase.is_coinbase() {
         return Err(BlockError::BadCoinbase("first tx is not coinbase-shaped"));
     }
-    for (i, tx) in block.txs.iter().enumerate().skip(1) {
+    for tx in block.txs.iter().skip(1) {
         if tx.is_coinbase() {
             return Err(BlockError::StrayCoinbase);
         }
-        let _ = i;
+    }
+    // BIP34: every coinbase after genesis starts with its height, so no
+    // two coinbases on one chain can share a txid.
+    if height > 0
+        && !coinbase.inputs[0]
+            .script_sig
+            .starts_with(&coinbase_height_prefix(height))
+    {
+        return Err(BlockError::BadCoinbaseHeight { height });
     }
 
     // 5./6./7. Transactions, fees, sigops — tx i sees txs 0..i.
     let mut total_fees = Sats::ZERO;
     let mut sigops = 0usize;
     let mut block_view = BlockView::new(view);
+    block_view.check_no_overwrite(coinbase, 0)?;
     block_view.record(coinbase, true);
     for (i, tx) in block.txs.iter().enumerate().skip(1) {
         let fee = validate_tx(tx, &block_view, params).map_err(|e| BlockError::Tx {
             index: i,
             source: e,
         })?;
+        block_view.check_no_overwrite(tx, i)?;
         block_view.record(tx, false);
         total_fees = total_fees
             .checked_add(fee)
@@ -317,6 +359,35 @@ fn count_sigops(tx: &minibtc_primitives::Transaction) -> usize {
         .sum()
 }
 
+/// The BIP34 height commitment a coinbase scriptSig must start with:
+/// exactly Bitcoin Core's `CScript() << nHeight` — `OP_0` for 0,
+/// `OP_1`..`OP_16` for 1..=16, otherwise a direct push of the minimal
+/// little-endian script number (a `0x00` byte is appended when the top
+/// byte's high bit is set, so the number stays positive).
+pub fn coinbase_height_prefix(height: u64) -> Vec<u8> {
+    const OP_0: u8 = 0x00;
+    const OP_1: u8 = 0x51;
+    match height {
+        0 => vec![OP_0],
+        1..=16 => vec![OP_1 + (height as u8 - 1)],
+        _ => {
+            let mut num = Vec::with_capacity(9);
+            let mut v = height;
+            while v > 0 {
+                num.push((v & 0xff) as u8);
+                v >>= 8;
+            }
+            if num.last().is_some_and(|b| b & 0x80 != 0) {
+                num.push(0x00);
+            }
+            let mut out = Vec::with_capacity(num.len() + 1);
+            out.push(num.len() as u8); // ≤ 9 bytes: a direct push opcode
+            out.extend_from_slice(&num);
+            out
+        }
+    }
+}
+
 /// Median of up to `span` block times, most-recent-first — Bitcoin's
 /// "median time past". Caller supplies the past block times (newest first).
 pub fn median_time_past(times_newest_first: &[u32], span: usize) -> Option<u32> {
@@ -332,3 +403,24 @@ pub fn median_time_past(times_newest_first: &[u32], span: usize) -> Option<u32> 
 /// Re-exported for callers that build headers.
 pub type Header = BlockHeader;
 pub type HeaderHash = Hash256;
+
+#[cfg(test)]
+mod tests {
+    use super::coinbase_height_prefix;
+
+    #[test]
+    fn height_prefix_matches_core_script_number_encoding() {
+        assert_eq!(coinbase_height_prefix(0), [0x00]);
+        assert_eq!(coinbase_height_prefix(1), [0x51]);
+        assert_eq!(coinbase_height_prefix(16), [0x60]);
+        assert_eq!(coinbase_height_prefix(17), [0x01, 0x11]);
+        assert_eq!(coinbase_height_prefix(127), [0x01, 0x7f]);
+        assert_eq!(coinbase_height_prefix(128), [0x02, 0x80, 0x00]);
+        assert_eq!(coinbase_height_prefix(255), [0x02, 0xff, 0x00]);
+        assert_eq!(coinbase_height_prefix(256), [0x02, 0x00, 0x01]);
+        assert_eq!(coinbase_height_prefix(65_535), [0x03, 0xff, 0xff, 0x00]);
+        // Bitcoin mainnet block 227,931 (BIP34 activation) coinbase starts
+        // with 03 5b 7a 03.
+        assert_eq!(coinbase_height_prefix(227_931), [0x03, 0x5b, 0x7a, 0x03]);
+    }
+}

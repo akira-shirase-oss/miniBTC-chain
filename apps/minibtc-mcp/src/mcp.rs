@@ -1278,6 +1278,10 @@ const CONSENSUS_DOCS: &str = r#"# MiniBTC consensus rules (devnet preset)
   invalid; each tx is validated against the UTXO set as updated by the
   earlier txs of the same block; timestamp > median of previous 11,
   ≤ now + 2h; size ≤ 1,000,000 bytes; ≤ 10,000 txs.
+- **Coinbase height (BIP34)**: every coinbase after genesis starts with
+  its block height as Bitcoin's `CScript() << height` push.
+- **No overwrite (BIP30)**: a tx may not create an outpoint that already
+  exists unspent.
 - **Tx rules**: no duplicate inputs; inputs must exist and be unspent;
   outputs positive and ≤ max money; fee = inputs − outputs ≥ 0;
   standardness is policy, not consensus.

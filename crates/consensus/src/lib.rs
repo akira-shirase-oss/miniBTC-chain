@@ -17,8 +17,8 @@ pub mod subsidy;
 pub mod txval;
 
 pub use blockval::{
-    BlockContext, BlockError, BlockValidation, median_time_past, validate_block,
-    validate_block_in_context,
+    BlockContext, BlockError, BlockValidation, coinbase_height_prefix, median_time_past,
+    validate_block, validate_block_in_context,
 };
 pub use genesis::{genesis_block, genesis_key, genesis_secret};
 pub use params::{ChainParams, ParamsError};

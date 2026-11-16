@@ -27,8 +27,8 @@ fn coinbase_tx(miner: &Keypair, height: u32, value: u64) -> Transaction {
         inputs: vec![TxInput {
             prev: OutPoint::NULL,
             script_sig: {
-                // BIP34-style: push height then arbitrary data.
-                let mut s = vec![0x02, height as u8];
+                // BIP34: the exact height push consensus requires.
+                let mut s = minibtc_consensus::coinbase_height_prefix(u64::from(height));
                 s.extend_from_slice(b"minibtc");
                 s
             },

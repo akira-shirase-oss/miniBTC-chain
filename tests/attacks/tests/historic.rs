@@ -262,7 +262,7 @@ fn attack_coinbase_overclaim_rejected() {
         inputs: vec![TxInput {
             prev: OutPoint::NULL,
             script_sig: {
-                let mut s = vec![0x02, 1u8];
+                let mut s = minibtc_consensus::coinbase_height_prefix(1);
                 s.extend_from_slice(b"evil");
                 s
             },

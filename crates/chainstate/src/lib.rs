@@ -160,6 +160,11 @@ impl<'a, B: CoinView + ?Sized> UtxoOverlay<'a, B> {
                 txid,
                 vout: vout as u32,
             };
+            // BIP30 backstop: never overwrite an unspent coin (consensus
+            // rejects this first; the set must not depend on that).
+            if self.coin(&op).is_some() {
+                return Err(ChainError::OutputExists(op));
+            }
             self.put(
                 op,
                 UtxoEntry {
@@ -380,6 +385,9 @@ pub enum ChainError {
     /// Applying a tx hit a missing prevout (should be caught by validation).
     #[error("missing prevout {0} during connect")]
     MissingPrevout(OutPoint),
+    /// A transaction would overwrite an unspent output (BIP30).
+    #[error("output {0} already exists unspent")]
+    OutputExists(OutPoint),
     /// Tried to disconnect a non-tip block.
     #[error("can only disconnect the tip")]
     NotTip,

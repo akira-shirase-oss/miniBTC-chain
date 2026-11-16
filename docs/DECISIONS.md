@@ -152,6 +152,30 @@ limit used to make mining *harder*). Consequence: devnet datadirs
 written before this change may hold blocks whose bits no longer match
 the schedule; `--reindex` would refuse them. Start such devnets fresh.
 
+### D-014 — BIP34 coinbase height + BIP30 no-overwrite (2026-11-16)
+
+The blueprint's Tier-1 table does not list either rule, and nothing in
+it forbids them; both close a real hole. Without them two identical
+coinbases (same payout, value and scriptSig — the old miner wrote the
+height as a wrapping `u16`) share a txid, the second overwrites the
+first's unspent coin, and disconnecting it deletes the original.
+
+- **BIP34**: for every block at height ≥ 1 the coinbase scriptSig must
+  start with `coinbase_height_prefix(height)`, byte-for-byte Bitcoin
+  Core's `CScript() << nHeight` (OP_0 / OP_1..OP_16 / minimal
+  script-number push). Genesis is exempt (it is never validated), so the
+  genesis hash is unchanged. The miner and test fixtures use the same
+  function.
+- **BIP30**: always on (Core skips it after BIP34 activation for speed;
+  MiniBTC keeps it because the check is a hash lookup). A tx whose
+  outpoints already exist unspent — in the UTXO set or earlier in the
+  same block — is rejected; the UTXO overlay also refuses to overwrite
+  as a backstop.
+
+Consequence: blocks mined before this change carry the old `0x02 <u16>`
+height and fail BIP34, so older devnet datadirs cannot `--reindex`;
+start them fresh (same note as D-013).
+
 ## Open questions
 
 - None blocking. Post-v1 candidates if revisited: SegWit/Taproot sighash

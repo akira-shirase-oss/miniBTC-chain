@@ -114,7 +114,9 @@ pub fn build_template(
 
 /// The coinbase transaction: one null-prevout input + one output paying
 /// `payout_script` (any scriptPubKey — P2PKH address, raw script, etc.).
-/// ScriptSig carries the height (BIP34-style) plus a tag.
+/// The scriptSig starts with the BIP34 height push consensus requires
+/// (`coinbase_height_prefix`), so coinbase txids never repeat on a chain,
+/// followed by a tag.
 pub fn coinbase_transaction(
     height: u64,
     value: Sats,
@@ -123,9 +125,7 @@ pub fn coinbase_transaction(
 ) -> Transaction {
     // Commit to the tx set lightly via a hash in the scriptSig — gives
     // each coinbase a unique txid even with identical payouts.
-    let mut sig_script = Vec::with_capacity(16);
-    sig_script.push(0x02);
-    sig_script.extend_from_slice(&(height as u16).to_le_bytes());
+    let mut sig_script = minibtc_consensus::coinbase_height_prefix(height);
     sig_script.extend_from_slice(b"MBTC");
     Transaction {
         version: 1,
