@@ -145,6 +145,7 @@ fn disconnect(node: &Node, addr: SocketAddr) {
     let mut inner = node.inner.lock().unwrap_or_else(|e| e.into_inner());
     inner.peers.remove(&addr);
     inner.sync.remove_peer(&addr);
+    inner.requests.forget_peer(&addr);
     // Drop the TCP side too: the session notices its queue closed and
     // exits; the peer table entry is already gone.
 }
@@ -463,6 +464,7 @@ async fn cleanup(node: &Node, addr: SocketAddr) {
     let mut inner = node.inner.lock().unwrap_or_else(|e| e.into_inner());
     inner.peers.remove(&addr);
     inner.sync.remove_peer(&addr);
+    inner.requests.forget_peer(&addr);
 }
 
 /// Build a getheaders locator: tip + a few ancestors (bounded).
