@@ -232,7 +232,13 @@ the read fails closed if echo cannot be disabled). Existing wallets need
 one passphrase-unlocked command (e.g. `wallet balance`, or an unlock in the
 wallet UI) to write their watch-only file. The file holds public data but
 links every address to one wallet, so both the CLI and the wallet UI write
-it owner-only (0600) via a temp file and an atomic rename.
+it owner-only (0600) via a temp file unique to each write and an atomic
+rename. It is part of the trust base: the MCP gate counts an output as
+change only if it pays a script listed there, so anything that can edit
+files as the wallet's user can widen what counts as change and therefore
+the spend caps. Such a process can equally broadcast an approved
+`signed_hex` itself; the caps protect against the model, not against
+same-user code.
 
 ### D-016 — What a failed reorg leaves behind (2026-11-16)
 
