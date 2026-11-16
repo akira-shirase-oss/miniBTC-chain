@@ -35,11 +35,15 @@ pub(crate) const PENDING_MAX_BLOCKS: usize = 1_024;
 pub(crate) const PENDING_MAX_BYTES: usize = 32 * 1024 * 1024;
 /// A queued block whose parent never arrives is dropped after this.
 pub(crate) const PENDING_TTL: Duration = Duration::from_secs(10 * 60);
-/// Most block requests (getdata) tracked at once, all peers together.
-pub(crate) const REQUESTS_MAX: usize = 16_384;
 /// Most block requests tracked for one peer — one peer's junk `inv`s can
 /// no longer fill the table and crowd out everyone else's requests.
 pub(crate) const REQUESTS_PER_PEER: usize = 2_048;
+/// Most block requests tracked at once, all peers together: room for every
+/// peer slot at its quota (32 × 2,048 = 65,536 entries, a few MB). Sized
+/// above the inbound share on purpose — with the total equal to
+/// `MAX_INBOUND × REQUESTS_PER_PEER`, attackers holding every inbound slot
+/// could fill it and the node's own outbound requests would be skipped.
+pub(crate) const REQUESTS_MAX: usize = REQUESTS_PER_PEER * minibtc_p2p::peer::MAX_PEERS;
 /// A block request not answered within this is forgotten.
 pub(crate) const REQUEST_TTL: Duration = Duration::from_secs(5 * 60);
 
@@ -930,6 +934,29 @@ mod tests {
         let h = Hash256([0xAB; 32]);
         r.note(h, honest, t0);
         assert!(r.take(&h, honest, t0), "honest request must be recorded");
+    }
+
+    #[test]
+    fn inbound_peers_cannot_fill_the_request_table() {
+        // Every inbound slot (MAX_INBOUND peers) at its per-peer quota must
+        // still leave room for an outbound peer's requests.
+        let t0 = Instant::now();
+        let mut r = BlockRequests::default();
+        let mut n = 0usize;
+        for p in 0..minibtc_p2p::peer::MAX_INBOUND {
+            let peer = SocketAddr::from(([10, p as u8, 0, 1], 1));
+            for _ in 0..REQUESTS_PER_PEER {
+                r.note(hash_n(n), peer, t0);
+                n += 1;
+            }
+        }
+        let outbound: SocketAddr = "172.16.0.1:1".parse().unwrap();
+        let h = Hash256([0xCD; 32]);
+        r.note(h, outbound, t0);
+        assert!(
+            r.take(&h, outbound, t0),
+            "outbound request must be recorded"
+        );
     }
 
     #[test]
