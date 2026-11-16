@@ -151,6 +151,14 @@ saturates instead of wrapping mod 2^256 (a slow period at the devnet
 limit used to make mining *harder*). Consequence: devnet datadirs
 written before this change may hold blocks whose bits no longer match
 the schedule; `--reindex` would refuse them. Start such devnets fresh.
+The devnet preset's `instant_difficulty` flag never disabled
+retargeting (it only grinds the genesis nonce), so it is now named
+`grind_genesis_nonce` (the old key still loads). Burst mining with
+`mine generate` therefore keeps raising difficulty ×4 per 20 blocks; a
+regtest-style "no retargeting" mode would have to be a new consensus
+parameter applied by validation and the miner alike, which the blueprint's
+"difficulty adjusts on schedule on devnet settings" milestone argues
+against.
 
 ### D-014 — BIP34 coinbase height + BIP30 no-overwrite (2026-11-16)
 

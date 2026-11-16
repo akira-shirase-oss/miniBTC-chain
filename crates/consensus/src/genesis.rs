@@ -76,10 +76,10 @@ pub fn genesis_block(params: &ChainParams) -> Block {
         bits: params.pow_limit_bits,
         nonce: 0,
     };
-    // On instant-difficulty networks, grind the genesis nonce so even the
-    // genesis header satisfies its own PoW check (nice invariant; real
+    // With `grind_genesis_nonce` (devnet), grind the genesis nonce so even
+    // the genesis header satisfies its own PoW check (nice invariant; real
     // networks can't afford this and skip it).
-    if params.instant_difficulty
+    if params.grind_genesis_nonce
         && let Ok(target) = crate::pow::target_for_bits(header.bits)
     {
         let mut n = 0u32;

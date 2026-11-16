@@ -81,9 +81,14 @@ pub struct ChainParams {
     pub p2p_port: u16,
     /// Default RPC port.
     pub rpc_port: u16,
-    /// Default regtest-style instant-difficulty flag consumed by the miner.
-    #[serde(default)]
-    pub instant_difficulty: bool,
+    /// Grind the genesis header's nonce so genesis meets its own proof of
+    /// work (cheap only at an easy pow limit). That is all it does: it does
+    /// **not** turn off retargeting — the difficulty schedule is a
+    /// consensus rule on every network (D-013). Formerly named
+    /// `instant_difficulty`, which suggested otherwise; the old key is
+    /// still accepted in params files.
+    #[serde(default, alias = "instant_difficulty")]
+    pub grind_genesis_nonce: bool,
 }
 
 impl ChainParams {
@@ -111,7 +116,7 @@ impl ChainParams {
             p2p_magic: *b"MBTC",
             p2p_port: 18_445,
             rpc_port: 18_446,
-            instant_difficulty: true,
+            grind_genesis_nonce: true,
         }
     }
 
@@ -139,7 +144,7 @@ impl ChainParams {
             p2p_magic: *b"MBTC",
             p2p_port: 18_445,
             rpc_port: 18_446,
-            instant_difficulty: false,
+            grind_genesis_nonce: false,
         }
     }
 
@@ -191,6 +196,16 @@ mod tests {
         let parsed = ChainParams::from_json(&text).unwrap();
         assert_eq!(parsed.name, "minibtc-devnet");
         assert_eq!(parsed.pow_limit_bits, ChainParams::devnet().pow_limit_bits);
+    }
+
+    #[test]
+    fn old_instant_difficulty_key_still_loads() {
+        let text = serde_json::to_string(&ChainParams::devnet())
+            .unwrap()
+            .replace("grind_genesis_nonce", "instant_difficulty");
+        assert!(text.contains("instant_difficulty"));
+        let p = ChainParams::from_json(&text).unwrap();
+        assert!(p.grind_genesis_nonce);
     }
 
     #[test]
