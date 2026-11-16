@@ -450,6 +450,8 @@ pub struct Chain {
     dropped: Vec<Hash256>,
     /// What the last successful reorg switched, until `take_reorg`.
     last_reorg: Option<ReorgReport>,
+    /// A fixed clock instead of the wall clock (`set_now`).
+    now_override: Option<u32>,
 }
 
 /// The blocks a reorg moved off and onto the active chain. Both stay in
@@ -479,6 +481,7 @@ impl Chain {
             invalid_order: VecDeque::new(),
             dropped: Vec::new(),
             last_reorg: None,
+            now_override: None,
         };
         // Genesis connects unconditionally: no prev to check, no PoW to
         // verify (it is definitionally valid), coinbase matures normally.
@@ -687,7 +690,13 @@ impl Chain {
                 Ok(())
             }
             Err((bad, e)) => {
-                self.mark_invalid(bad);
+                // "Too far in the future" is a verdict about our clock, not
+                // the block (Core's BLOCK_TIME_FUTURE is never cached): keep
+                // the branch so a later block can retry once the clock
+                // catches up. Every other failure is a property of the block.
+                if !matches!(e, ChainError::InvalidBlock(BlockError::TimeTooNew { .. })) {
+                    self.mark_invalid(bad);
+                }
                 Err(e)
             }
         }
@@ -812,6 +821,13 @@ impl Chain {
         std::mem::take(&mut self.dropped)
     }
 
+    /// Use `now` (unix seconds) as the clock for the future-time rule
+    /// instead of the wall clock; `None` restores the wall clock. For
+    /// deterministic tests and replays.
+    pub fn set_now(&mut self, now: Option<u32>) {
+        self.now_override = now;
+    }
+
     /// Whether `hash` failed full validation.
     pub fn is_invalid(&self, hash: &Hash256) -> bool {
         self.invalid.contains(hash)
@@ -832,6 +848,9 @@ impl Chain {
     /// For the in-memory chain we use wall clock via `std::time` — this is
     /// the ONE place chainstate touches a clock, isolated for tests.
     fn adjusted_time(&self) -> u32 {
+        if let Some(now) = self.now_override {
+            return now;
+        }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as u32)
