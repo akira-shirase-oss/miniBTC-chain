@@ -577,7 +577,12 @@ impl Store {
             }
             generation = survivors;
         }
-        let _ = chain.take_dropped(); // not in the rebuilt index; snapshot drops them
+        // Replay bookkeeping is not news for the node: the dropped blocks
+        // are not in the rebuilt index (the snapshot writes them out), and a
+        // reorg that happened during the replay must not be processed again
+        // by the first connect after start-up.
+        let _ = chain.take_dropped();
+        let _ = chain.take_reorg();
         Ok(chain)
     }
 
