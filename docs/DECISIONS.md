@@ -200,7 +200,11 @@ the model — as human approval. Now:
    the draft plus signatures (`minibtc_wallet::draft::matches_draft`),
    with input values fetched from the node, and applies the per-request
    and per-day caps to the spend decoded from those bytes (outputs that
-   are not change, plus fee).
+   are not change, plus fee). Change means an output paying one of the
+   wallet's own scripts from `<wallet>.watch.json`; the draft's
+   `change_index` and the approval's `change_outputs` are display-only,
+   because a process that can write the drafts directory could relabel
+   them to dodge the caps.
 
 **What the barrier is.** The barrier is the wallet passphrase, which
 never enters the MCP process, the draft files or any environment the

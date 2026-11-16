@@ -965,11 +965,20 @@ impl MiniBtcMcp {
                 }
             }
         }
+        // Change = outputs paying the wallet's own scripts, from its
+        // watch-only file — not from the draft or approval JSON.
+        let watch = match minibtc_wallet::watch::read_watch_file(
+            &minibtc_wallet::watch::watch_file_path(&self.shared.datadir, &draft.wallet),
+        ) {
+            Ok(w) => w,
+            Err(e) => return Self::err(format!("cannot tell change from payment: {e}")),
+        };
         let spent_today = crate::daily_spent(&self.shared.datadir);
         let (signed_tx, spend) = match crate::check_send(
             &draft,
             signed.as_ref(),
             &values,
+            &watch.scripts,
             self.shared.max_spend_sats,
             spent_today,
             self.shared.max_daily_sats,

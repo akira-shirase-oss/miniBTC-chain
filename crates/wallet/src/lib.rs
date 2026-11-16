@@ -16,6 +16,7 @@ pub mod bip39;
 pub mod draft;
 pub mod keystore;
 pub mod wallet;
+pub mod watch;
 
 pub use bip32::{ChildNumber, DerivationPath, Xpriv};
 pub use bip39::{Mnemonic, generate_mnemonic, mnemonic_from_phrase, seed_from_mnemonic};
