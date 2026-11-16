@@ -202,6 +202,14 @@ the model — as human approval. Now:
    and per-day caps to the spend decoded from those bytes (outputs that
    are not change, plus fee).
 
+**What the barrier is.** The barrier is the wallet passphrase, which
+never enters the MCP process, the draft files or any environment the
+agent controls. The terminal check is a guard against mistakes (a script
+piping `sign` into the prompt), not a security boundary: any process can
+allocate a pseudo-terminal and drive the prompt (the 2026-11-16 review did
+it with Python's `pty`). Without the passphrase that gets it nowhere: a
+wrong passphrase fails the keystore unlock and nothing is signed.
+
 Honest limit: an agent that has a shell *and* the wallet passphrase (for
 example exported in the same shell) can always run `minibtc-cli wallet
 send` itself; no MCP gate can stop that. Keep the passphrase out of any

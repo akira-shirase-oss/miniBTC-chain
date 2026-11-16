@@ -429,9 +429,10 @@ fn save_indices(datadir: &Path, name: &str, indices: (u32, u32)) -> Result<()> {
     Ok(())
 }
 
-/// The approval gate runs only where a person can type: stdin and stderr
-/// must be a terminal, so a script or an agent piping input cannot drive
-/// it.
+/// The approval prompt runs only on a terminal (stdin and stderr). This
+/// is a guard against mistakes — a script piping `sign` into it — not a
+/// security boundary: any process can allocate a pseudo-terminal. The
+/// barrier is the wallet passphrase the prompt asks for (D-015).
 fn require_interactive() -> Result<()> {
     use std::io::IsTerminal;
     if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
