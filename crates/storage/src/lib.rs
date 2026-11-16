@@ -47,6 +47,8 @@ const CHAINMETA: TableDefinition<'_, &[u8], &[u8]> = TableDefinition::new("chain
 /// 2026-11-16 hardening (no key written); 2 = BIP34 coinbase heights,
 /// BIP30, the bits schedule and pow limit enforced (D-013, D-014).
 pub const RULES_VERSION: u32 = 2;
+/// What `rules_version` reports for a datadir with no rules key.
+const UNVERSIONED: u32 = 1;
 const RULES_KEY: &[u8] = b"rules";
 
 /// Storage errors.
@@ -380,6 +382,14 @@ impl Store {
             return Ok(None);
         }
         let found = self.rules_version()?;
+        if found == UNVERSIONED {
+            // No key: written before versions were recorded. Datadirs from
+            // between the rules change and the key already follow the
+            // current rules, so verify by replay instead of refusing them.
+            drop(blocks_t);
+            drop(txn);
+            return self.upgrade_unversioned(params, genesis).map(Some);
+        }
         if found != RULES_VERSION {
             return Err(StoreError::RulesVersion {
                 found,
@@ -586,15 +596,37 @@ impl Store {
         Ok(chain)
     }
 
+    /// Replay an unversioned datadir under the current rules. If the replay
+    /// ends on the recorded tip, every block of the recorded active chain
+    /// is valid under them: stamp the version (snapshot) and return the
+    /// replayed chain. Otherwise refuse, leaving the datadir untouched.
+    fn upgrade_unversioned(
+        &self,
+        params: ChainParams,
+        genesis: Block,
+    ) -> Result<Chain, StoreError> {
+        let recorded = self.recorded_tip()?;
+        let replayed = self.reindex(params, genesis)?;
+        if recorded == Some(replayed.tip) {
+            self.snapshot(&replayed)?;
+            Ok(replayed)
+        } else {
+            Err(StoreError::RulesVersion {
+                found: UNVERSIONED,
+                expected: RULES_VERSION,
+            })
+        }
+    }
+
     /// The consensus-rules version recorded in the datadir (1 when the
     /// key is absent: written before versions were recorded).
     pub fn rules_version(&self) -> Result<u32, StoreError> {
         let txn = self.db.begin_read()?;
         let Some(t) = opt_table(&txn, CHAINMETA)? else {
-            return Ok(1);
+            return Ok(UNVERSIONED);
         };
         let Some(g) = t.get(RULES_KEY)? else {
-            return Ok(1);
+            return Ok(UNVERSIONED);
         };
         let b = g.value();
         if b.len() != 4 {

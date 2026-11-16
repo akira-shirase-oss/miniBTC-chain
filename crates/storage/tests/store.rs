@@ -314,29 +314,90 @@ fn side_block_is_persisted_without_touching_chain_state() {
 const CHAINMETA_T: redb::TableDefinition<'_, &[u8], &[u8]> =
     redb::TableDefinition::new("chainmeta");
 
-fn strip_rules_version(dir: &std::path::Path) {
+fn set_rules_key(dir: &std::path::Path, value: Option<u32>) {
     let fail = |e: &dyn std::fmt::Debug| -> ! { panic!("redb: {e:?}") };
     let db = redb::Database::create(dir.join("minibtc.redb")).unwrap_or_else(|e| fail(&e));
     let txn = db.begin_write().unwrap_or_else(|e| fail(&e));
     {
         let mut t = txn.open_table(CHAINMETA_T).unwrap_or_else(|e| fail(&e));
-        let _ = t.remove(&b"rules"[..]).unwrap_or_else(|e| fail(&e));
+        match value {
+            None => {
+                let _ = t.remove(&b"rules"[..]).unwrap_or_else(|e| fail(&e));
+            }
+            Some(v) => {
+                let _ = t
+                    .insert(&b"rules"[..], v.to_le_bytes().as_slice())
+                    .unwrap_or_else(|e| fail(&e));
+            }
+        }
     }
     txn.commit().unwrap_or_else(|e| fail(&e));
 }
 
 #[test]
-fn datadir_from_older_consensus_rules_is_refused() {
-    // A datadir written before the current rules (BIP34, bits schedule)
-    // must not load silently: the node would keep extending a chain no
-    // fresh node accepts.
+fn unversioned_datadir_valid_under_current_rules_is_accepted() {
+    // Datadirs written between the rules change and the version key (e.g.
+    // by a7fa717) carry no key but follow the current rules. Load verifies
+    // that by replay, stamps the version, and goes on.
     let (chain, _m, params) = build_chain(3);
     let (dir, _g) = tempdir();
     {
         let store = Store::open(&dir).unwrap();
         store.snapshot(&chain).unwrap();
     }
-    strip_rules_version(&dir);
+    set_rules_key(&dir, None);
+    let store = Store::open(&dir).unwrap();
+    assert_eq!(store.rules_version().unwrap(), 1);
+    let genesis = chain.blocks[&chain.genesis].block.clone();
+    let loaded = store
+        .load(params, genesis)
+        .unwrap_or_else(|e| panic!("a datadir valid under the current rules was refused: {e}"))
+        .unwrap();
+    assert_eq!(loaded.tip, chain.tip);
+    assert_eq!(loaded.utxos.fingerprint(), chain.utxos.fingerprint());
+    assert_eq!(
+        store.rules_version().unwrap(),
+        minibtc_storage::RULES_VERSION
+    );
+}
+
+#[test]
+fn datadir_from_older_consensus_rules_is_refused() {
+    // A chain whose tip block breaks the current rules (a pre-BIP34
+    // coinbase), with no version key: the replay cannot reproduce the
+    // recorded tip, so load refuses and says how to recover.
+    let (mut chain, miner, params) = build_chain(3);
+    let tip = chain.blocks[&chain.tip].clone();
+    let mut cb = p2pkh_tx(&miner, 4, params.subsidy_start);
+    cb.inputs[0].script_sig = vec![0x02, 4, b'o', b'l', b'd']; // old height encoding
+    let block = Block {
+        header: mine_header(BlockHeader {
+            version: 1,
+            prev_hash: chain.tip,
+            merkle_root: merkle_root(std::slice::from_ref(&cb)),
+            time: tip.block.header.time + 1,
+            bits: tip.block.header.bits,
+            nonce: 0,
+        }),
+        txs: vec![cb],
+    };
+    let hash = block.header.block_hash();
+    chain.blocks.insert(
+        hash,
+        minibtc_chainstate::IndexedBlock {
+            block,
+            height: 4,
+            cum_work: tip.cum_work + 1,
+            status: minibtc_chainstate::BlockStatus::Active,
+        },
+    );
+    chain.tip = hash; // as an old binary would have recorded it
+    let (dir, _g) = tempdir();
+    {
+        let store = Store::open(&dir).unwrap();
+        store.snapshot(&chain).unwrap();
+    }
+    set_rules_key(&dir, None);
     let store = Store::open(&dir).unwrap();
     let genesis = chain.blocks[&chain.genesis].block.clone();
     let err = store
@@ -348,10 +409,33 @@ fn datadir_from_older_consensus_rules_is_refused() {
         msg.contains("--reindex") && msg.contains("fresh"),
         "the error must say how to recover: {msg}"
     );
+    assert_eq!(
+        store.rules_version().unwrap(),
+        1,
+        "refused datadir is untouched"
+    );
 
-    // Reindex is the way forward: it rewrites the store under the
-    // current rules, and the datadir then loads.
+    // Reindex is the way forward: it rebuilds under the current rules
+    // (dropping the invalid block) and the datadir then loads.
     let rebuilt = store.reindex(params.clone(), genesis.clone()).unwrap();
     store.snapshot(&rebuilt).unwrap();
-    assert!(store.load(params, genesis).unwrap().is_some());
+    let loaded = store.load(params, genesis).unwrap().unwrap();
+    assert_eq!(loaded.height(), 3);
+}
+
+#[test]
+fn datadir_from_unknown_rules_version_is_refused() {
+    let (chain, _m, params) = build_chain(2);
+    let (dir, _g) = tempdir();
+    {
+        let store = Store::open(&dir).unwrap();
+        store.snapshot(&chain).unwrap();
+    }
+    set_rules_key(&dir, Some(99));
+    let store = Store::open(&dir).unwrap();
+    let genesis = chain.blocks[&chain.genesis].block.clone();
+    assert!(
+        store.load(params, genesis).is_err(),
+        "a future rules version must not load"
+    );
 }
