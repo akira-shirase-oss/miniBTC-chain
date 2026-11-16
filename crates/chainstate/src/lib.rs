@@ -13,18 +13,25 @@
 //! - Applying a block is atomic: transactions are applied to a
 //!   [`UtxoOverlay`] and the base set changes only when every transaction
 //!   succeeded. A block rejected half-way leaves no trace.
+//! - A side branch is judged by its own history: header rules from its
+//!   parent, transactions against the fork point's UTXO state during the
+//!   reorg. A reorg that fails part-way leaves the old tip and UTXO set.
 //!
 //! This crate owns memory state; `minibtc-storage` persists it. Both must
 //! agree — the consistency test replays blocks into a fresh chain and
 //! compares UTXO sets hash-for-hash.
 
 use minibtc_consensus::{
-    BlockContext, BlockError, ChainParams, UtxoView, is_retarget_height, next_bits_for_period,
-    validate_block_in_context,
+    BlockContext, BlockError, ChainParams, UtxoView, check_block_in_context, is_retarget_height,
+    next_bits_for_period, validate_block_in_context,
 };
 use minibtc_crypto::Hash256;
 use minibtc_primitives::{Block, OutPoint, Transaction, TxOutput};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
+
+/// How many invalid block hashes the chain remembers (bounded: the set is
+/// filled by peer-supplied blocks).
+const INVALID_CACHE_CAP: usize = 10_000;
 
 /// A UTXO entry: the output plus the context maturity/rules need.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -385,6 +392,21 @@ pub enum ChainError {
     /// Applying a tx hit a missing prevout (should be caught by validation).
     #[error("missing prevout {0} during connect")]
     MissingPrevout(OutPoint),
+    /// `connect_tip` was handed a block whose parent is not the tip.
+    #[error("block parent {0} is not the current tip")]
+    NotOnTip(Hash256),
+    /// The block already failed full validation during a reorg.
+    #[error("block {0} is known to be invalid")]
+    KnownInvalid(Hash256),
+    /// The block builds on a block known to be invalid.
+    #[error("block builds on invalid block {0}")]
+    InvalidAncestor(Hash256),
+    /// No common ancestor between a branch and the active chain.
+    #[error("branch does not connect to the active chain")]
+    NoForkPoint,
+    /// An active block has no undo record (index/undo store disagree).
+    #[error("missing undo data for active block {0}")]
+    MissingUndo(Hash256),
     /// A transaction would overwrite an unspent output (BIP30).
     #[error("output {0} already exists unspent")]
     OutputExists(OutPoint),
@@ -416,6 +438,12 @@ pub struct Chain {
     pub genesis: Hash256,
     /// Undo data per connected block — required for exact disconnects.
     pub undos: HashMap<Hash256, UndoData>,
+    /// Blocks that failed full validation while activating their branch
+    /// (bounded FIFO). Only blocks that passed the context-free checks —
+    /// merkle mutation included — get here, so the hash really commits to
+    /// the invalid contents (CVE-2012-2459 cannot poison it).
+    invalid: HashSet<Hash256>,
+    invalid_order: VecDeque<Hash256>,
 }
 
 impl Chain {
@@ -430,6 +458,8 @@ impl Chain {
             tip: genesis_hash,
             genesis: genesis_hash,
             undos: HashMap::new(),
+            invalid: HashSet::new(),
+            invalid_order: VecDeque::new(),
         };
         // Genesis connects unconditionally: no prev to check, no PoW to
         // verify (it is definitionally valid), coinbase matures normally.
@@ -453,27 +483,22 @@ impl Chain {
             .map_err(|e| ChainError::InvalidBlock(BlockError::Pow(e)))
     }
 
-    /// Connect `block` as the new tip — caller guarantees it builds on
-    /// current tip and is fully validated. Applies UTXOs, stores undo.
+    /// Connect `block` as the new tip. It must build on the current tip;
+    /// it is fully validated in its parent's context and applied
+    /// atomically (nothing changes if it is rejected).
     pub fn connect_tip(&mut self, block: Block) -> Result<(), ChainError> {
-        let hash = block.header.block_hash();
-        let parent = self
-            .blocks
-            .get(&block.header.prev_hash)
-            .ok_or(ChainError::UnknownPrev(block.header.prev_hash))?;
-        let height = parent.height.saturating_add(1);
-        let work = self.header_work(&block.header)?;
-        let cum_work = parent.cum_work.saturating_add(work);
-
-        // Validate against current UTXO set, in the parent's context.
+        if block.header.prev_hash != self.tip {
+            return Err(ChainError::NotOnTip(block.header.prev_hash));
+        }
+        let (height, cum_work) = self.placement(&block)?;
         let ctx = self.context_for(block.header.prev_hash)?;
         validate_block_in_context(&block, &self.utxos, &self.params, &ctx)?;
-
         let undo = self.apply_block_at(&block, height)?;
+        let hash = block.header.block_hash();
         self.blocks.insert(
             hash,
             IndexedBlock {
-                block: block.clone(),
+                block,
                 height,
                 cum_work,
                 status: BlockStatus::Active,
@@ -482,6 +507,19 @@ impl Chain {
         self.undos.insert(hash, undo);
         self.tip = hash;
         Ok(())
+    }
+
+    /// Height and cumulative work `block` would have under its parent.
+    fn placement(&self, block: &Block) -> Result<(u32, u128), ChainError> {
+        let parent = self
+            .blocks
+            .get(&block.header.prev_hash)
+            .ok_or(ChainError::UnknownPrev(block.header.prev_hash))?;
+        let work = self.header_work(&block.header)?;
+        Ok((
+            parent.height.saturating_add(1),
+            parent.cum_work.saturating_add(work),
+        ))
     }
 
     /// Apply block txs at an explicit height (used by connect_tip and
@@ -523,50 +561,33 @@ impl Chain {
     }
 
     /// Consider a block that may or may not extend the tip — the reorg
-    /// entry point. Validates, then either connects it (tip extension) or
-    /// evaluates whether its branch has more work (reorg).
+    /// entry point.
+    ///
+    /// - On the tip: full validation, atomic connect.
+    /// - Elsewhere: the header and every rule that needs no UTXO set are
+    ///   checked in the block's own context (its parent's bits schedule and
+    ///   median-time-past), then it is stored as a side branch. If its
+    ///   branch now has more work than the tip, [`Self::reorg_to`] judges
+    ///   the branch's transactions against the fork point's state.
     pub fn consider_block(&mut self, block: Block) -> Result<(), ChainError> {
         let hash = block.header.block_hash();
         if self.blocks.contains_key(&hash) {
             return Ok(()); // already known
         }
-        let parent_hash = block.header.prev_hash;
-        let parent = self
-            .blocks
-            .get(&parent_hash)
-            .ok_or(ChainError::UnknownPrev(parent_hash))?;
-        let height = parent.height.saturating_add(1);
-        let work = self.header_work(&block.header)?;
-        let cum_work = parent.cum_work.saturating_add(work);
-
-        // Full validation against the UTXO set *as of the parent* — for
-        // side branches this is subtle: our utxos reflect the active tip,
-        // not the parent. For MiniBTC devnet we validate side-branch txs
-        // against the active set as an approximation and rely on connect
-        // order during reorg for exactness — documented limitation; the
-        // reorg path re-validates each block at connect time anyway via
-        // apply (missing prevouts error there).
-        let ctx = self.context_for(parent_hash)?;
-        validate_block_in_context(&block, &self.utxos, &self.params, &ctx)?;
-
-        if parent_hash == self.tip {
-            // Direct extension.
-            let undo = self.apply_block_at(&block, height)?;
-            self.blocks.insert(
-                hash,
-                IndexedBlock {
-                    block,
-                    height,
-                    cum_work,
-                    status: BlockStatus::Active,
-                },
-            );
-            self.undos.insert(hash, undo);
-            self.tip = hash;
-            return Ok(());
+        if self.invalid.contains(&hash) {
+            return Err(ChainError::KnownInvalid(hash));
         }
-
-        // Side branch: store it; reorg only if it beats the tip's work.
+        let parent_hash = block.header.prev_hash;
+        if self.invalid.contains(&parent_hash) {
+            self.remember_invalid(hash);
+            return Err(ChainError::InvalidAncestor(parent_hash));
+        }
+        if parent_hash == self.tip {
+            return self.connect_tip(block);
+        }
+        let (height, cum_work) = self.placement(&block)?;
+        let ctx = self.context_for(parent_hash)?;
+        check_block_in_context(&block, &self.params, &ctx)?;
         self.blocks.insert(
             hash,
             IndexedBlock {
@@ -576,84 +597,192 @@ impl Chain {
                 status: BlockStatus::Inactive,
             },
         );
-        self.maybe_reorg(hash)
-    }
-
-    /// If `candidate`'s branch has more cumulative work than the tip,
-    /// reorg: disconnect tip back to the fork point, connect the other
-    /// branch forward. UTXOs end up exactly equal to fresh replay.
-    fn maybe_reorg(&mut self, candidate: Hash256) -> Result<(), ChainError> {
-        // Walk candidate back to find fork point with active chain.
-        let tip_work = self.blocks.get(&self.tip).map(|r| r.cum_work).unwrap_or(0);
-        let cand_work = self.blocks.get(&candidate).map(|r| r.cum_work).unwrap_or(0);
-        if cand_work <= tip_work {
-            return Ok(()); // no reorg — candidate stays inactive
+        if cum_work > self.tip_work() {
+            self.reorg_to(hash)?;
         }
-        // Find fork point: walk both back until common ancestor.
-        let fork = self.find_fork(candidate)?;
-        let fork_height = self.blocks.get(&fork).map(|r| r.height).unwrap_or(0);
-
-        // Disconnect active tip down to fork.
-        while self.tip != fork {
-            self.disconnect_tip()?;
-        }
-        // Connect candidate's branch from fork forward.
-        let mut branch: Vec<Hash256> = Vec::new();
-        let mut cur = candidate;
-        loop {
-            branch.push(cur);
-            let rec = self.blocks.get(&cur).ok_or(ChainError::NotTip)?;
-            if rec.block.header.prev_hash == fork {
-                break;
-            }
-            cur = rec.block.header.prev_hash;
-            if branch.len() > 100_000 {
-                return Err(ChainError::NotTip); // absurd depth guard
-            }
-        }
-        branch.reverse();
-        for h in branch {
-            let blk = self
-                .blocks
-                .get(&h)
-                .map(|r| r.block.clone())
-                .ok_or(ChainError::NotTip)?;
-            self.connect_tip(blk)?;
-        }
-        let _ = fork_height;
         Ok(())
     }
 
-    /// Find the last common ancestor of `candidate` and the active tip.
-    fn find_fork(&self, candidate: Hash256) -> Result<Hash256, ChainError> {
-        // Mark active-chain hashes in a set (active branch only).
-        let mut active_ancestors = std::collections::HashSet::new();
-        let mut cur = self.tip;
-        loop {
-            active_ancestors.insert(cur);
-            let rec = self.blocks.get(&cur).ok_or(ChainError::NotTip)?;
-            if rec.block.header.prev_hash == cur {
-                break; // genesis self-check
+    /// Make `candidate`'s branch active. All UTXO work happens on one
+    /// [`UtxoOverlay`]: the active blocks back to the fork point are undone
+    /// in it, then each branch block is validated against it — the fork
+    /// point's state plus the branch's earlier blocks — and applied. Only
+    /// when the whole branch connected is the overlay committed and the
+    /// index switched. If any branch block fails, it and its descendants
+    /// are marked invalid and the chain is exactly as it was: same tip,
+    /// same UTXO set, same undo data.
+    fn reorg_to(&mut self, candidate: Hash256) -> Result<(), ChainError> {
+        let fork = self.find_fork(candidate)?;
+        let old_branch = self.path_back(self.tip, fork)?; // tip first
+        let mut new_branch = self.path_back(candidate, fork)?;
+        new_branch.reverse(); // fork's child first
+
+        let outcome = {
+            let mut overlay = UtxoOverlay::new(&self.utxos);
+            for h in &old_branch {
+                let undo = self.undos.get(h).ok_or(ChainError::MissingUndo(*h))?;
+                for u in undo.txs.iter().rev() {
+                    overlay.undo_tx(u);
+                }
             }
-            let prev = rec.block.header.prev_hash;
-            if prev == self.genesis || !self.blocks.contains_key(&prev) {
-                active_ancestors.insert(prev);
+            let mut undos = Vec::with_capacity(new_branch.len());
+            let mut failure = None;
+            for h in &new_branch {
+                match self.connect_into(&overlay, *h) {
+                    Ok((undo, changes)) => {
+                        overlay.absorb(changes);
+                        undos.push((*h, undo));
+                    }
+                    Err(e) => {
+                        failure = Some((*h, e));
+                        break;
+                    }
+                }
+            }
+            match failure {
+                None => Ok((overlay.into_changes(), undos)),
+                Some(f) => Err(f),
+            }
+        };
+
+        match outcome {
+            Ok((changes, undos)) => {
+                self.utxos.commit(changes);
+                for h in &old_branch {
+                    self.undos.remove(h);
+                    if let Some(r) = self.blocks.get_mut(h) {
+                        r.status = BlockStatus::Inactive;
+                    }
+                }
+                for (h, undo) in undos {
+                    self.undos.insert(h, undo);
+                    if let Some(r) = self.blocks.get_mut(&h) {
+                        r.status = BlockStatus::Active;
+                    }
+                }
+                self.tip = candidate;
+                Ok(())
+            }
+            Err((bad, e)) => {
+                self.mark_invalid(bad);
+                Err(e)
+            }
+        }
+    }
+
+    /// Fully validate block `hash` against `view` (the UTXO state at its
+    /// parent) and apply it to a child overlay. Returns its undo record and
+    /// the changes to absorb; `view` itself is untouched.
+    fn connect_into(
+        &self,
+        view: &UtxoOverlay<'_, UtxoSet>,
+        hash: Hash256,
+    ) -> Result<(UndoData, UtxoChanges), ChainError> {
+        let rec = self
+            .blocks
+            .get(&hash)
+            .ok_or(ChainError::UnknownPrev(hash))?;
+        let ctx = self.context_for(rec.block.header.prev_hash)?;
+        validate_block_in_context(&rec.block, view, &self.params, &ctx)?;
+        let mut block_overlay = UtxoOverlay::new(view);
+        let undo =
+            block_overlay.apply_block(&rec.block, rec.height, self.params.coinbase_maturity)?;
+        Ok((undo, block_overlay.into_changes()))
+    }
+
+    /// Hashes from `from` back to (excluding) its ancestor `to`, newest
+    /// first.
+    fn path_back(&self, from: Hash256, to: Hash256) -> Result<Vec<Hash256>, ChainError> {
+        let stop = self
+            .blocks
+            .get(&to)
+            .map(|r| r.height)
+            .ok_or(ChainError::NoForkPoint)?;
+        let mut out = Vec::new();
+        let mut cur = from;
+        while cur != to {
+            let rec = self.blocks.get(&cur).ok_or(ChainError::UnknownPrev(cur))?;
+            if rec.height <= stop {
+                return Err(ChainError::NoForkPoint);
+            }
+            out.push(cur);
+            cur = rec.block.header.prev_hash;
+        }
+        Ok(out)
+    }
+
+    /// Last common ancestor of `candidate` and the active tip: walk the
+    /// higher one down to equal height, then both together.
+    fn find_fork(&self, candidate: Hash256) -> Result<Hash256, ChainError> {
+        let height = |h: Hash256| {
+            self.blocks
+                .get(&h)
+                .map(|r| r.height)
+                .ok_or(ChainError::UnknownPrev(h))
+        };
+        let parent = |h: Hash256| {
+            self.blocks
+                .get(&h)
+                .map(|r| r.block.header.prev_hash)
+                .ok_or(ChainError::UnknownPrev(h))
+        };
+        let (mut a, mut b) = (candidate, self.tip);
+        while height(a)? > height(b)? {
+            a = parent(a)?;
+        }
+        while height(b)? > height(a)? {
+            b = parent(b)?;
+        }
+        while a != b {
+            if height(a)? == 0 {
+                return Err(ChainError::NoForkPoint);
+            }
+            a = parent(a)?;
+            b = parent(b)?;
+        }
+        Ok(a)
+    }
+
+    /// Drop `bad` and every indexed descendant (all side-branch blocks)
+    /// and remember their hashes as invalid.
+    fn mark_invalid(&mut self, bad: Hash256) {
+        let mut doomed: HashSet<Hash256> = HashSet::from([bad]);
+        loop {
+            let more: Vec<Hash256> = self
+                .blocks
+                .iter()
+                .filter(|(h, r)| !doomed.contains(*h) && doomed.contains(&r.block.header.prev_hash))
+                .map(|(h, _)| *h)
+                .collect();
+            if more.is_empty() {
                 break;
             }
-            cur = prev;
+            doomed.extend(more);
         }
-        // Walk candidate back until hitting an active ancestor.
-        let mut cur = candidate;
-        loop {
-            if active_ancestors.contains(&cur) {
-                return Ok(cur);
+        for h in doomed {
+            // Never drop an active block (cannot happen: `bad` is past the
+            // fork point, so it and its descendants are inactive).
+            if self.blocks.get(&h).map(|r| r.status) == Some(BlockStatus::Active) {
+                continue;
             }
-            let rec = self.blocks.get(&cur).ok_or(ChainError::NotTip)?;
-            let prev = rec.block.header.prev_hash;
-            if prev == cur || !self.blocks.contains_key(&prev) {
-                return Err(ChainError::NotTip);
+            self.blocks.remove(&h);
+            self.remember_invalid(h);
+        }
+    }
+
+    /// Whether `hash` failed full validation.
+    pub fn is_invalid(&self, hash: &Hash256) -> bool {
+        self.invalid.contains(hash)
+    }
+
+    fn remember_invalid(&mut self, hash: Hash256) {
+        if self.invalid.insert(hash) {
+            self.invalid_order.push_back(hash);
+            while self.invalid_order.len() > INVALID_CACHE_CAP {
+                if let Some(old) = self.invalid_order.pop_front() {
+                    self.invalid.remove(&old);
+                }
             }
-            cur = prev;
         }
     }
 

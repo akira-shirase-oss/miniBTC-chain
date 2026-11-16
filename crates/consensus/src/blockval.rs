@@ -225,13 +225,27 @@ pub fn validate_block_in_context<V: UtxoView>(
     validate_block_inner(block, view, params, ctx.height, Some(ctx))
 }
 
-fn validate_block_inner<V: UtxoView>(
+/// Every block rule that needs no UTXO set: merkle root and mutation,
+/// proof of work and the pow limit, size/count limits, coinbase shape,
+/// BIP34, the sigop limit and — from `ctx` — the retarget schedule and the
+/// timestamp rules. A side-branch block must pass this before it is
+/// stored; its transactions are checked against the fork point's UTXO
+/// state only when its branch is activated (Bitcoin Core's
+/// `CheckBlock` + `ContextualCheckBlockHeader` vs `ConnectBlock`).
+pub fn check_block_in_context(
     block: &Block,
-    view: &V,
+    params: &ChainParams,
+    ctx: &BlockContext,
+) -> Result<(), BlockError> {
+    check_block_inner(block, params, ctx.height, Some(ctx))
+}
+
+fn check_block_inner(
+    block: &Block,
     params: &ChainParams,
     height: u64,
     ctx: Option<&BlockContext>,
-) -> Result<BlockValidation, BlockError> {
+) -> Result<(), BlockError> {
     // 1. Merkle (includes ambiguity check).
     check_merkle_root(&block.header, &block.txs)?;
 
@@ -241,14 +255,29 @@ fn validate_block_inner<V: UtxoView>(
     if !block.header.check_pow(&target) {
         return Err(PowError::BadBits(block.header.bits).into());
     }
-    // Contextual: the retarget schedule fixes `bits` exactly.
-    if let Some(ctx) = ctx
-        && block.header.bits != ctx.expected_bits
-    {
-        return Err(BlockError::BadDiffBits {
-            got: block.header.bits,
-            expected: ctx.expected_bits,
-        });
+    if let Some(ctx) = ctx {
+        // The retarget schedule fixes `bits` exactly.
+        if block.header.bits != ctx.expected_bits {
+            return Err(BlockError::BadDiffBits {
+                got: block.header.bits,
+                expected: ctx.expected_bits,
+            });
+        }
+        // Timestamp rules.
+        if block.header.time
+            > ctx
+                .adjusted_time
+                .saturating_add(params.max_future_time_secs)
+        {
+            return Err(BlockError::TimeTooNew {
+                block_time: block.header.time,
+                adjusted_time: ctx.adjusted_time,
+                max_future: params.max_future_time_secs,
+            });
+        }
+        if block.header.time <= ctx.median_time_past {
+            return Err(BlockError::TimeTooOld);
+        }
     }
 
     // 3. Limits.
@@ -283,7 +312,29 @@ fn validate_block_inner<V: UtxoView>(
         return Err(BlockError::BadCoinbaseHeight { height });
     }
 
-    // 5./6./7. Transactions, fees, sigops — tx i sees txs 0..i.
+    // 5. Sigops (counted from the txs alone).
+    let sigops = block
+        .txs
+        .iter()
+        .skip(1)
+        .fold(0usize, |n, tx| n.saturating_add(count_sigops(tx)));
+    if sigops > params.max_block_sigops {
+        return Err(BlockError::Limits("sigop limit exceeded"));
+    }
+    Ok(())
+}
+
+fn validate_block_inner<V: UtxoView>(
+    block: &Block,
+    view: &V,
+    params: &ChainParams,
+    height: u64,
+    ctx: Option<&BlockContext>,
+) -> Result<BlockValidation, BlockError> {
+    check_block_inner(block, params, height, ctx)?;
+    let coinbase = &block.txs[0];
+
+    // 6. Transactions and fees — tx i sees txs 0..i.
     let mut total_fees = Sats::ZERO;
     let mut sigops = 0usize;
     let mut block_view = BlockView::new(view);
@@ -301,11 +352,9 @@ fn validate_block_inner<V: UtxoView>(
             .ok_or(BlockError::Limits("fee overflow"))?;
         sigops = sigops.saturating_add(count_sigops(tx));
     }
-    if sigops > params.max_block_sigops {
-        return Err(BlockError::Limits("sigop limit exceeded"));
-    }
 
-    // Coinbase value cap: outputs ≤ subsidy + fees (checked).
+    // 7. Coinbase value cap: outputs ≤ subsidy + fees (checked). Bitcoin
+    // allows several coinbase outputs (payout splitting); so do we.
     let allowed = subsidy::max_coinbase_value(params, height, total_fees)?;
     let cb_out = coinbase
         .output_sum()
@@ -315,26 +364,6 @@ fn validate_block_inner<V: UtxoView>(
             outputs: cb_out.sats(),
             allowed: allowed.sats(),
         });
-    }
-    // Coinbase must have exactly one output? No — Bitcoin allows many
-    // outputs (payout splitting); we allow it too.
-
-    // Timestamp rules when context is supplied.
-    if let Some(ctx) = ctx {
-        if block.header.time
-            > ctx
-                .adjusted_time
-                .saturating_add(params.max_future_time_secs)
-        {
-            return Err(BlockError::TimeTooNew {
-                block_time: block.header.time,
-                adjusted_time: ctx.adjusted_time,
-                max_future: params.max_future_time_secs,
-            });
-        }
-        if block.header.time <= ctx.median_time_past {
-            return Err(BlockError::TimeTooOld);
-        }
     }
 
     Ok(BlockValidation { total_fees, sigops })

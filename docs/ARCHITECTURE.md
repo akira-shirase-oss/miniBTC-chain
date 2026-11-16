@@ -73,8 +73,17 @@ Hard rules:
   (`tests/attacks/tests/block_apply.rs`).
 - **Block index** tracks every known header with height, cumulative work and
   status (valid / invalid / headers-only / assumevalid-none).
-- **Reorgs** disconnect blocks in reverse using undo data (restores spent
-  outputs, removes created ones), then connect the heavier branch.
+- **Side branches** are judged by their own history: on arrival a
+  non-tip block gets the header rules from its parent (bits schedule,
+  median-time-past) and every rule that needs no UTXO set; its
+  transactions are checked during activation against the fork point's
+  state plus the branch's earlier blocks.
+- **Reorgs** run on one `UtxoOverlay`: undo the active blocks back to the
+  fork (exact undo data), then validate and apply each branch block. The
+  overlay is committed and the index switched only if the whole branch
+  connected; otherwise the failing block and its descendants are marked
+  invalid and the node keeps its old tip and UTXO set
+  (`tests/attacks/tests/reorg.rs`).
 - **Mempool** is local policy: removed on connect, re-added (re-validated)
   on disconnect.
 - **Wallet** state is local files under the datadir; it learns chain facts
