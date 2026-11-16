@@ -73,3 +73,71 @@ fn keystore_passphrase_prompt_does_not_echo() {
         "the passphrase was echoed to the terminal"
     );
 }
+
+/// Runs `sh -c '<cli> wallet create ...; stty -a'` in a pseudo-terminal,
+/// sends SIGINT to the CLI (only) once the passphrase prompt is up, and
+/// prints what the terminal showed — including `stty -a` run afterwards on
+/// the same terminal.
+const SIGINT_DRIVER: &str = r#"
+import os, pty, select, signal, subprocess, sys, tempfile, shutil, time
+cli = sys.argv[1]
+d = tempfile.mkdtemp(prefix="mb-sigint-")
+open(os.path.join(d, ".cookie"), "w").write("u:p\n")
+script = '"%s" --datadir "%s" --rpc-port 1 wallet create --name probe; echo CLI-EXITED; stty -a' % (cli, d)
+pid, fd = pty.fork()
+if pid == 0:
+    os.execv("/bin/sh", ["/bin/sh", "-c", script])
+out = b""
+def read_until(pred, timeout):
+    global out
+    end = time.time() + timeout
+    while time.time() < end and not pred():
+        r, _, _ = select.select([fd], [], [], 0.05)
+        if r:
+            try:
+                chunk = os.read(fd, 4096)
+            except OSError:
+                return
+            if not chunk:
+                return
+            out += chunk
+read_until(lambda: b"passphrase" in out.lower(), 20)
+time.sleep(0.3)  # echo is off once the prompt is shown
+kids = subprocess.run(["pgrep", "-P", str(pid)], capture_output=True, text=True).stdout.split()
+for k in kids:
+    os.kill(int(k), signal.SIGINT)
+read_until(lambda: b"lflags" in out or b"speed" in out and b"echo" in out, 20)
+read_until(lambda: False, 1)
+try:
+    os.waitpid(pid, 0)
+except ChildProcessError:
+    pass
+shutil.rmtree(d, ignore_errors=True)
+sys.stdout.write(out.decode(errors="replace"))
+"#;
+
+#[test]
+fn ctrl_c_at_a_passphrase_prompt_restores_echo() {
+    if Command::new("python3").arg("--version").output().is_err() {
+        eprintln!("skipped: python3 not available to drive a pseudo-terminal");
+        return;
+    }
+    let out = Command::new("python3")
+        .args(["-I", "-c", SIGINT_DRIVER, env!("CARGO_BIN_EXE_minibtc-cli")])
+        .output()
+        .unwrap_or_else(|e| panic!("run pty driver: {e}"));
+    let shown = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        shown.contains("CLI-EXITED"),
+        "the CLI did not exit: {shown}"
+    );
+    let flags: Vec<&str> = shown
+        .split_whitespace()
+        .filter(|w| *w == "echo" || *w == "-echo")
+        .collect();
+    assert!(!flags.is_empty(), "no echo flag in stty output: {shown}");
+    assert!(
+        flags.iter().all(|w| *w == "echo"),
+        "terminal left with echo off after Ctrl-C: {flags:?}"
+    );
+}

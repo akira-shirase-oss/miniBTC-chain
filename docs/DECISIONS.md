@@ -227,8 +227,10 @@ example exported in the same shell) can always run `minibtc-cli wallet
 send` itself; no MCP gate can stop that. Keep the passphrase out of any
 environment an agent can read. Every CLI passphrase prompt (and the
 mnemonic prompt of `wallet restore`) reads with terminal echo off,
-switched off before the prompt appears (`stty -echo`, restored on exit;
-the read fails closed if echo cannot be disabled). Existing wallets need
+switched off before the prompt appears (`stty -echo`; the read fails
+closed if echo cannot be disabled). Echo is restored when the read ends
+and also on Ctrl-C (a SIGINT handler registered at CLI startup turns it
+back on, then exits with 130). Existing wallets need
 one passphrase-unlocked command (e.g. `wallet balance`, or an unlock in the
 wallet UI) to write their watch-only file. The file holds public data but
 links every address to one wallet, so both the CLI and the wallet UI write
