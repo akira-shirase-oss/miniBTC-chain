@@ -485,19 +485,26 @@ fn attack_eclipse_diversity_limits_hold() {
         }
     }
     assert_eq!(landed, minibtc_p2p::peer::MAX_PER_SUBNET);
-    // Honest peers from diverse subnets fill remaining slots.
-    for i in 0..20u8 {
-        let addr: SocketAddr = SocketAddr::from(([192, 168, i, 1], 18445));
-        let _ = pm.register(addr, false, &mk_ver()); // some rejected at cap
+    // Two honest inbound peers from other /16s: the inbound table is now
+    // MAX_PER_SUBNET + 2, below MAX_INBOUND, so only the subnet cap can
+    // refuse the next attacker.
+    for i in 0..2u8 {
+        let addr: SocketAddr = SocketAddr::from(([192, 100 + i, 0, 1], 18445));
+        pm.register(addr, false, &mk_ver()).unwrap();
     }
+    assert!(pm.len() < minibtc_p2p::peer::MAX_INBOUND);
 
-    // A NEW inbound peer from the attacker subnet must be refused.
+    // A NEW inbound peer from the attacker subnet must be refused — by the
+    // subnet cap, not by a full table.
     let eclipse_addr: SocketAddr = SocketAddr::from(([10, 9, 1, 200], 18445));
     let res = pm.admit(eclipse_addr, false);
     assert!(
-        matches!(res, Err(PeerError::AddrLimit) | Err(PeerError::Full)),
-        "eclipse peer must be refused, got {res:?}"
+        matches!(res, Err(PeerError::AddrLimit)),
+        "eclipse peer must be refused by the subnet cap, got {res:?}"
     );
+    // ...while an inbound peer from a fresh /16 still gets in.
+    let fresh: SocketAddr = SocketAddr::from(([172, 30, 0, 1], 18445));
+    assert!(pm.admit(fresh, false).is_ok(), "inbound slots remain");
 
     // Per-IP limit: 3 conns from same IP different ports → capped at 2.
     let mut pm2 = PeerManager::new();
