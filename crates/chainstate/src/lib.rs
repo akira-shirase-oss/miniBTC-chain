@@ -448,6 +448,19 @@ pub struct Chain {
     /// failed reorg's invalid block and descendants) — the persistence
     /// layer deletes them so they do not come back on restart.
     dropped: Vec<Hash256>,
+    /// What the last successful reorg switched, until `take_reorg`.
+    last_reorg: Option<ReorgReport>,
+}
+
+/// The blocks a reorg moved off and onto the active chain. Both stay in
+/// the index; the node uses this to re-admit the disconnected blocks'
+/// transactions and to repoint its transaction index.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReorgReport {
+    /// Blocks that left the active chain, old tip first.
+    pub disconnected: Vec<Hash256>,
+    /// Blocks that joined it, the fork point's child first.
+    pub connected: Vec<Hash256>,
 }
 
 impl Chain {
@@ -465,6 +478,7 @@ impl Chain {
             invalid: HashSet::new(),
             invalid_order: VecDeque::new(),
             dropped: Vec::new(),
+            last_reorg: None,
         };
         // Genesis connects unconditionally: no prev to check, no PoW to
         // verify (it is definitionally valid), coinbase matures normally.
@@ -666,6 +680,10 @@ impl Chain {
                     }
                 }
                 self.tip = candidate;
+                self.last_reorg = Some(ReorgReport {
+                    disconnected: old_branch,
+                    connected: new_branch,
+                });
                 Ok(())
             }
             Err((bad, e)) => {
@@ -774,6 +792,11 @@ impl Chain {
             self.remember_invalid(h);
             self.dropped.push(h);
         }
+    }
+
+    /// The last successful reorg, if one happened since the last call.
+    pub fn take_reorg(&mut self) -> Option<ReorgReport> {
+        self.last_reorg.take()
     }
 
     /// Hashes dropped from the index (invalid) since the last call. The

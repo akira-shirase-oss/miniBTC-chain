@@ -89,8 +89,10 @@ Hard rules:
   connected; otherwise the failing block and its descendants are marked
   invalid and the node keeps its old tip and UTXO set
   (`tests/attacks/tests/reorg.rs`).
-- **Mempool** is local policy: removed on connect, re-added (re-validated)
-  on disconnect.
+- **Mempool** is local policy: removed on connect; after a reorg the
+  disconnected blocks' transactions are re-validated against the new chain
+  and re-admitted (oldest block first; conflicts and already-confirmed ones
+  drop). The node's tx index covers the active chain only.
 - **Wallet** state is local files under the datadir; it learns chain facts
   only through RPC.
 

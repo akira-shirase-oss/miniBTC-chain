@@ -1001,6 +1001,77 @@ mod tests {
         }
     }
 
+    /// A signed spend of node `i`'s coinbase at `height` (paid to the
+    /// node's own key by `mine`).
+    fn spend_coinbase(net: &TestNet, i: usize, height: u32) -> minibtc_primitives::Transaction {
+        use minibtc_primitives::{OutPoint, Sats, Transaction, TxInput, TxOutput};
+        let key = minibtc_crypto::Keypair::from_secret_bytes(&[i as u8 + 1; 32])
+            .unwrap_or_else(|e| panic!("key: {e:?}"));
+        let inner = net.nodes[i].inner.lock().unwrap_or_else(|e| e.into_inner());
+        let at = crate::core::block_at_height(&inner, height)
+            .unwrap_or_else(|| panic!("no block at {height}"));
+        let cb = inner.chain.blocks[&at].block.txs[0].clone();
+        let prev_spk = cb.outputs[0].script_pubkey.clone();
+        let mut tx = Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                prev: OutPoint {
+                    txid: cb.txid(),
+                    vout: 0,
+                },
+                script_sig: vec![],
+                sequence: 0xffff_ffff,
+            }],
+            outputs: vec![TxOutput {
+                value: Sats(cb.outputs[0].value.sats() - 10_000),
+                script_pubkey: prev_spk.clone(),
+            }],
+            locktime: 0,
+        };
+        let sig = minibtc_script::sighash::sign_input(&tx, 0, &prev_spk, &key)
+            .unwrap_or_else(|e| panic!("sign: {e:?}"));
+        tx.inputs[0].script_sig = minibtc_script::Script::p2pkh_spend(&sig, &key.public_key()).0;
+        tx
+    }
+
+    #[tokio::test]
+    async fn reorged_out_transactions_return_to_the_mempool() {
+        let mut net = TestNet::new(2);
+        net.connect(0, 1);
+        net.mine(0, 101); // N1's coinbase at height 1 is now mature
+        net.pump().await;
+        assert_eq!(net.tip(1), net.tip(0));
+
+        // Partition, then N1 confirms T in one block; N2 mines two without it.
+        net.hold(0, 1);
+        let t = spend_coinbase(&net, 0, 1);
+        let txid = t.txid();
+        net.nodes[0]
+            .accept_tx(t, None, None)
+            .unwrap_or_else(|e| panic!("accept: {e:?}"));
+        net.mine(0, 1);
+        {
+            let inner = net.nodes[0].inner.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(inner.mempool.get(&txid).is_none(), "T confirmed on N1");
+            assert!(inner.txindex.contains_key(&txid));
+        }
+        net.mine(1, 2);
+        net.release(0, 1);
+        net.pump().await;
+        assert_eq!(net.tip(0), net.tip(1), "N1 reorged onto N2's branch");
+
+        let inner = net.nodes[0].inner.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            inner.mempool.get(&txid).is_some(),
+            "a reorged-out transaction must go back to the mempool"
+        );
+        assert!(
+            !inner.txindex.contains_key(&txid),
+            "txindex must not point at a block that left the active chain"
+        );
+        assert_eq!(crate::core::tx_confirmations(&inner, &txid), None);
+    }
+
     #[tokio::test]
     async fn reorg_reaches_a_node_connected_only_through_a_relay() {
         // N3 — N1 — N2: N2 hears about N3's blocks only through N1.

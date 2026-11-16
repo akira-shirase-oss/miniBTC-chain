@@ -277,11 +277,14 @@ pub fn open(datadir: &Path, params: ChainParams, reindex: bool) -> Result<Node, 
     for h in chain.blocks.keys() {
         sync.note_have(*h);
     }
-    // txid → block hash over every indexed block (active + inactive).
+    // txid → block hash for the ACTIVE chain only: a tx that exists only
+    // in a side or orphaned block is not confirmed.
     let mut txindex = HashMap::new();
     for (bh, rec) in &chain.blocks {
-        for t in &rec.block.txs {
-            txindex.insert(t.txid(), *bh);
+        if rec.status == minibtc_chainstate::BlockStatus::Active {
+            for t in &rec.block.txs {
+                txindex.insert(t.txid(), *bh);
+            }
         }
     }
     let inner = NodeInner {
@@ -420,21 +423,47 @@ impl Node {
                 store.snapshot(&inner.chain)?;
             }
         }
-        // Index the new block's txs + mark it held for sync/relay dedup.
-        let new_txids: Vec<Hash256> = inner
-            .chain
-            .blocks
-            .get(&hash)
-            .map(|r| r.block.txs.iter().map(|t| t.txid()).collect())
-            .unwrap_or_default();
-        for t in new_txids {
-            inner.txindex.insert(t, hash);
+        // The tx index covers the active chain only. A tip extension adds
+        // the block; a reorg removes the disconnected blocks' entries and
+        // adds the connected ones; a side block changes nothing.
+        let reorg = inner.chain.take_reorg();
+        if let Some(r) = &reorg {
+            for d in &r.disconnected {
+                let txids: Vec<Hash256> = inner
+                    .chain
+                    .blocks
+                    .get(d)
+                    .map(|rec| rec.block.txs.iter().map(|t| t.txid()).collect())
+                    .unwrap_or_default();
+                for t in txids {
+                    if inner.txindex.get(&t) == Some(d) {
+                        inner.txindex.remove(&t);
+                    }
+                }
+            }
+            for c in r.connected.clone() {
+                index_block_txs(&mut inner, c);
+            }
+        } else if direct {
+            index_block_txs(&mut inner, hash);
         }
         let tip = inner.chain.tip;
         inner.sync.note_have(hash);
-        // Mempool refresh: confirmed txs drop out, reorg-returned txs come
-        // back, conflicts die — one code path for every connect type.
+        // Mempool refresh: confirmed txs drop out, conflicts die.
         self.refresh_mempool(&mut inner);
+        // Then the reorged-out blocks' transactions go back in (oldest
+        // block first), each re-validated against the new chain.
+        if let Some(r) = &reorg {
+            let NodeInner { mempool, chain, .. } = &mut *inner;
+            for d in r.disconnected.iter().rev() {
+                if let Some(rec) = chain.blocks.get(d) {
+                    let block = rec.block.clone();
+                    mempool.on_block_disconnected(&block, &chain.utxos, &self.params, |tx| {
+                        validate_against_chain(chain, &self.params, tx)
+                    });
+                }
+            }
+        }
         inner.sync.set_tip(tip);
         let outcome = if inner.chain.tip == hash {
             ConnectOutcome::Connected
@@ -453,25 +482,51 @@ impl Node {
         inner: &NodeInner,
         tx: &Transaction,
     ) -> Result<Sats, String> {
-        let fee = validate_tx(tx, &inner.chain.utxos, &self.params).map_err(|e| e.to_string())?;
-        // Coinbase maturity is a connect-time rule; mempool enforces it
-        // early so miners never template an unminable tx.
-        let tip_h = inner.chain.height();
-        for inp in &tx.inputs {
-            if let Some(e) = inner.chain.utxos.get(&inp.prev)
-                && e.coinbase
-                && tip_h.saturating_sub(e.height) < self.params.coinbase_maturity
-            {
-                return Err(format!(
-                    "immature coinbase (depth {} < {})",
-                    tip_h.saturating_sub(e.height),
-                    self.params.coinbase_maturity
-                ));
-            }
-        }
-        Ok(fee)
+        validate_against_chain(&inner.chain, &self.params, tx)
     }
+}
 
+/// Index every transaction of block `hash` (an active-chain block).
+fn index_block_txs(inner: &mut NodeInner, hash: Hash256) {
+    let txids: Vec<Hash256> = inner
+        .chain
+        .blocks
+        .get(&hash)
+        .map(|r| r.block.txs.iter().map(|t| t.txid()).collect())
+        .unwrap_or_default();
+    for t in txids {
+        inner.txindex.insert(t, hash);
+    }
+}
+
+/// Full consensus validation of a mempool candidate against the active
+/// chain plus the coinbase-maturity rule at the next height. Returns the
+/// fee.
+fn validate_against_chain(
+    chain: &Chain,
+    params: &ChainParams,
+    tx: &Transaction,
+) -> Result<Sats, String> {
+    let fee = validate_tx(tx, &chain.utxos, params).map_err(|e| e.to_string())?;
+    // Coinbase maturity is a connect-time rule; mempool enforces it
+    // early so miners never template an unminable tx.
+    let tip_h = chain.height();
+    for inp in &tx.inputs {
+        if let Some(e) = chain.utxos.get(&inp.prev)
+            && e.coinbase
+            && tip_h.saturating_sub(e.height) < params.coinbase_maturity
+        {
+            return Err(format!(
+                "immature coinbase (depth {} < {})",
+                tip_h.saturating_sub(e.height),
+                params.coinbase_maturity
+            ));
+        }
+    }
+    Ok(fee)
+}
+
+impl Node {
     /// The single tx-accept path: consensus + maturity + mempool policy.
     /// `replace` is the RBF target txid when the tx signals BIP125;
     /// `relay_except` excludes the origin peer from the inv fan-out.
