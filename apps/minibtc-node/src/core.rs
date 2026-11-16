@@ -368,7 +368,16 @@ impl Node {
         }
         let direct = block.header.prev_hash == inner.chain.tip;
         let prev_tip = inner.chain.tip;
-        inner.chain.consider_block(block.clone())?;
+        let considered = inner.chain.consider_block(block.clone());
+        // A failed reorg drops the invalid block and its descendants from
+        // the index; delete them from disk too, or a restart loads them back.
+        let dropped = inner.chain.take_dropped();
+        if let Some(store) = &self.store
+            && !dropped.is_empty()
+        {
+            store.delete_blocks(&dropped)?;
+        }
+        considered?;
         // Persist: incremental for a tip extension, block + meta only for a
         // side branch that changed nothing else, full snapshot only for a
         // reorg (which needs more work than the tip — it costs PoW).

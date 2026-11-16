@@ -444,6 +444,10 @@ pub struct Chain {
     /// the invalid contents (CVE-2012-2459 cannot poison it).
     invalid: HashSet<Hash256>,
     invalid_order: VecDeque<Hash256>,
+    /// Blocks removed from the index since the last `take_dropped` (a
+    /// failed reorg's invalid block and descendants) — the persistence
+    /// layer deletes them so they do not come back on restart.
+    dropped: Vec<Hash256>,
 }
 
 impl Chain {
@@ -460,6 +464,7 @@ impl Chain {
             undos: HashMap::new(),
             invalid: HashSet::new(),
             invalid_order: VecDeque::new(),
+            dropped: Vec::new(),
         };
         // Genesis connects unconditionally: no prev to check, no PoW to
         // verify (it is definitionally valid), coinbase matures normally.
@@ -767,7 +772,14 @@ impl Chain {
             }
             self.blocks.remove(&h);
             self.remember_invalid(h);
+            self.dropped.push(h);
         }
+    }
+
+    /// Hashes dropped from the index (invalid) since the last call. The
+    /// caller removes them from durable storage.
+    pub fn take_dropped(&mut self) -> Vec<Hash256> {
+        std::mem::take(&mut self.dropped)
     }
 
     /// Whether `hash` failed full validation.
