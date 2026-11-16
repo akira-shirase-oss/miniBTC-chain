@@ -218,7 +218,7 @@ async fn main() -> Result<()> {
         .with_target(false)
         .init();
     let cli = Cli::parse();
-    let params = load_params(&cli)?;
+    let params = load_params(&cli).await?;
     let datadir = cli.datadir.clone();
     let json_out = cli.json;
     let client = RpcClient::from_datadir(&cli.datadir, cli.rpc_port)
@@ -243,9 +243,15 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn load_params(cli: &Cli) -> Result<ChainParams> {
+/// Chain params: read the file here (consensus only parses), else devnet.
+async fn load_params(cli: &Cli) -> Result<ChainParams> {
     match &cli.params {
-        Some(p) => ChainParams::load(p).context("load chain params"),
+        Some(p) => {
+            let text = tokio::fs::read_to_string(p)
+                .await
+                .with_context(|| format!("read params file {}", p.display()))?;
+            ChainParams::from_json(&text).context("parse chain params")
+        }
         None => Ok(ChainParams::devnet()),
     }
 }
@@ -508,7 +514,7 @@ async fn wallet_cmd(
             // The mnemonic IS the wallet — show it once, loudly.
             println!("=== WALLET CREATED: {} ===", name);
             println!("MNEMONIC (back this up NOW — never shown again):");
-            println!("{}", mnemonic.phrase());
+            println!("{}", mnemonic.phrase()); // secret-display-once: wallet create shows the new seed exactly once
             // First address, then persist seed + issuance counters.
             let addr = w.new_address()?;
             let seed = minibtc_wallet::seed_from_mnemonic(&mnemonic.phrase(), &bip39_pass)

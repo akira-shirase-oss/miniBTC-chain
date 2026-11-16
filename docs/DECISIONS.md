@@ -48,9 +48,11 @@ conceptually; sent as `Authorization: Bearer`). Binds `127.0.0.1` by default;
 
 `ChainParams` (subsidy, halving interval, powLimit, retarget interval &
 timespan, coinbase maturity, max block weight/size, min relay fee, ports,
-genesis message/time) loads from a TOML file per datadir with
-`minibtc-node --params`. Defaults target a watchable devnet (fast blocks,
-short retarget window); nothing assumes mainnet values.
+genesis message/time) loads from a JSON file passed with `--params`
+(node, CLI, MCP, wallet UI). The binary reads the file; consensus only
+parses and validates the text (`ChainParams::from_json`), so the pure
+crate never touches the filesystem. Defaults target a watchable devnet
+(fast blocks, short retarget window); nothing assumes mainnet values.
 
 ### D-007 — Sighash scope: SIGHASH_ALL now, others reserved
 

@@ -72,7 +72,14 @@ async fn main() -> Result<()> {
 
     // Params: custom file or devnet preset.
     let params: ChainParams = match &args.params {
-        Some(p) => ChainParams::load(p).with_context(|| format!("load params {}", p.display()))?,
+        Some(p) => {
+            // File I/O lives here; consensus only parses and validates.
+            let text = tokio::fs::read_to_string(p)
+                .await
+                .with_context(|| format!("read params file {}", p.display()))?;
+            ChainParams::from_json(&text)
+                .with_context(|| format!("parse params {}", p.display()))?
+        }
         None => ChainParams::devnet(),
     };
     if !params.devnet {

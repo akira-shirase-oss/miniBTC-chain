@@ -358,8 +358,13 @@ async fn main() -> Result<()> {
     let rpc = RpcClient::from_datadir(&args.datadir, args.rpc_port)
         .context("connect to node RPC (is the node running?)")?;
     let params = match &args.params {
-        Some(p) => minibtc_consensus::ChainParams::load(p)
-            .with_context(|| format!("load params {}", p.display()))?,
+        Some(p) => {
+            let text = tokio::fs::read_to_string(p)
+                .await
+                .with_context(|| format!("read params file {}", p.display()))?;
+            minibtc_consensus::ChainParams::from_json(&text)
+                .with_context(|| format!("parse params {}", p.display()))?
+        }
         None => minibtc_consensus::ChainParams::devnet(),
     };
     let shared = Arc::new(Shared {
