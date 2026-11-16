@@ -41,6 +41,14 @@ const ADDRINDEX: TableDefinition<'_, &[u8], &[u8]> = TableDefinition::new("addri
 /// Table: single-row "meta" → chain params fingerprint + genesis hash.
 const CHAINMETA: TableDefinition<'_, &[u8], &[u8]> = TableDefinition::new("chainmeta");
 
+/// Version of the consensus rules a datadir's chain was validated under,
+/// stored in chainmeta under `rules`. Bump it whenever a consensus change
+/// makes previously stored blocks invalid. 1 = everything before the
+/// 2026-11-16 hardening (no key written); 2 = BIP34 coinbase heights,
+/// BIP30, the bits schedule and pow limit enforced (D-013, D-014).
+pub const RULES_VERSION: u32 = 2;
+const RULES_KEY: &[u8] = b"rules";
+
 /// Storage errors.
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -56,6 +64,20 @@ pub enum StoreError {
     /// redb commit failure.
     #[error("redb commit: {0}")]
     Commit(#[from] redb::CommitError),
+    /// The datadir was written under different consensus rules.
+    #[error(
+        "this datadir was written under consensus rules v{found}, but this node enforces \
+         v{expected} (BIP34 coinbase heights and the difficulty schedule, D-013/D-014); its \
+         chain would be rejected by every up-to-date node. Start with a fresh --datadir, or \
+         run once with --reindex to rebuild it under the current rules (blocks that are \
+         invalid under them are discarded)"
+    )]
+    RulesVersion {
+        /// Version recorded in the datadir (1 when absent).
+        found: u32,
+        /// `RULES_VERSION`.
+        expected: u32,
+    },
     /// redb transaction failure.
     #[error("redb txn: {0}")]
     Txn(#[from] redb::TransactionError),
@@ -145,6 +167,7 @@ impl Store {
             cm.hash256(&chain.genesis);
             cm.hash256(&chain.tip);
             chainmeta.insert(&b"chain"[..], cm.into_bytes().as_slice())?;
+            chainmeta.insert(RULES_KEY, RULES_VERSION.to_le_bytes().as_slice())?;
 
             // Blocks + meta + txindex + addrindex inputs.
             let mut addr_map: std::collections::BTreeMap<Vec<u8>, Vec<u8>> =
@@ -265,6 +288,7 @@ impl Store {
             cm.hash256(&chain.genesis);
             cm.hash256(hash);
             chainmeta.insert(&b"chain"[..], cm.into_bytes().as_slice())?;
+            chainmeta.insert(RULES_KEY, RULES_VERSION.to_le_bytes().as_slice())?;
         }
         txn.commit()?;
         Ok(())
@@ -354,6 +378,13 @@ impl Store {
         };
         if blocks_t.is_empty()? {
             return Ok(None);
+        }
+        let found = self.rules_version()?;
+        if found != RULES_VERSION {
+            return Err(StoreError::RulesVersion {
+                found,
+                expected: RULES_VERSION,
+            });
         }
         // Snapshot writes all tables atomically — a missing sibling table
         // alongside blocks means corruption.
@@ -548,6 +579,23 @@ impl Store {
         }
         let _ = chain.take_dropped(); // not in the rebuilt index; snapshot drops them
         Ok(chain)
+    }
+
+    /// The consensus-rules version recorded in the datadir (1 when the
+    /// key is absent: written before versions were recorded).
+    pub fn rules_version(&self) -> Result<u32, StoreError> {
+        let txn = self.db.begin_read()?;
+        let Some(t) = opt_table(&txn, CHAINMETA)? else {
+            return Ok(1);
+        };
+        let Some(g) = t.get(RULES_KEY)? else {
+            return Ok(1);
+        };
+        let b = g.value();
+        if b.len() != 4 {
+            return Err(StoreError::Corrupt("bad rules version".into()));
+        }
+        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     }
 
     /// The tip recorded by the last snapshot/append, if any.
