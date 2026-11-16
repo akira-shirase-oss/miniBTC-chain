@@ -151,6 +151,14 @@ saturates instead of wrapping mod 2^256 (a slow period at the devnet
 limit used to make mining *harder*). Consequence: devnet datadirs
 written before this change may hold blocks whose bits no longer match
 the schedule; `--reindex` would refuse them. Start such devnets fresh.
+The devnet preset's `instant_difficulty` flag never disabled
+retargeting (it only grinds the genesis nonce), so it is now named
+`grind_genesis_nonce` (the old key still loads). Burst mining with
+`mine generate` therefore keeps raising difficulty ×4 per 20 blocks; a
+regtest-style "no retargeting" mode would have to be a new consensus
+parameter applied by validation and the miner alike, which the blueprint's
+"difficulty adjusts on schedule on devnet settings" milestone argues
+against.
 
 ### D-014 — BIP34 coinbase height + BIP30 no-overwrite (2026-11-16)
 
@@ -200,15 +208,54 @@ the model — as human approval. Now:
    the draft plus signatures (`minibtc_wallet::draft::matches_draft`),
    with input values fetched from the node, and applies the per-request
    and per-day caps to the spend decoded from those bytes (outputs that
-   are not change, plus fee).
+   are not change, plus fee). Change means an output paying one of the
+   wallet's own scripts from `<wallet>.watch.json`; the draft's
+   `change_index` and the approval's `change_outputs` are display-only,
+   because a process that can write the drafts directory could relabel
+   them to dodge the caps.
+
+**What the barrier is.** The barrier is the wallet passphrase, which
+never enters the MCP process, the draft files or any environment the
+agent controls. The terminal check is a guard against mistakes (a script
+piping `sign` into the prompt), not a security boundary: any process can
+allocate a pseudo-terminal and drive the prompt (the 2026-11-16 review did
+it with Python's `pty`). Without the passphrase that gets it nowhere: a
+wrong passphrase fails the keystore unlock and nothing is signed.
 
 Honest limit: an agent that has a shell *and* the wallet passphrase (for
 example exported in the same shell) can always run `minibtc-cli wallet
 send` itself; no MCP gate can stop that. Keep the passphrase out of any
-environment an agent can read. The passphrase prompt echoes (same as the
-CLI's other prompts; tracked with the CLI items). Existing wallets need
-one passphrase-unlocked command (e.g. `wallet balance`) to write their
-watch-only file.
+environment an agent can read. Every CLI passphrase prompt (and the
+mnemonic prompt of `wallet restore`) reads with terminal echo off,
+switched off before the prompt appears (`stty -echo`, restored on exit;
+the read fails closed if echo cannot be disabled). Existing wallets need
+one passphrase-unlocked command (e.g. `wallet balance`, or an unlock in the
+wallet UI) to write their watch-only file. The file holds public data but
+links every address to one wallet, so both the CLI and the wallet UI write
+it owner-only (0600) via a temp file and an atomic rename.
+
+### D-016 — What a failed reorg leaves behind (2026-11-16)
+
+`Chain::reorg_to` validates the heavier branch block by block on one
+UTXO overlay and commits only if the whole branch connects. When block
+*k* fails:
+
+- the node returns to its **old tip**, even if the valid prefix
+  (blocks before *k*) has more work than the old tip. Bitcoin Core would
+  stay on that prefix. MiniBTC can't reach that case today: blocks are
+  processed one at a time and a reorg starts at the first branch block
+  whose work exceeds the tip's, so every earlier prefix has at most the
+  tip's work. Revisit if blocks are ever connected in batches (for
+  example a parallel download that hands several blocks to
+  `consider_block` at once).
+- block *k* and all its descendants are dropped from the index, kept in
+  a bounded invalid-hash cache and deleted from disk
+  (`take_dropped` → `Store::delete_blocks`). The cache is forgotten on
+  restart, which is safe because the blocks are gone from disk too.
+- exception: a block that fails only "too far in the future"
+  (`TimeTooNew`) is kept and nothing is marked invalid, because that
+  verdict depends on the local clock (Core's `BLOCK_TIME_FUTURE` is
+  never cached either). A later block on the branch retries the reorg.
 
 ## Open questions
 

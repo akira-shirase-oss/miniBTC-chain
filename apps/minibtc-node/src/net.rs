@@ -145,6 +145,7 @@ fn disconnect(node: &Node, addr: SocketAddr) {
     let mut inner = node.inner.lock().unwrap_or_else(|e| e.into_inner());
     inner.peers.remove(&addr);
     inner.sync.remove_peer(&addr);
+    inner.requests.forget_peer(&addr);
     // Drop the TCP side too: the session notices its queue closed and
     // exits; the peer table entry is already gone.
 }
@@ -463,6 +464,7 @@ async fn cleanup(node: &Node, addr: SocketAddr) {
     let mut inner = node.inner.lock().unwrap_or_else(|e| e.into_inner());
     inner.peers.remove(&addr);
     inner.sync.remove_peer(&addr);
+    inner.requests.forget_peer(&addr);
 }
 
 /// Build a getheaders locator: tip + a few ancestors (bounded).
@@ -709,6 +711,18 @@ async fn handle_block(node: &Node, addr: SocketAddr, block: Block, reply: &mpsc:
         if !inner.pending.push(block, now) {
             return; // queue full (count or bytes) or already queued
         }
+        // An orphan means this peer is on a branch we have not seen: ask it
+        // for the headers between our chain and its block (Bitcoin Core
+        // does the same). Without this a reorg never reaches a node that
+        // hears about it only through a relay — the relay announces only
+        // the new tip blocks, whose ancestors we never requested.
+        if !parent_known {
+            let locator = sync_locator(&inner);
+            let _ = reply.try_send(Message::GetHeaders {
+                locator,
+                stop: Hash256::ZERO,
+            });
+        }
     }
     drain_pending(node, addr, reply).await;
 }
@@ -870,4 +884,225 @@ fn active_headers(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    //! In-process network: real `handle_message` on memory-only nodes,
+    //! one bounded channel per directed link, and a pump that delivers
+    //! messages until the network is quiet. A link can be held to
+    //! simulate a partition (its messages wait until it is released).
+
+    use super::*;
+    use crate::core::in_memory;
+    use std::collections::{HashMap, HashSet};
+
+    struct TestNet {
+        nodes: Vec<Node>,
+        addrs: Vec<SocketAddr>,
+        /// (from, to) → receiver of messages `from` sends to `to`.
+        links: Vec<((usize, usize), mpsc::Receiver<Message>)>,
+        /// (from, to) → sender used as `reply` when `to` handles a message
+        /// from `from` — i.e. the channel to → from.
+        senders: HashMap<(usize, usize), mpsc::Sender<Message>>,
+        held: HashSet<(usize, usize)>,
+    }
+
+    impl TestNet {
+        fn new(n: usize) -> Self {
+            let params = ChainParams::devnet();
+            Self {
+                nodes: (0..n).map(|_| in_memory(params.clone())).collect(),
+                addrs: (0..n)
+                    .map(|i| SocketAddr::from(([10, 0, i as u8 + 1, 1], 18_445)))
+                    .collect(),
+                links: Vec::new(),
+                senders: HashMap::new(),
+                held: HashSet::new(),
+            }
+        }
+
+        /// Connect `a` and `b` (both directions), as a finished handshake.
+        fn connect(&mut self, a: usize, b: usize) {
+            for (from, to) in [(a, b), (b, a)] {
+                let (tx, rx) = mpsc::channel::<Message>(4_096);
+                // `from` sends to `to` through `tx`: register it in from's
+                // peer table under to's address.
+                self.nodes[from]
+                    .peer_tx
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(self.addrs[to], tx.clone());
+                self.senders.insert((from, to), tx);
+                self.links.push(((from, to), rx));
+                let mut inner = self.nodes[from]
+                    .inner
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let v = our_version_msg(&self.nodes[from].params, 0);
+                inner
+                    .peers
+                    .register(self.addrs[to], true, &v)
+                    .unwrap_or_else(|e| panic!("register: {e:?}"));
+                inner.peers.mark_handshaken(&self.addrs[to]);
+                inner.sync.add_peer(self.addrs[to]);
+            }
+        }
+
+        fn hold(&mut self, a: usize, b: usize) {
+            self.held.insert((a, b));
+            self.held.insert((b, a));
+        }
+
+        fn release(&mut self, a: usize, b: usize) {
+            self.held.remove(&(a, b));
+            self.held.remove(&(b, a));
+        }
+
+        /// Deliver messages until no link carries any (bounded rounds).
+        async fn pump(&mut self) {
+            for _ in 0..10_000 {
+                let mut delivered = false;
+                for i in 0..self.links.len() {
+                    let (from, to) = self.links[i].0;
+                    if self.held.contains(&(from, to)) {
+                        continue;
+                    }
+                    while let Ok(msg) = self.links[i].1.try_recv() {
+                        delivered = true;
+                        let reply = self.senders[&(to, from)].clone();
+                        let node = self.nodes[to].clone();
+                        handle_message(&node, self.addrs[from], msg, &reply).await;
+                    }
+                }
+                if !delivered {
+                    return;
+                }
+            }
+            panic!("network never went quiet");
+        }
+
+        fn tip(&self, i: usize) -> (Hash256, u32) {
+            let inner = self.nodes[i]
+                .inner
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            (inner.chain.tip, inner.chain.height())
+        }
+
+        /// Mine `n` blocks on node `i`, paying a key unique to that node
+        /// (otherwise two nodes mining in the same second build identical
+        /// blocks and there is no fork at all).
+        fn mine(&self, i: usize, n: u64) {
+            let key = minibtc_crypto::Keypair::from_secret_bytes(&[i as u8 + 1; 32])
+                .unwrap_or_else(|e| panic!("key: {e:?}"));
+            let payout = minibtc_script::Script::p2pkh(&key.public_key().key_hash()).0;
+            self.nodes[i]
+                .generate(n, &payout)
+                .unwrap_or_else(|e| panic!("mine: {e:?}"));
+        }
+    }
+
+    /// A signed spend of node `i`'s coinbase at `height` (paid to the
+    /// node's own key by `mine`).
+    fn spend_coinbase(net: &TestNet, i: usize, height: u32) -> minibtc_primitives::Transaction {
+        use minibtc_primitives::{OutPoint, Sats, Transaction, TxInput, TxOutput};
+        let key = minibtc_crypto::Keypair::from_secret_bytes(&[i as u8 + 1; 32])
+            .unwrap_or_else(|e| panic!("key: {e:?}"));
+        let inner = net.nodes[i].inner.lock().unwrap_or_else(|e| e.into_inner());
+        let at = crate::core::block_at_height(&inner, height)
+            .unwrap_or_else(|| panic!("no block at {height}"));
+        let cb = inner.chain.blocks[&at].block.txs[0].clone();
+        let prev_spk = cb.outputs[0].script_pubkey.clone();
+        let mut tx = Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                prev: OutPoint {
+                    txid: cb.txid(),
+                    vout: 0,
+                },
+                script_sig: vec![],
+                sequence: 0xffff_ffff,
+            }],
+            outputs: vec![TxOutput {
+                value: Sats(cb.outputs[0].value.sats() - 10_000),
+                script_pubkey: prev_spk.clone(),
+            }],
+            locktime: 0,
+        };
+        let sig = minibtc_script::sighash::sign_input(&tx, 0, &prev_spk, &key)
+            .unwrap_or_else(|e| panic!("sign: {e:?}"));
+        tx.inputs[0].script_sig = minibtc_script::Script::p2pkh_spend(&sig, &key.public_key()).0;
+        tx
+    }
+
+    #[tokio::test]
+    async fn reorged_out_transactions_return_to_the_mempool() {
+        let mut net = TestNet::new(2);
+        net.connect(0, 1);
+        net.mine(0, 101); // N1's coinbase at height 1 is now mature
+        net.pump().await;
+        assert_eq!(net.tip(1), net.tip(0));
+
+        // Partition, then N1 confirms T in one block; N2 mines two without it.
+        net.hold(0, 1);
+        let t = spend_coinbase(&net, 0, 1);
+        let txid = t.txid();
+        net.nodes[0]
+            .accept_tx(t, None, None)
+            .unwrap_or_else(|e| panic!("accept: {e:?}"));
+        net.mine(0, 1);
+        {
+            let inner = net.nodes[0].inner.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(inner.mempool.get(&txid).is_none(), "T confirmed on N1");
+            assert!(inner.txindex.contains_key(&txid));
+        }
+        net.mine(1, 2);
+        net.release(0, 1);
+        net.pump().await;
+        assert_eq!(net.tip(0), net.tip(1), "N1 reorged onto N2's branch");
+
+        let inner = net.nodes[0].inner.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            inner.mempool.get(&txid).is_some(),
+            "a reorged-out transaction must go back to the mempool"
+        );
+        assert!(
+            !inner.txindex.contains_key(&txid),
+            "txindex must not point at a block that left the active chain"
+        );
+        assert_eq!(crate::core::tx_confirmations(&inner, &txid), None);
+    }
+
+    #[tokio::test]
+    async fn reorg_reaches_a_node_connected_only_through_a_relay() {
+        // N3 — N1 — N2: N2 hears about N3's blocks only through N1.
+        let mut net = TestNet::new(3);
+        net.connect(0, 1);
+        net.connect(0, 2);
+        net.mine(0, 5);
+        net.pump().await;
+        assert_eq!(net.tip(1), net.tip(0));
+        assert_eq!(net.tip(2), net.tip(0));
+
+        // Partition N1 | N3. N1 mines 2 (N2 follows), N3 mines 4.
+        net.hold(0, 2);
+        net.mine(0, 2);
+        net.mine(2, 4);
+        net.pump().await;
+        assert_eq!(net.tip(1), net.tip(0), "N2 follows N1 during the split");
+        assert_eq!(net.tip(0).1, 7);
+        assert_eq!(net.tip(2).1, 9);
+
+        // Heal: N1 reorgs onto N3's heavier branch; N2 must follow through N1.
+        net.release(0, 2);
+        net.pump().await;
+
+        assert_eq!(net.tip(0), net.tip(2), "N1 reorged onto the heavier branch");
+        assert_eq!(
+            net.tip(1),
+            net.tip(2),
+            "the relay-only node must reach the same tip"
+        );
+    }
 }

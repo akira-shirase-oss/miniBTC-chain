@@ -35,8 +35,11 @@ pub(crate) const PENDING_MAX_BLOCKS: usize = 1_024;
 pub(crate) const PENDING_MAX_BYTES: usize = 32 * 1024 * 1024;
 /// A queued block whose parent never arrives is dropped after this.
 pub(crate) const PENDING_TTL: Duration = Duration::from_secs(10 * 60);
-/// Most block requests (getdata) tracked at once.
-pub(crate) const REQUESTS_MAX: usize = 8_192;
+/// Most block requests (getdata) tracked at once, all peers together.
+pub(crate) const REQUESTS_MAX: usize = 16_384;
+/// Most block requests tracked for one peer — one peer's junk `inv`s can
+/// no longer fill the table and crowd out everyone else's requests.
+pub(crate) const REQUESTS_PER_PEER: usize = 2_048;
 /// A block request not answered within this is forgotten.
 pub(crate) const REQUEST_TTL: Duration = Duration::from_secs(5 * 60);
 
@@ -133,21 +136,47 @@ impl PendingBlocks {
 }
 
 /// Blocks this node asked a peer for (getdata), so a block that arrives
-/// unasked cannot take a slot in the out-of-order queue. Bounded and
-/// expiring.
+/// unasked cannot take a slot in the out-of-order queue. Bounded per peer
+/// and in total; entries expire lazily from a time-ordered queue, so every
+/// operation is O(1) amortised under the node lock (it used to `retain`
+/// the whole table on each call).
 #[derive(Default)]
 pub struct BlockRequests {
     by_hash: HashMap<Hash256, (SocketAddr, Instant)>,
+    /// (requested_at, hash) in request order; an entry is stale when the
+    /// hash was taken or re-requested since.
+    order: VecDeque<(Instant, Hash256)>,
+    per_peer: HashMap<SocketAddr, usize>,
 }
 
 impl BlockRequests {
-    /// Record that `hash` was requested from `peer` at `now`. Silently
-    /// skips when full (the block can still arrive once its parent is
-    /// known, and the request is retried by the next headers round).
+    /// Record that `hash` was requested from `peer` at `now`. Skipped when
+    /// that peer is at `REQUESTS_PER_PEER` or the table is full; the block
+    /// can still arrive once its parent is known, and the next headers
+    /// round asks again. Re-requesting from the same peer is a no-op; from
+    /// another peer it moves the request there.
     pub fn note(&mut self, hash: Hash256, peer: SocketAddr, now: Instant) {
         self.expire(now);
-        if self.by_hash.len() < REQUESTS_MAX || self.by_hash.contains_key(&hash) {
-            self.by_hash.insert(hash, (peer, now));
+        if let Some((asked, _)) = self.by_hash.get(&hash) {
+            if *asked == peer {
+                return;
+            }
+            let old = *asked;
+            self.by_hash.remove(&hash);
+            self.dec(old);
+        }
+        let mine = self.per_peer.get(&peer).copied().unwrap_or(0);
+        if mine >= REQUESTS_PER_PEER || self.by_hash.len() >= REQUESTS_MAX {
+            return;
+        }
+        self.by_hash.insert(hash, (peer, now));
+        *self.per_peer.entry(peer).or_insert(0) += 1;
+        self.order.push_back((now, hash));
+        if self.order.len() > 2 * REQUESTS_MAX {
+            // Drop stale queue entries (re-pointed requests), amortised.
+            let by_hash = &self.by_hash;
+            self.order
+                .retain(|(t, h)| by_hash.get(h).is_some_and(|(_, at)| at == t));
         }
     }
 
@@ -158,16 +187,44 @@ impl BlockRequests {
         match self.by_hash.get(hash) {
             Some((asked, _)) if *asked == peer => {
                 self.by_hash.remove(hash);
+                self.dec(peer);
                 true
             }
             _ => false,
         }
     }
 
-    /// Forget requests older than `REQUEST_TTL`.
+    /// Forget requests older than `REQUEST_TTL` — pops from the front of
+    /// the time-ordered queue only.
     pub fn expire(&mut self, now: Instant) {
-        self.by_hash
-            .retain(|_, (_, at)| now.saturating_duration_since(*at) <= REQUEST_TTL);
+        while let Some(&(at, hash)) = self.order.front() {
+            if now.saturating_duration_since(at) <= REQUEST_TTL {
+                break;
+            }
+            self.order.pop_front();
+            if let Some(&(peer, t)) = self.by_hash.get(&hash)
+                && t == at
+            {
+                self.by_hash.remove(&hash);
+                self.dec(peer);
+            }
+        }
+    }
+
+    /// Drop every request to `peer` (on disconnect). O(n), once per
+    /// session end.
+    pub fn forget_peer(&mut self, peer: &SocketAddr) {
+        self.by_hash.retain(|_, (p, _)| p != peer);
+        self.per_peer.remove(peer);
+    }
+
+    fn dec(&mut self, peer: SocketAddr) {
+        if let Some(n) = self.per_peer.get_mut(&peer) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                self.per_peer.remove(&peer);
+            }
+        }
     }
 
     /// Outstanding requests for observability.
@@ -277,11 +334,14 @@ pub fn open(datadir: &Path, params: ChainParams, reindex: bool) -> Result<Node, 
     for h in chain.blocks.keys() {
         sync.note_have(*h);
     }
-    // txid → block hash over every indexed block (active + inactive).
+    // txid → block hash for the ACTIVE chain only: a tx that exists only
+    // in a side or orphaned block is not confirmed.
     let mut txindex = HashMap::new();
     for (bh, rec) in &chain.blocks {
-        for t in &rec.block.txs {
-            txindex.insert(t.txid(), *bh);
+        if rec.status == minibtc_chainstate::BlockStatus::Active {
+            for t in &rec.block.txs {
+                txindex.insert(t.txid(), *bh);
+            }
         }
     }
     let inner = NodeInner {
@@ -303,6 +363,36 @@ pub fn open(datadir: &Path, params: ChainParams, reindex: bool) -> Result<Node, 
         peer_tx: Arc::new(Mutex::new(HashMap::new())),
         cancel: Arc::new(AtomicBool::new(false)),
     })
+}
+
+/// A memory-only node (no datadir, no store) for in-process tests.
+#[cfg(test)]
+pub(crate) fn in_memory(params: ChainParams) -> Node {
+    let genesis = genesis_block(&params);
+    let chain = minibtc_chainstate::Chain::new(params.clone(), genesis)
+        .unwrap_or_else(|e| panic!("genesis: {e:?}"));
+    let tip = chain.tip;
+    let mut sync = Sync::new(params.clone(), tip);
+    sync.note_have(tip);
+    let inner = NodeInner {
+        chain,
+        mempool: Mempool::new(MempoolPolicy::default()),
+        peers: PeerManager::new(),
+        sync,
+        addrbook: Vec::new(),
+        txindex: HashMap::new(),
+        pending: PendingBlocks::default(),
+        requests: BlockRequests::default(),
+        claimed: HashMap::new(),
+        dialing: HashSet::new(),
+    };
+    Node {
+        params,
+        inner: Arc::new(Mutex::new(inner)),
+        store: None,
+        peer_tx: Arc::new(Mutex::new(HashMap::new())),
+        cancel: Arc::new(AtomicBool::new(false)),
+    }
 }
 
 /// Node errors (binary-facing; anyhow wraps at the edge).
@@ -368,7 +458,16 @@ impl Node {
         }
         let direct = block.header.prev_hash == inner.chain.tip;
         let prev_tip = inner.chain.tip;
-        inner.chain.consider_block(block.clone())?;
+        let considered = inner.chain.consider_block(block.clone());
+        // A failed reorg drops the invalid block and its descendants from
+        // the index; delete them from disk too, or a restart loads them back.
+        let dropped = inner.chain.take_dropped();
+        if let Some(store) = &self.store
+            && !dropped.is_empty()
+        {
+            store.delete_blocks(&dropped)?;
+        }
+        considered?;
         // Persist: incremental for a tip extension, block + meta only for a
         // side branch that changed nothing else, full snapshot only for a
         // reorg (which needs more work than the tip — it costs PoW).
@@ -381,21 +480,47 @@ impl Node {
                 store.snapshot(&inner.chain)?;
             }
         }
-        // Index the new block's txs + mark it held for sync/relay dedup.
-        let new_txids: Vec<Hash256> = inner
-            .chain
-            .blocks
-            .get(&hash)
-            .map(|r| r.block.txs.iter().map(|t| t.txid()).collect())
-            .unwrap_or_default();
-        for t in new_txids {
-            inner.txindex.insert(t, hash);
+        // The tx index covers the active chain only. A tip extension adds
+        // the block; a reorg removes the disconnected blocks' entries and
+        // adds the connected ones; a side block changes nothing.
+        let reorg = inner.chain.take_reorg();
+        if let Some(r) = &reorg {
+            for d in &r.disconnected {
+                let txids: Vec<Hash256> = inner
+                    .chain
+                    .blocks
+                    .get(d)
+                    .map(|rec| rec.block.txs.iter().map(|t| t.txid()).collect())
+                    .unwrap_or_default();
+                for t in txids {
+                    if inner.txindex.get(&t) == Some(d) {
+                        inner.txindex.remove(&t);
+                    }
+                }
+            }
+            for c in r.connected.clone() {
+                index_block_txs(&mut inner, c);
+            }
+        } else if direct {
+            index_block_txs(&mut inner, hash);
         }
         let tip = inner.chain.tip;
         inner.sync.note_have(hash);
-        // Mempool refresh: confirmed txs drop out, reorg-returned txs come
-        // back, conflicts die — one code path for every connect type.
+        // Mempool refresh: confirmed txs drop out, conflicts die.
         self.refresh_mempool(&mut inner);
+        // Then the reorged-out blocks' transactions go back in (oldest
+        // block first), each re-validated against the new chain.
+        if let Some(r) = &reorg {
+            let NodeInner { mempool, chain, .. } = &mut *inner;
+            for d in r.disconnected.iter().rev() {
+                if let Some(rec) = chain.blocks.get(d) {
+                    let block = rec.block.clone();
+                    mempool.on_block_disconnected(&block, &chain.utxos, &self.params, |tx| {
+                        validate_against_chain(chain, &self.params, tx)
+                    });
+                }
+            }
+        }
         inner.sync.set_tip(tip);
         let outcome = if inner.chain.tip == hash {
             ConnectOutcome::Connected
@@ -414,25 +539,51 @@ impl Node {
         inner: &NodeInner,
         tx: &Transaction,
     ) -> Result<Sats, String> {
-        let fee = validate_tx(tx, &inner.chain.utxos, &self.params).map_err(|e| e.to_string())?;
-        // Coinbase maturity is a connect-time rule; mempool enforces it
-        // early so miners never template an unminable tx.
-        let tip_h = inner.chain.height();
-        for inp in &tx.inputs {
-            if let Some(e) = inner.chain.utxos.get(&inp.prev)
-                && e.coinbase
-                && tip_h.saturating_sub(e.height) < self.params.coinbase_maturity
-            {
-                return Err(format!(
-                    "immature coinbase (depth {} < {})",
-                    tip_h.saturating_sub(e.height),
-                    self.params.coinbase_maturity
-                ));
-            }
-        }
-        Ok(fee)
+        validate_against_chain(&inner.chain, &self.params, tx)
     }
+}
 
+/// Index every transaction of block `hash` (an active-chain block).
+fn index_block_txs(inner: &mut NodeInner, hash: Hash256) {
+    let txids: Vec<Hash256> = inner
+        .chain
+        .blocks
+        .get(&hash)
+        .map(|r| r.block.txs.iter().map(|t| t.txid()).collect())
+        .unwrap_or_default();
+    for t in txids {
+        inner.txindex.insert(t, hash);
+    }
+}
+
+/// Full consensus validation of a mempool candidate against the active
+/// chain plus the coinbase-maturity rule at the next height. Returns the
+/// fee.
+fn validate_against_chain(
+    chain: &Chain,
+    params: &ChainParams,
+    tx: &Transaction,
+) -> Result<Sats, String> {
+    let fee = validate_tx(tx, &chain.utxos, params).map_err(|e| e.to_string())?;
+    // Coinbase maturity is a connect-time rule; mempool enforces it
+    // early so miners never template an unminable tx.
+    let tip_h = chain.height();
+    for inp in &tx.inputs {
+        if let Some(e) = chain.utxos.get(&inp.prev)
+            && e.coinbase
+            && tip_h.saturating_sub(e.height) < params.coinbase_maturity
+        {
+            return Err(format!(
+                "immature coinbase (depth {} < {})",
+                tip_h.saturating_sub(e.height),
+                params.coinbase_maturity
+            ));
+        }
+    }
+    Ok(fee)
+}
+
+impl Node {
     /// The single tx-accept path: consensus + maturity + mempool policy.
     /// `replace` is the RBF target txid when the tx signals BIP125;
     /// `relay_except` excludes the origin peer from the inv fan-out.
@@ -759,6 +910,50 @@ mod tests {
         assert!(precheck_block(&hard, &too_easy).is_err());
     }
 
+    fn hash_n(i: usize) -> Hash256 {
+        let mut x = [0u8; 32];
+        x[..8].copy_from_slice(&(i as u64).to_le_bytes());
+        Hash256(x)
+    }
+
+    #[test]
+    fn one_peer_cannot_crowd_out_other_peers_requests() {
+        // An attacker announcing junk hashes must not fill the table so
+        // that an honest peer's requests stop being recorded.
+        let t0 = Instant::now();
+        let attacker: SocketAddr = "10.6.6.6:1".parse().unwrap();
+        let honest: SocketAddr = "10.1.1.1:1".parse().unwrap();
+        let mut r = BlockRequests::default();
+        for i in 0..(REQUESTS_MAX + 100) {
+            r.note(hash_n(i), attacker, t0);
+        }
+        let h = Hash256([0xAB; 32]);
+        r.note(h, honest, t0);
+        assert!(r.take(&h, honest, t0), "honest request must be recorded");
+    }
+
+    #[test]
+    fn request_expiry_is_exact_and_lazy() {
+        let t0 = Instant::now();
+        let a: SocketAddr = "10.0.0.1:1".parse().unwrap();
+        let mut r = BlockRequests::default();
+        for i in 0..100 {
+            r.note(hash_n(i), a, t0);
+        }
+        let t1 = t0 + Duration::from_secs(60);
+        for i in 100..150 {
+            r.note(hash_n(i), a, t1);
+        }
+        r.expire(t0 + REQUEST_TTL + Duration::from_secs(1));
+        assert_eq!(r.len(), 50, "only the first batch expired");
+        assert!(!r.take(&hash_n(5), a, t1 + Duration::from_secs(1)));
+        assert!(r.take(&hash_n(120), a, t1 + Duration::from_secs(1)));
+        // Re-noting a hash does not duplicate it.
+        r.note(hash_n(130), a, t1);
+        r.note(hash_n(130), a, t1);
+        assert_eq!(r.len(), 49);
+    }
+
     #[test]
     fn pending_queue_caps_blocks_and_bytes() {
         let now = Instant::now();
@@ -809,12 +1004,20 @@ mod tests {
         r.note(h, a, t0);
         let late = t0 + REQUEST_TTL + Duration::from_secs(1);
         assert!(!r.take(&h, a, late), "requests expire");
-        // Bounded.
+        // Bounded per peer and in total.
         let mut r = BlockRequests::default();
         for i in 0..(REQUESTS_MAX + 100) {
             let mut x = [0u8; 32];
             x[..8].copy_from_slice(&(i as u64).to_le_bytes());
             r.note(Hash256(x), a, t0);
+        }
+        assert_eq!(r.len(), REQUESTS_PER_PEER);
+        let mut r = BlockRequests::default();
+        for i in 0..(REQUESTS_MAX + 100) {
+            let mut x = [0u8; 32];
+            x[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            let peer = SocketAddr::from(([10, 0, (i / REQUESTS_PER_PEER) as u8, 1], 1));
+            r.note(Hash256(x), peer, t0);
         }
         assert_eq!(r.len(), REQUESTS_MAX);
     }

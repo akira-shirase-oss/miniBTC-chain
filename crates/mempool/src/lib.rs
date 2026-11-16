@@ -402,18 +402,35 @@ impl Mempool {
         // re-validation on next admit/block template.
     }
 
-    /// Re-add transactions from a disconnected block (reorg) — they go
-    /// back to the pool, fee info preserved if we tracked it; we
-    /// recompute against the restored UTXO view by the caller.
-    pub fn on_block_disconnected(&mut self, block: &minibtc_primitives::Block) {
+    /// Re-add the transactions of a block a reorg disconnected. `view`
+    /// is the UTXO set *after* the reorg; `validate` is the caller's full
+    /// consensus check for a mempool candidate (scripts, maturity) and
+    /// returns its fee. Transactions the new branch already confirmed, or
+    /// that now conflict with it, fail validation and are dropped. Returns
+    /// how many went back into the pool. Call it for disconnected blocks
+    /// oldest first. (A transaction spending another reorged-out
+    /// transaction's output is not re-admitted: the pool does not hold
+    /// unconfirmed chains.)
+    pub fn on_block_disconnected<V, F>(
+        &mut self,
+        block: &minibtc_primitives::Block,
+        view: &V,
+        params: &ChainParams,
+        mut validate: F,
+    ) -> usize
+    where
+        V: UtxoView,
+        F: FnMut(&Transaction) -> Result<Sats, String>,
+    {
+        let mut readmitted = 0usize;
         for tx in block.txs.iter().skip(1) {
-            // Recompute fee requires the pre-block UTXO view — caller passes
-            // it via re_admit. Here we just park them as orphans-with-fee=0
-            // is wrong; instead the node re-validates. For the in-memory
-            // pool we store with fee recomputed lazily — simplest correct:
-            // caller uses `re_admit` with the view.
-            let _ = tx;
+            if let Ok(fee) = validate(tx)
+                && self.admit(tx.clone(), fee, view, params, None).is_ok()
+            {
+                readmitted += 1;
+            }
         }
+        readmitted
     }
 
     /// Re-admit a tx after reorg with a fresh fee computation.
@@ -676,6 +693,41 @@ mod tests {
         };
         mp.on_block_connected(&block);
         assert!(mp.get(&txid).is_none());
+    }
+
+    #[test]
+    fn block_disconnect_readmits_what_still_validates() {
+        // A disconnected block: coinbase, a tx still valid on the new
+        // chain, and one the new chain already confirmed (validator says no).
+        let mut mp = Mempool::new(MempoolPolicy::default());
+        let view = view_with(&[(op(1), 10_000), (op(2), 10_000)]);
+        let p = ChainParams::devnet();
+        let cb = tx_spending(OutPoint::NULL, 1);
+        let back = tx_spending(op(1), 9_000);
+        let gone = tx_spending(op(2), 9_000);
+        let (back_id, gone_id) = (back.txid(), gone.txid());
+        let block = minibtc_primitives::Block {
+            header: minibtc_primitives::BlockHeader {
+                version: 1,
+                prev_hash: Hash256::ZERO,
+                merkle_root: Hash256::ZERO,
+                time: 0,
+                bits: 0,
+                nonce: 0,
+            },
+            txs: vec![cb, back, gone],
+        };
+        let n = mp.on_block_disconnected(&block, &view, &p, |tx| {
+            if tx.txid() == gone_id {
+                Err("input spent on the new chain".into())
+            } else {
+                Ok(Sats(1_000))
+            }
+        });
+        assert_eq!(n, 1);
+        assert!(mp.get(&back_id).is_some(), "still-valid tx re-admitted");
+        assert!(mp.get(&gone_id).is_none(), "conflicting tx dropped");
+        assert_eq!(mp.len(), 1, "the coinbase never enters the pool");
     }
 
     #[test]

@@ -4,9 +4,11 @@
 #   Phase 1  3 nodes connect; mine 120 blocks on N1 → all converge.
 #   Phase 2  Partition N3; N1 mines 40 more → N2 follows, N3 stale.
 #   Phase 3  Reconnect N3 → headers-first catch-up of 40 blocks.
-#   Phase 4  Isolate N3; it mines a 55-block private fork (height 216
-#            vs network 161) → reconnect → most-work reorg: N1+N2
-#            adopt N3's chain, orphaning N1's 55-block extension.
+#   Phase 4  Real competing fork. Isolate N3. N1 mines a 5-block branch
+#            (N2 follows it); N3 mines a heavier 55-block branch paying a
+#            different address. Reconnect N3 → N1 reorgs onto N3's branch,
+#            orphaning its own 5 blocks, and N2 — connected only to N1, a
+#            relay-only node — must follow the reorg through N1.
 #   Phase 5  Two wallets: A sends 10 BTC to B through the live network;
 #            one block confirms; B's balance reflects it.
 #
@@ -159,22 +161,35 @@ T3=$(date +%s)
 echo "  N3 catch-up time: $((T3-T2))s for $((H2-H1)) missed blocks"
 [ $((H2-H1)) -ge 50 ] || echo "  note: catch-up was $((H2-H1)) blocks"
 
-log "Phase 4: deliberate fork — N3 mines 55 solo, most-work reorg"
-# Isolate N3 (no --connect) and mine a heavier private fork.
+log "Phase 4: competing fork — N1 mines 5, isolated N3 mines 55, most-work reorg"
+# A different payout for N3's branch, so its blocks can never coincide
+# with N1's (any valid devnet P2PKH address works).
+ADDR_FORK="mqmLVoDnuDpSH4FyWn8enX3ksHVEDGX4Ke"
 stop_node "$D3"
 start_node N3-iso "$D3" $P3 $R3   # no connect → solo
-cli "$D3" $R3 mine generate 55 --address "$ADDR_A" >/dev/null
+
+# N1's competing branch; N2 (relay-only, connected to N1) follows it.
+cli "$D1" $R1 mine generate 5 --address "$ADDR_A" >/dev/null
+N1BR=$(tip "$D1" $R1)
+N1BH=${N1BR%% *}; N1BHASH=${N1BR##* }
+check "N1 branch height" "$N1BH" "$((H2+5))"
+wait_tip "$D2" $R2 "$N1BH" "$N1BHASH" 120 "N2 on N1's branch"
+
+# N3's heavier private branch from the same fork point.
+cli "$D3" $R3 mine generate 55 --address "$ADDR_FORK" >/dev/null
 FORK_TIP=$(tip "$D3" $R3)
 FH=${FORK_TIP%% *}; FHASH=${FORK_TIP##* }
-echo "  N3 fork tip: height=$FH hash=$FHASH (network at $H2)"
-check "N3 fork is ahead" "$((FH - H2))" "55"
+echo "  N1 branch tip: height=$N1BH hash=$N1BHASH"
+echo "  N3 branch tip: height=$FH hash=$FHASH (fork point $H2)"
+check "N3 branch is ahead of the fork point" "$((FH - H2))" "55"
+[ "$N1BHASH" != "$FHASH" ] && ok "the two branches differ" || bad "branches coincide"
 
-# Reconnect N3 → its taller chain must win via most-work.
+# Reconnect N3 → its heavier branch must win; N1 orphans its 5 blocks
+# and N2 must follow through N1 alone.
 stop_node "$D3"
 start_node N3 "$D3" $P3 $R3 "127.0.0.1:$P1"
-HASH2=$(tip "$D1" $R1 | cut -d' ' -f2)
-wait_tip "$D1" $R1 "$FH" "$FHASH" 240 "N1 reorged to N3 fork"
-wait_tip "$D2" $R2 "$FH" "$FHASH" 240 "N2 reorged to N3 fork"
+wait_tip "$D1" $R1 "$FH" "$FHASH" 240 "N1 reorged from its own branch to N3's"
+wait_tip "$D2" $R2 "$FH" "$FHASH" 240 "N2 (relay-only) followed the reorg through N1"
 wait_tip "$D3" $R3 "$FH" "$FHASH" 60 "N3 stable on its chain"
 ok "3-node convergence after most-work fork resolution"
 
@@ -189,7 +204,7 @@ BAL_A_BEFORE=$(cli "$D1" $R1 wallet balance --name alice --passphrase "$WALLET_P
 echo "  alice balance before: $BAL_A_BEFORE sats"
 
 SEND_OUT=$(cli "$D1" $R1 wallet send --name alice --to "$ADDR_B" --amount 10 \
-  --passphrase "$WALLET_PASS" 2>&1) || { bad "send failed: $SEND_OUT"; SEND_OUT=""; }
+  --passphrase "$WALLET_PASS" --yes 2>&1) || { bad "send failed: $SEND_OUT"; SEND_OUT=""; }
 echo "  send result: $(echo "$SEND_OUT" | head -3 | tr '\n' ' ')"
 TXID=$(echo "$SEND_OUT" | python3 -c 'import json,sys
 try:

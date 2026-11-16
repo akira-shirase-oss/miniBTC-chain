@@ -444,6 +444,25 @@ pub struct Chain {
     /// the invalid contents (CVE-2012-2459 cannot poison it).
     invalid: HashSet<Hash256>,
     invalid_order: VecDeque<Hash256>,
+    /// Blocks removed from the index since the last `take_dropped` (a
+    /// failed reorg's invalid block and descendants) — the persistence
+    /// layer deletes them so they do not come back on restart.
+    dropped: Vec<Hash256>,
+    /// What the last successful reorg switched, until `take_reorg`.
+    last_reorg: Option<ReorgReport>,
+    /// A fixed clock instead of the wall clock (`set_now`).
+    now_override: Option<u32>,
+}
+
+/// The blocks a reorg moved off and onto the active chain. Both stay in
+/// the index; the node uses this to re-admit the disconnected blocks'
+/// transactions and to repoint its transaction index.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReorgReport {
+    /// Blocks that left the active chain, old tip first.
+    pub disconnected: Vec<Hash256>,
+    /// Blocks that joined it, the fork point's child first.
+    pub connected: Vec<Hash256>,
 }
 
 impl Chain {
@@ -460,6 +479,9 @@ impl Chain {
             undos: HashMap::new(),
             invalid: HashSet::new(),
             invalid_order: VecDeque::new(),
+            dropped: Vec::new(),
+            last_reorg: None,
+            now_override: None,
         };
         // Genesis connects unconditionally: no prev to check, no PoW to
         // verify (it is definitionally valid), coinbase matures normally.
@@ -661,10 +683,20 @@ impl Chain {
                     }
                 }
                 self.tip = candidate;
+                self.last_reorg = Some(ReorgReport {
+                    disconnected: old_branch,
+                    connected: new_branch,
+                });
                 Ok(())
             }
             Err((bad, e)) => {
-                self.mark_invalid(bad);
+                // "Too far in the future" is a verdict about our clock, not
+                // the block (Core's BLOCK_TIME_FUTURE is never cached): keep
+                // the branch so a later block can retry once the clock
+                // catches up. Every other failure is a property of the block.
+                if !matches!(e, ChainError::InvalidBlock(BlockError::TimeTooNew { .. })) {
+                    self.mark_invalid(bad);
+                }
                 Err(e)
             }
         }
@@ -746,18 +778,25 @@ impl Chain {
     /// Drop `bad` and every indexed descendant (all side-branch blocks)
     /// and remember their hashes as invalid.
     fn mark_invalid(&mut self, bad: Hash256) {
+        // One pass builds parent → children, then a walk collects every
+        // descendant: O(index + descendants). Rescanning the whole index
+        // once per generation was O(index × depth), which a long cheap
+        // devnet side branch could trigger.
+        let mut children: HashMap<Hash256, Vec<Hash256>> = HashMap::new();
+        for (h, r) in &self.blocks {
+            children
+                .entry(r.block.header.prev_hash)
+                .or_default()
+                .push(*h);
+        }
         let mut doomed: HashSet<Hash256> = HashSet::from([bad]);
-        loop {
-            let more: Vec<Hash256> = self
-                .blocks
-                .iter()
-                .filter(|(h, r)| !doomed.contains(*h) && doomed.contains(&r.block.header.prev_hash))
-                .map(|(h, _)| *h)
-                .collect();
-            if more.is_empty() {
-                break;
+        let mut stack = vec![bad];
+        while let Some(h) = stack.pop() {
+            for c in children.get(&h).into_iter().flatten() {
+                if doomed.insert(*c) {
+                    stack.push(*c);
+                }
             }
-            doomed.extend(more);
         }
         for h in doomed {
             // Never drop an active block (cannot happen: `bad` is past the
@@ -767,7 +806,26 @@ impl Chain {
             }
             self.blocks.remove(&h);
             self.remember_invalid(h);
+            self.dropped.push(h);
         }
+    }
+
+    /// The last successful reorg, if one happened since the last call.
+    pub fn take_reorg(&mut self) -> Option<ReorgReport> {
+        self.last_reorg.take()
+    }
+
+    /// Hashes dropped from the index (invalid) since the last call. The
+    /// caller removes them from durable storage.
+    pub fn take_dropped(&mut self) -> Vec<Hash256> {
+        std::mem::take(&mut self.dropped)
+    }
+
+    /// Use `now` (unix seconds) as the clock for the future-time rule
+    /// instead of the wall clock; `None` restores the wall clock. For
+    /// deterministic tests and replays.
+    pub fn set_now(&mut self, now: Option<u32>) {
+        self.now_override = now;
     }
 
     /// Whether `hash` failed full validation.
@@ -790,6 +848,9 @@ impl Chain {
     /// For the in-memory chain we use wall clock via `std::time` — this is
     /// the ONE place chainstate touches a clock, isolated for tests.
     fn adjusted_time(&self) -> u32 {
+        if let Some(now) = self.now_override {
+            return now;
+        }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as u32)

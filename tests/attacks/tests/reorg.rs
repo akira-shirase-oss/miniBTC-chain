@@ -236,3 +236,128 @@ fn two_nodes_with_conflicting_spends_converge_on_one() {
         assert!(!confirmed(node, t1_id), "T1 must not be confirmed");
     }
 }
+
+#[test]
+fn a_failed_reorg_drops_every_descendant_of_the_invalid_block() {
+    // Off the main block at 100: B1 (invalid spend) with two stored
+    // descendant branches, x (to 105, equal work) and y (to 104). Block x6
+    // makes branch x heavier; the reorg fails at B1, and every descendant
+    // of B1 on both branches must go. The active chain stays.
+    let (mut chain, miner) = fresh_chain();
+    mine_empty(&mut chain, &miner, 105);
+    let tip = chain.tip;
+    let mut cur = chain.tip;
+    while chain.blocks[&cur].height > 100 {
+        cur = chain.blocks[&cur].block.header.prev_hash;
+    }
+    let fork = header_of(&chain, cur);
+    let other = new_key();
+    let ghost = OutPoint {
+        txid: minibtc_crypto::Hash256([0x77; 32]),
+        vout: 0,
+    };
+    let bad = signed_spend(
+        ghost,
+        &p2pkh_spk(&other),
+        Sats(10_000),
+        &other,
+        &p2pkh_spk(&other),
+        Sats(1_000),
+        Sats(1_000),
+    );
+    let b1 = child(&chain, &fork, 101, 40, &other, vec![bad]);
+    chain
+        .consider_block(b1.clone())
+        .unwrap_or_else(|e| panic!("{e:?}"));
+    let mut expected = vec![b1.header.block_hash()];
+    let mut branch = |chain: &mut Chain, first_dt: u32, to: u32| -> BlockHeader {
+        let key = new_key();
+        let mut parent = b1.header;
+        for (i, h) in (102..=to).enumerate() {
+            let dt = if i == 0 { first_dt } else { 31 };
+            let b = child(chain, &parent, h, dt, &key, vec![]);
+            parent = b.header;
+            expected.push(b.header.block_hash());
+            chain.consider_block(b).unwrap_or_else(|e| panic!("{e:?}"));
+        }
+        parent
+    };
+    let x5 = branch(&mut chain, 31, 105);
+    let _y4 = branch(&mut chain, 33, 104);
+    assert_eq!(chain.tip, tip, "equal or less work: still side branches");
+    let x6 = child(&chain, &x5, 106, 31, &other, vec![]);
+    expected.push(x6.header.block_hash());
+    assert!(
+        chain.consider_block(x6).is_err(),
+        "reorg onto B1's branch fails"
+    );
+
+    assert_eq!(chain.tip, tip);
+    for h in &expected {
+        assert!(!chain.blocks.contains_key(h), "descendant of B1 kept");
+        assert!(chain.is_invalid(h));
+    }
+    let mut dropped = chain.take_dropped();
+    dropped.sort();
+    expected.sort();
+    assert_eq!(dropped, expected);
+}
+
+#[test]
+fn a_block_too_far_in_the_future_is_retried_not_marked_invalid() {
+    // "Too far in the future" depends on the clock, not on the block: if
+    // the clock steps back after a side block was stored, a reorg can fail
+    // on that rule. Bitcoin Core never caches it as invalid; neither may we.
+    let (mut chain, miner) = fresh_chain();
+    mine_empty(&mut chain, &miner, 105);
+    let tip = chain.tip;
+    let mut cur = chain.tip;
+    while chain.blocks[&cur].height > 103 {
+        cur = chain.blocks[&cur].block.header.prev_hash;
+    }
+    let fork = header_of(&chain, cur);
+    let key = new_key();
+    // B104 is timestamped well ahead; B105 and B106 are not (they only need
+    // to beat the median of the past 11 blocks).
+    let b104 = child(&chain, &fork, 104, 10_000, &key, vec![]);
+    chain.consider_block(b104.clone()).unwrap();
+    let mut b105 = child(&chain, &b104.header, 105, 0, &key, vec![]);
+    b105.header.time = fork.time + 200;
+    b105 = remine(b105);
+    chain.consider_block(b105.clone()).unwrap();
+    // The clock steps back: B104 is now more than 2 hours ahead of it.
+    let max_future = chain.params.max_future_time_secs;
+    chain.set_now(Some(b104.header.time - max_future - 1_000));
+    let mut b106 = child(&chain, &b105.header, 106, 0, &key, vec![]);
+    b106.header.time = fork.time + 300;
+    b106 = remine(b106);
+    assert!(
+        chain.consider_block(b106.clone()).is_err(),
+        "reorg fails on B104's time"
+    );
+    assert_eq!(chain.tip, tip);
+    assert!(
+        !chain.is_invalid(&b104.header.block_hash()),
+        "a time-too-new block must not be remembered as invalid"
+    );
+    assert!(
+        chain.take_dropped().is_empty(),
+        "nothing dropped from the index"
+    );
+
+    // The clock is right again: the next block on the branch reorgs onto it.
+    chain.set_now(None);
+    let b107 = child(&chain, &b106.header, 107, 31, &key, vec![]);
+    chain
+        .consider_block(b107.clone())
+        .unwrap_or_else(|e| panic!("branch must still be usable: {e:?}"));
+    assert_eq!(chain.tip, b107.header.block_hash());
+}
+
+/// Re-mine `block` after changing its header or transactions.
+fn remine(mut block: Block) -> Block {
+    block.header.merkle_root = merkle_root(&block.txs);
+    block.header.nonce = 0;
+    block.header = mine_header(block.header);
+    block
+}

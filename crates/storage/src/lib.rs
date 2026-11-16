@@ -41,6 +41,14 @@ const ADDRINDEX: TableDefinition<'_, &[u8], &[u8]> = TableDefinition::new("addri
 /// Table: single-row "meta" → chain params fingerprint + genesis hash.
 const CHAINMETA: TableDefinition<'_, &[u8], &[u8]> = TableDefinition::new("chainmeta");
 
+/// Version of the consensus rules a datadir's chain was validated under,
+/// stored in chainmeta under `rules`. Bump it whenever a consensus change
+/// makes previously stored blocks invalid. 1 = everything before the
+/// 2026-11-16 hardening (no key written); 2 = BIP34 coinbase heights,
+/// BIP30, the bits schedule and pow limit enforced (D-013, D-014).
+pub const RULES_VERSION: u32 = 2;
+const RULES_KEY: &[u8] = b"rules";
+
 /// Storage errors.
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -56,6 +64,20 @@ pub enum StoreError {
     /// redb commit failure.
     #[error("redb commit: {0}")]
     Commit(#[from] redb::CommitError),
+    /// The datadir was written under different consensus rules.
+    #[error(
+        "this datadir was written under consensus rules v{found}, but this node enforces \
+         v{expected} (BIP34 coinbase heights and the difficulty schedule, D-013/D-014); its \
+         chain would be rejected by every up-to-date node. Start with a fresh --datadir, or \
+         run once with --reindex to rebuild it under the current rules (blocks that are \
+         invalid under them are discarded)"
+    )]
+    RulesVersion {
+        /// Version recorded in the datadir (1 when absent).
+        found: u32,
+        /// `RULES_VERSION`.
+        expected: u32,
+    },
     /// redb transaction failure.
     #[error("redb txn: {0}")]
     Txn(#[from] redb::TransactionError),
@@ -145,6 +167,7 @@ impl Store {
             cm.hash256(&chain.genesis);
             cm.hash256(&chain.tip);
             chainmeta.insert(&b"chain"[..], cm.into_bytes().as_slice())?;
+            chainmeta.insert(RULES_KEY, RULES_VERSION.to_le_bytes().as_slice())?;
 
             // Blocks + meta + txindex + addrindex inputs.
             let mut addr_map: std::collections::BTreeMap<Vec<u8>, Vec<u8>> =
@@ -265,6 +288,7 @@ impl Store {
             cm.hash256(&chain.genesis);
             cm.hash256(hash);
             chainmeta.insert(&b"chain"[..], cm.into_bytes().as_slice())?;
+            chainmeta.insert(RULES_KEY, RULES_VERSION.to_le_bytes().as_slice())?;
         }
         txn.commit()?;
         Ok(())
@@ -354,6 +378,13 @@ impl Store {
         };
         if blocks_t.is_empty()? {
             return Ok(None);
+        }
+        let found = self.rules_version()?;
+        if found != RULES_VERSION {
+            return Err(StoreError::RulesVersion {
+                found,
+                expected: RULES_VERSION,
+            });
         }
         // Snapshot writes all tables atomically — a missing sibling table
         // alongside blocks means corruption.
@@ -476,55 +507,147 @@ impl Store {
 
     /// Rebuild the chain by replaying every stored block through full
     /// validation — the integrity path. Discards all derived state first.
+    ///
+    /// Blocks are replayed in height order (generation by generation from
+    /// genesis) through [`Chain::consider_block`], so side branches are
+    /// stored and activated exactly as when they arrived, and the result is
+    /// the most-work *valid* chain: work only grows during the replay, and
+    /// any valid block with more work than the current tip triggers its
+    /// reorg when it is replayed. Within a height, blocks on the recorded
+    /// tip's path go first (so an equal-work tie keeps the chain the node
+    /// had), then by hash — the outcome never depends on map order.
+    /// A block that fails is skipped with its descendants; it is not fatal.
+    /// Blocks not reachable from genesis are ignored. Call
+    /// [`Self::snapshot`] on the result to write the rejected blocks out.
     pub fn reindex(&self, params: ChainParams, genesis: Block) -> Result<Chain, StoreError> {
-        let txn = self.db.begin_read()?;
-        let Some(blocks_t) = opt_table(&txn, BLOCKS)? else {
-            // Empty store → replay just genesis.
-            return Ok(Chain::new(params.clone(), genesis)?);
-        };
-        let mut blocks: Vec<Block> = Vec::new();
-        for row in blocks_t.iter()? {
-            let (_, v) = row?;
-            blocks.push(
-                Block::decode(v.value(), params.max_block_txs, params.max_block_size)
-                    .map_err(|e| StoreError::Corrupt(format!("block decode: {e}")))?,
-            );
-        }
-        drop(blocks_t);
-        drop(txn);
-
-        // Order by height via prev-chain walk from tips: simplest correct
-        // approach — repeatedly connect any block whose parent is known.
         let genesis_hash = genesis.header.block_hash();
-        let mut chain = Chain::new(params.clone(), genesis)?;
-        let mut pending: std::collections::HashMap<Hash256, Block> = blocks
-            .into_iter()
-            .map(|b| (b.header.block_hash(), b))
-            .collect();
-        pending.remove(&genesis_hash);
-        // Iteratively connect blocks whose prev is the tip or known.
-        loop {
-            let tip_hash = chain.tip;
-            // Find a pending block building on tip.
-            let next = pending
-                .values()
-                .find(|b| b.header.prev_hash == tip_hash)
-                .map(|b| b.header.block_hash());
-            match next {
-                Some(h) => {
-                    let b = pending
-                        .remove(&h)
-                        .ok_or_else(|| StoreError::Corrupt("pending block vanished".into()))?;
-                    chain.connect_tip(b)?;
-                }
-                None => break,
+        let mut by_hash: std::collections::HashMap<Hash256, Block> =
+            std::collections::HashMap::new();
+        {
+            let txn = self.db.begin_read()?;
+            let Some(blocks_t) = opt_table(&txn, BLOCKS)? else {
+                // Empty store → replay just genesis.
+                return Ok(Chain::new(params, genesis)?);
+            };
+            for row in blocks_t.iter()? {
+                let (_, v) = row?;
+                let b = Block::decode(v.value(), params.max_block_txs, params.max_block_size)
+                    .map_err(|e| StoreError::Corrupt(format!("block decode: {e}")))?;
+                by_hash.insert(b.header.block_hash(), b);
             }
         }
-        // Any leftovers are side-branch — consider them for completeness.
-        for (_, b) in pending {
-            let _ = chain.consider_block(b);
+        by_hash.remove(&genesis_hash);
+        let recorded_tip = self.recorded_tip()?;
+
+        // parent → children, and the recorded tip's ancestry.
+        let mut children: std::collections::HashMap<Hash256, Vec<Hash256>> =
+            std::collections::HashMap::new();
+        for (h, b) in &by_hash {
+            children.entry(b.header.prev_hash).or_default().push(*h);
         }
+        let mut preferred = std::collections::HashSet::new();
+        let mut cur = recorded_tip;
+        while let Some(h) = cur
+            && let Some(b) = by_hash.get(&h)
+            && preferred.insert(h)
+        {
+            cur = Some(b.header.prev_hash);
+        }
+
+        let mut chain = Chain::new(params, genesis)?;
+        let mut generation = vec![genesis_hash];
+        while !generation.is_empty() {
+            let mut next: Vec<Hash256> = generation
+                .iter()
+                .filter_map(|p| children.get(p))
+                .flatten()
+                .copied()
+                .collect();
+            next.sort_by_key(|h| (!preferred.contains(h), *h));
+            let mut survivors = Vec::with_capacity(next.len());
+            for h in next {
+                let Some(b) = by_hash.remove(&h) else {
+                    continue;
+                };
+                // Invalid blocks are skipped (and their descendants with
+                // them); the chain remembers what a failed reorg dropped.
+                if chain.consider_block(b).is_ok() && chain.blocks.contains_key(&h) {
+                    survivors.push(h);
+                }
+            }
+            generation = survivors;
+        }
+        let _ = chain.take_dropped(); // not in the rebuilt index; snapshot drops them
         Ok(chain)
+    }
+
+    /// The consensus-rules version recorded in the datadir (1 when the
+    /// key is absent: written before versions were recorded).
+    pub fn rules_version(&self) -> Result<u32, StoreError> {
+        let txn = self.db.begin_read()?;
+        let Some(t) = opt_table(&txn, CHAINMETA)? else {
+            return Ok(1);
+        };
+        let Some(g) = t.get(RULES_KEY)? else {
+            return Ok(1);
+        };
+        let b = g.value();
+        if b.len() != 4 {
+            return Err(StoreError::Corrupt("bad rules version".into()));
+        }
+        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    /// The tip recorded by the last snapshot/append, if any.
+    fn recorded_tip(&self) -> Result<Option<Hash256>, StoreError> {
+        let txn = self.db.begin_read()?;
+        let Some(t) = opt_table(&txn, CHAINMETA)? else {
+            return Ok(None);
+        };
+        let Some(g) = t.get(&b"chain"[..])? else {
+            return Ok(None);
+        };
+        let b = g.value();
+        if b.len() < 64 {
+            return Ok(None);
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&b[32..64]);
+        Ok(Some(Hash256(arr)))
+    }
+
+    /// Delete blocks (bytes, index meta, and tx-index entries that point at
+    /// them) — for blocks the chain dropped as invalid, so a restart does
+    /// not load them back. Missing hashes are ignored.
+    pub fn delete_blocks(&self, hashes: &[Hash256]) -> Result<(), StoreError> {
+        if hashes.is_empty() {
+            return Ok(());
+        }
+        let txn = self.db.begin_write()?;
+        {
+            let mut blocks = txn.open_table(BLOCKS)?;
+            let mut meta = txn.open_table(META)?;
+            let mut txindex = txn.open_table(TXINDEX)?;
+            for h in hashes {
+                let bytes = blocks.remove(h.as_bytes())?.map(|g| g.value().to_vec());
+                if let Some(bytes) = bytes
+                    && let Ok(b) = Block::decode(&bytes, usize::MAX, usize::MAX)
+                {
+                    for tx in &b.txs {
+                        let txid = tx.txid();
+                        let points_here = txindex
+                            .get(txid.as_bytes())?
+                            .is_some_and(|g| g.value() == h.as_bytes());
+                        if points_here {
+                            txindex.remove(txid.as_bytes())?;
+                        }
+                    }
+                }
+                meta.remove(h.as_bytes())?;
+            }
+        }
+        txn.commit()?;
+        Ok(())
     }
 
     /// The consistency proof: replay stored blocks fresh and compare the

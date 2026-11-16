@@ -215,6 +215,22 @@ fn persist_wallet(
     save_indices(datadir, name, indices)
 }
 
+/// Write the wallet's watch-only file (public scripts; owner-only, atomic)
+/// so the CLI's `wallet draft` and the MCP gate also work for wallets
+/// created or used here. Same format and writer as the CLI.
+fn write_watch(datadir: &Path, name: &str, w: &mut Wallet) -> Result<()> {
+    wallet_path(datadir, name)?; // validates the name
+    let path = minibtc_wallet::watch::watch_file_path(datadir, name);
+    minibtc_wallet::watch::write_watch_file(&path, w, GAP_LIMIT)?;
+    Ok(())
+}
+
+/// Bytes of the watch file, for callers that hold a session lock (build
+/// under the lock, write after releasing it).
+fn watch_bytes(w: &mut Wallet) -> Option<Vec<u8>> {
+    minibtc_wallet::watch::watch_json(w, GAP_LIMIT).ok()
+}
+
 fn save_indices(datadir: &Path, name: &str, indices: (u32, u32)) -> Result<()> {
     let path = wallet_path(datadir, name)?.with_extension("state.json");
     let state = json!({ "next_receive": indices.0, "next_change": indices.1 });
@@ -756,8 +772,12 @@ async fn seed_confirm(
         }
         Err(e) => return err_page(&format!("derive failed: {e}")).into_response(),
     };
+    let mut wallet = wallet;
     let indices = wallet.indices();
     if let Err(e) = persist_wallet(&app.datadir, &name, &p.seed, pass, indices) {
+        return err_page(&format!("save failed: {e}")).into_response();
+    }
+    if let Err(e) = write_watch(&app.datadir, &name, &mut wallet) {
         return err_page(&format!("save failed: {e}")).into_response();
     }
     let Some(token) = open_session(&app, &name, wallet) else {
@@ -844,6 +864,9 @@ async fn restore_submit(
     if let Err(e) = persist_wallet(&app.datadir, &name, &seed, pass, indices) {
         return err_page(&format!("save failed: {e}")).into_response();
     }
+    if let Err(e) = write_watch(&app.datadir, &name, &mut wallet) {
+        return err_page(&format!("save failed: {e}")).into_response();
+    }
     let Some(token) = open_session(&app, &name, wallet) else {
         return err_page("too many sessions").into_response();
     };
@@ -878,7 +901,10 @@ async fn unlock(
 
     let wallet = match load_wallet(&app.datadir, &name, &app.params, pass) {
         Ok(mut w) => {
-            w.prime_lookahead(GAP_LIMIT).ok();
+            // Refreshes the watch file (and primes the lookahead window).
+            if write_watch(&app.datadir, &name, &mut w).is_err() {
+                w.prime_lookahead(GAP_LIMIT).ok();
+            }
             w
         }
         Err(_) => {
@@ -1232,9 +1258,14 @@ async fn send_build(
     let inputs = tx.inputs.len();
     let name = sess.name.clone();
     let indices = sess.wallet.indices();
+    let watch = watch_bytes(&mut sess.wallet);
     drop(sessions);
     if let Err(e) = save_indices(&app.datadir, &name, indices) {
         return fail(format!("failed to persist wallet indices: {e}"));
+    }
+    if let Some(bytes) = watch {
+        let path = minibtc_wallet::watch::watch_file_path(&app.datadir, &name);
+        let _ = minibtc_wallet::watch::write_watch_bytes(&path, &bytes);
     }
 
     {

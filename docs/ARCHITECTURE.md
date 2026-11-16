@@ -64,7 +64,12 @@ Hard rules:
 ## Consistency story
 
 - **UTXO set** is derived state, rebuildable by replaying blocks
-  (`--reindex`). Storage commits a block, its undo data and index updates in
+  (`--reindex`). Reindex replays the stored blocks in height order through
+  `consider_block` (recorded-tip path first, then by hash), so it always
+  ends on the most-work valid chain; a stored block that fails is skipped
+  with its descendants, never fatal, and the following snapshot writes it
+  out. Blocks a failed reorg drops are deleted from disk immediately
+  (`Chain::take_dropped` → `Store::delete_blocks`). Storage commits a block, its undo data and index updates in
   one redb transaction.
 - **Block apply is atomic.** Connect applies a block's transactions to a
   `UtxoOverlay` (reads fall through to the UTXO set, writes stay in the
@@ -84,8 +89,10 @@ Hard rules:
   connected; otherwise the failing block and its descendants are marked
   invalid and the node keeps its old tip and UTXO set
   (`tests/attacks/tests/reorg.rs`).
-- **Mempool** is local policy: removed on connect, re-added (re-validated)
-  on disconnect.
+- **Mempool** is local policy: removed on connect; after a reorg the
+  disconnected blocks' transactions are re-validated against the new chain
+  and re-admitted (oldest block first; conflicts and already-confirmed ones
+  drop). The node's tx index covers the active chain only.
 - **Wallet** state is local files under the datadir; it learns chain facts
   only through RPC.
 

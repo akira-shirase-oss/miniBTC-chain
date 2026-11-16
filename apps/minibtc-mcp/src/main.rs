@@ -29,6 +29,7 @@ use minibtc_rpc::client::RpcClient;
 use rmcp::ServiceExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -219,15 +220,28 @@ pub fn decode_tx_hex(hex: &str) -> Result<Transaction> {
     Transaction::decode(&bytes).context("transaction bytes")
 }
 
+/// Indices of `tx`'s outputs that pay one of the wallet's own scripts.
+pub fn change_outputs(tx: &Transaction, wallet_scripts: &HashSet<Vec<u8>>) -> Vec<usize> {
+    tx.outputs
+        .iter()
+        .enumerate()
+        .filter(|(_, o)| wallet_scripts.contains(&o.script_pubkey))
+        .map(|(i, _)| i)
+        .collect()
+}
+
 /// The gate `request_send` applies before broadcasting: there must be a
-/// signed form, it must be exactly the draft plus signatures, the wallet
-/// must agree with the drafter about which output is change, and the
-/// spend computed from the signed bytes (`input_values` from the node)
-/// must fit both caps. Returns the signed tx and its spend.
+/// signed form, it must be exactly the draft plus signatures, and the
+/// spend computed from the signed bytes must fit both caps. Input values
+/// come from the node; which outputs are change comes from the wallet's
+/// watch-only scripts (`wallet_scripts`), never from the draft or approval
+/// files — those are plain JSON a process could relabel to dodge the caps.
+/// Returns the signed tx and its spend.
 pub fn check_send(
     draft: &Draft,
     signed: Option<&SignedDraft>,
     input_values: &[minibtc_primitives::Sats],
+    wallet_scripts: &HashSet<Vec<u8>>,
     max_spend_sats: u64,
     spent_today_sats: u64,
     max_daily_sats: u64,
@@ -243,11 +257,8 @@ pub fn check_send(
     };
     let signed_tx = decode_tx_hex(&signed.signed_hex)?;
     minibtc_wallet::draft::matches_draft(&unsigned, &signed_tx)?;
-    let drafted_change: Vec<usize> = draft.change_index.into_iter().collect();
-    if signed.change_outputs != drafted_change {
-        anyhow::bail!("change output disagrees between draft and approval");
-    }
-    let s = minibtc_wallet::draft::spend_summary(&signed_tx, input_values, &drafted_change)?;
+    let change = change_outputs(&signed_tx, wallet_scripts);
+    let s = minibtc_wallet::draft::spend_summary(&signed_tx, input_values, &change)?;
     let spend = s.spend.sats();
     if spend > max_spend_sats {
         anyhow::bail!("spend {spend} sats exceeds the per-request cap {max_spend_sats}");
@@ -399,6 +410,8 @@ mod tests {
     use super::*;
     use minibtc_primitives::{OutPoint, Sats, TxInput, TxOutput};
 
+    /// Output 0 pays the payee (script 0xaa); any further output pays the
+    /// wallet's own change script (0xbb).
     fn tx(signed: bool, outputs: &[u64]) -> Transaction {
         Transaction {
             version: 1,
@@ -412,13 +425,18 @@ mod tests {
             }],
             outputs: outputs
                 .iter()
-                .map(|v| TxOutput {
+                .enumerate()
+                .map(|(i, v)| TxOutput {
                     value: Sats(*v),
-                    script_pubkey: vec![0x51],
+                    script_pubkey: if i == 0 { vec![0xaa] } else { vec![0xbb] },
                 })
                 .collect(),
             locktime: 0,
         }
+    }
+
+    fn wallet() -> HashSet<Vec<u8>> {
+        HashSet::from([vec![0xbb]])
     }
 
     fn draft(outputs: &[u64], change: Option<usize>) -> Draft {
@@ -457,7 +475,7 @@ mod tests {
         let rec = d.signed(&dir);
         let _ = std::fs::remove_dir_all(&dir);
         assert!(rec.is_none());
-        let err = check_send(&d, rec.as_ref(), &[Sats(1_000)], CAP, 0, CAP).unwrap_err();
+        let err = check_send(&d, rec.as_ref(), &[Sats(1_000)], &wallet(), CAP, 0, CAP).unwrap_err();
         assert!(err.to_string().contains("not approved"), "{err}");
     }
 
@@ -469,6 +487,7 @@ mod tests {
             &d,
             Some(&signed(&[700, 200], &[1])),
             &[Sats(1_000)],
+            &wallet(),
             CAP,
             0,
             CAP,
@@ -476,13 +495,24 @@ mod tests {
         .unwrap();
         assert_eq!(spend, 800);
         // Different outputs behind the same draft id: refused.
-        assert!(check_send(&d, Some(&signed(&[900], &[])), &[Sats(1_000)], CAP, 0, CAP).is_err());
+        assert!(
+            check_send(
+                &d,
+                Some(&signed(&[900], &[])),
+                &[Sats(1_000)],
+                &wallet(),
+                CAP,
+                0,
+                CAP
+            )
+            .is_err()
+        );
         // An unsigned "signed" record: refused.
         let unsigned = SignedDraft {
             signed_hex: d.unsigned_hex.clone(),
             change_outputs: vec![1],
         };
-        assert!(check_send(&d, Some(&unsigned), &[Sats(1_000)], CAP, 0, CAP).is_err());
+        assert!(check_send(&d, Some(&unsigned), &[Sats(1_000)], &wallet(), CAP, 0, CAP).is_err());
     }
 
     #[test]
@@ -490,13 +520,55 @@ mod tests {
         let d = draft(&[700, 200], Some(1));
         let s = signed(&[700, 200], &[1]);
         // Per-request cap below the decoded spend (800).
-        assert!(check_send(&d, Some(&s), &[Sats(1_000)], 799, 0, CAP).is_err());
+        assert!(check_send(&d, Some(&s), &[Sats(1_000)], &wallet(), 799, 0, CAP).is_err());
         // Daily cap: 300 already spent today, 1,000 allowed.
-        assert!(check_send(&d, Some(&s), &[Sats(1_000)], CAP, 300, 1_000).is_err());
-        assert!(check_send(&d, Some(&s), &[Sats(1_000)], CAP, 200, 1_000).is_ok());
-        // An approval that relabels the payment output as change is refused.
+        assert!(check_send(&d, Some(&s), &[Sats(1_000)], &wallet(), CAP, 300, 1_000).is_err());
+        assert!(check_send(&d, Some(&s), &[Sats(1_000)], &wallet(), CAP, 200, 1_000).is_ok());
+    }
+
+    #[test]
+    fn relabelling_the_payment_as_change_cannot_dodge_the_cap() {
+        // Both JSON files claim output 0 (the payment) is change. The gate
+        // ignores them: change is what pays the wallet's own scripts, so
+        // the spend is still 700 + fee 100 = 800, above a 799 cap.
+        let mut d = draft(&[700, 200], Some(0));
+        d.change_index = Some(0);
         let relabelled = signed(&[700, 200], &[0]);
-        assert!(check_send(&d, Some(&relabelled), &[Sats(1_000)], CAP, 0, CAP).is_err());
+        assert!(
+            check_send(
+                &d,
+                Some(&relabelled),
+                &[Sats(1_000)],
+                &wallet(),
+                799,
+                0,
+                CAP
+            )
+            .is_err()
+        );
+        let (_, spend) = check_send(
+            &d,
+            Some(&relabelled),
+            &[Sats(1_000)],
+            &wallet(),
+            CAP,
+            0,
+            CAP,
+        )
+        .unwrap();
+        assert_eq!(spend, 800);
+        // With no wallet scripts known, every output counts as leaving.
+        let (_, all) = check_send(
+            &d,
+            Some(&relabelled),
+            &[Sats(1_000)],
+            &HashSet::new(),
+            CAP,
+            0,
+            CAP,
+        )
+        .unwrap();
+        assert_eq!(all, 1_000);
     }
 
     #[test]

@@ -307,3 +307,51 @@ fn side_block_is_persisted_without_touching_chain_state() {
         Some(minibtc_chainstate::BlockStatus::Inactive)
     );
 }
+
+/// The table the store keeps chain-level metadata in (same definition as
+/// the crate's private one) — used to fake a datadir written by an older
+/// binary, which never wrote a rules version.
+const CHAINMETA_T: redb::TableDefinition<'_, &[u8], &[u8]> =
+    redb::TableDefinition::new("chainmeta");
+
+fn strip_rules_version(dir: &std::path::Path) {
+    let fail = |e: &dyn std::fmt::Debug| -> ! { panic!("redb: {e:?}") };
+    let db = redb::Database::create(dir.join("minibtc.redb")).unwrap_or_else(|e| fail(&e));
+    let txn = db.begin_write().unwrap_or_else(|e| fail(&e));
+    {
+        let mut t = txn.open_table(CHAINMETA_T).unwrap_or_else(|e| fail(&e));
+        let _ = t.remove(&b"rules"[..]).unwrap_or_else(|e| fail(&e));
+    }
+    txn.commit().unwrap_or_else(|e| fail(&e));
+}
+
+#[test]
+fn datadir_from_older_consensus_rules_is_refused() {
+    // A datadir written before the current rules (BIP34, bits schedule)
+    // must not load silently: the node would keep extending a chain no
+    // fresh node accepts.
+    let (chain, _m, params) = build_chain(3);
+    let (dir, _g) = tempdir();
+    {
+        let store = Store::open(&dir).unwrap();
+        store.snapshot(&chain).unwrap();
+    }
+    strip_rules_version(&dir);
+    let store = Store::open(&dir).unwrap();
+    let genesis = chain.blocks[&chain.genesis].block.clone();
+    let err = store
+        .load(params.clone(), genesis.clone())
+        .err()
+        .unwrap_or_else(|| panic!("an old-rules datadir loaded silently"));
+    let msg = err.to_string();
+    assert!(
+        msg.contains("--reindex") && msg.contains("fresh"),
+        "the error must say how to recover: {msg}"
+    );
+
+    // Reindex is the way forward: it rewrites the store under the
+    // current rules, and the datadir then loads.
+    let rebuilt = store.reindex(params.clone(), genesis.clone()).unwrap();
+    store.snapshot(&rebuilt).unwrap();
+    assert!(store.load(params, genesis).unwrap().is_some());
+}
