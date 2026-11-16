@@ -63,6 +63,32 @@ pub enum BlockError {
     /// A non-first tx was coinbase-shaped.
     #[error("non-first transaction is coinbase-shaped")]
     StrayCoinbase,
+    /// `bits` is not what the retarget schedule requires after the
+    /// parent (Bitcoin Core's `bad-diffbits`).
+    #[error("bad difficulty bits 0x{got:08x}, schedule requires 0x{expected:08x}")]
+    BadDiffBits {
+        /// The block's bits.
+        got: u32,
+        /// The bits the schedule requires.
+        expected: u32,
+    },
+}
+
+/// The chain context a block is judged in. The caller derives every field
+/// from the block's **parent** (never from the active tip), so a side
+/// branch is judged by its own history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockContext {
+    /// Height of the block being validated.
+    pub height: u64,
+    /// The compact bits the retarget schedule requires for this block
+    /// (see [`crate::pow::next_bits_for_period`]).
+    pub expected_bits: u32,
+    /// Median time of the parent and its ancestors (up to
+    /// `params.median_time_span` blocks).
+    pub median_time_past: u32,
+    /// The validating node's adjusted clock.
+    pub adjusted_time: u32,
 }
 
 /// Result of validating a block's transactions: total fees collected.
@@ -130,7 +156,8 @@ impl<V: UtxoView> UtxoView for BlockView<'_, V> {
 /// [`BlockView`]). Checks, in order:
 ///
 /// 1. merkle root matches txs (with CVE-2012-2459 ambiguity check);
-/// 2. PoW: `bits` decodes and `hash <= target`;
+/// 2. PoW: `bits` decodes, its target is not above the pow limit, and
+///    `hash <= target`;
 /// 3. size/tx-count limits;
 /// 4. first tx is coinbase-shaped; no other tx is;
 /// 5. every non-coinbase tx passes [`validate_tx`] against the pre-block
@@ -140,40 +167,56 @@ impl<V: UtxoView> UtxoView for BlockView<'_, V> {
 /// 6. coinbase outputs ≤ subsidy(height) + fees — checked;
 /// 7. sigop total ≤ limit.
 ///
-/// Timestamp rules need chain context (median-time-past, adjusted time)
-/// — those live in [`crate::chaindb`] where the block index exists; this
-/// function takes `adjusted_time`/`median_time_past` as inputs when the
-/// caller wants them checked via [`validate_block_with_time`].
+/// Rules that need chain context — the retarget schedule (`bits`),
+/// median-time-past and the future-time limit — are checked only by
+/// [`validate_block_in_context`]; this function is for callers (and tests)
+/// that isolate the other rules. The node always uses the contextual form.
 pub fn validate_block<V: UtxoView>(
     block: &Block,
     view: &V,
     params: &ChainParams,
     height: u64,
 ) -> Result<BlockValidation, BlockError> {
-    validate_block_with_time(block, view, params, height, None, None)
+    validate_block_inner(block, view, params, height, None)
 }
 
-/// [`validate_block`] plus optional timestamp policy checks.
-///
-/// `adjusted_time` — our clock's median-adjusted time (caller computes).
-/// `median_time_past` — median of up to `params.median_time_span` previous
-/// block times (caller computes from the index). Pass `Some` for both to
-/// enforce; `None` skips (used by tests that isolate other rules).
-pub fn validate_block_with_time<V: UtxoView>(
+/// [`validate_block`] plus every contextual header rule from `ctx`:
+/// `bits` must equal `ctx.expected_bits`, the timestamp must exceed
+/// `ctx.median_time_past` and be at most `ctx.adjusted_time +
+/// params.max_future_time_secs`.
+pub fn validate_block_in_context<V: UtxoView>(
+    block: &Block,
+    view: &V,
+    params: &ChainParams,
+    ctx: &BlockContext,
+) -> Result<BlockValidation, BlockError> {
+    validate_block_inner(block, view, params, ctx.height, Some(ctx))
+}
+
+fn validate_block_inner<V: UtxoView>(
     block: &Block,
     view: &V,
     params: &ChainParams,
     height: u64,
-    adjusted_time: Option<u32>,
-    median_time_past: Option<u32>,
+    ctx: Option<&BlockContext>,
 ) -> Result<BlockValidation, BlockError> {
     // 1. Merkle (includes ambiguity check).
     check_merkle_root(&block.header, &block.txs)?;
 
-    // 2. PoW.
+    // 2. PoW: target in range (not above the pow limit), hash meets it.
+    pow::checked_target(block.header.bits, params)?;
     let target = pow::target_for_bits(block.header.bits)?;
     if !block.header.check_pow(&target) {
         return Err(PowError::BadBits(block.header.bits).into());
+    }
+    // Contextual: the retarget schedule fixes `bits` exactly.
+    if let Some(ctx) = ctx
+        && block.header.bits != ctx.expected_bits
+    {
+        return Err(BlockError::BadDiffBits {
+            got: block.header.bits,
+            expected: ctx.expected_bits,
+        });
     }
 
     // 3. Limits.
@@ -234,16 +277,20 @@ pub fn validate_block_with_time<V: UtxoView>(
     // Coinbase must have exactly one output? No — Bitcoin allows many
     // outputs (payout splitting); we allow it too.
 
-    // Timestamp policy when context is supplied.
-    if let (Some(adj), Some(mtp)) = (adjusted_time, median_time_past) {
-        if block.header.time > adj.saturating_add(params.max_future_time_secs) {
+    // Timestamp rules when context is supplied.
+    if let Some(ctx) = ctx {
+        if block.header.time
+            > ctx
+                .adjusted_time
+                .saturating_add(params.max_future_time_secs)
+        {
             return Err(BlockError::TimeTooNew {
                 block_time: block.header.time,
-                adjusted_time: adj,
+                adjusted_time: ctx.adjusted_time,
                 max_future: params.max_future_time_secs,
             });
         }
-        if block.header.time <= mtp {
+        if block.header.time <= ctx.median_time_past {
             return Err(BlockError::TimeTooOld);
         }
     }

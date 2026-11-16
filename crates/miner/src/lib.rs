@@ -11,7 +11,7 @@
 //!   optional cancellation via `AtomicBool`.
 //! - [`next_bits`] — difficulty retarget per params (clamped ×4).
 
-use minibtc_consensus::{ChainParams, retarget_bits};
+use minibtc_consensus::{ChainParams, next_bits_for_period};
 #[cfg(test)]
 use minibtc_crypto::Keypair;
 use minibtc_primitives::{
@@ -181,22 +181,16 @@ pub fn assemble(template: &Template, header: BlockHeader) -> Block {
     }
 }
 
-/// Compute the `bits` for the block after `prev_bits`, given the actual
-/// timespan of the last retarget period. Delegates to consensus retarget.
+/// Compute the `bits` for the first block of a new period after
+/// `prev_bits`, given the actual timespan of the period. Delegates to the
+/// consensus rule (`next_bits_for_period`) so a mined block always carries
+/// the bits validation requires.
 pub fn next_bits(
     params: &ChainParams,
     prev_bits: u32,
     actual_span_secs: u64,
 ) -> Result<u32, MineError> {
-    let target_span = u64::from(params.pow_target_spacing)
-        .saturating_mul(u64::from(params.pow_target_timespan_blocks));
-    retarget_bits(
-        prev_bits,
-        actual_span_secs,
-        target_span,
-        params.pow_clamp_factor,
-    )
-    .map_err(MineError::Bits)
+    next_bits_for_period(params, prev_bits, actual_span_secs).map_err(MineError::Bits)
 }
 
 /// Quick helper: does `hash` meet the target? Exposed for tests.

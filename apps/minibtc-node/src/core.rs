@@ -424,7 +424,8 @@ impl Node {
                     .ok_or(minibtc_chainstate::ChainError::NotTip)?;
                 let h = inner.chain.height() as u64 + 1;
                 let time = candidate_time(&inner);
-                let bits = next_bits(&inner, tip_rec)?;
+                // The schedule validation enforces — one implementation.
+                let bits = inner.chain.next_bits_after(inner.chain.tip)?;
                 let txs = inner.mempool.txs_by_fee_rate();
                 let t = minibtc_miner::build_template(
                     &self.params,
@@ -483,40 +484,6 @@ fn candidate_time(inner: &NodeInner) -> u32 {
         .unwrap_or(0);
     now.max(mtp.saturating_add(1))
         .max(tip_time.saturating_add(1))
-}
-
-/// Bits for the next block: prev bits, retargeted at period boundaries.
-fn next_bits(
-    inner: &NodeInner,
-    tip_rec: &minibtc_chainstate::IndexedBlock,
-) -> Result<u32, NodeError> {
-    let interval = inner.chain.params.pow_target_timespan_blocks;
-    // The block being built sits at tip+1 — retarget iff ITS height is a
-    // multiple of the interval (Bitcoin's nHeight+1 rule).
-    let new_height = inner.chain.height().saturating_add(1);
-    if interval == 0 || !new_height.is_multiple_of(interval) {
-        return Ok(tip_rec.block.header.bits);
-    }
-    // Span = tip.time − time of block `interval` back from the new height.
-    let target_h = new_height.saturating_sub(interval);
-    let old_time = block_at_height(inner, target_h)
-        .and_then(|h| inner.chain.blocks.get(&h))
-        .map(|r| r.block.header.time)
-        .unwrap_or(tip_rec.block.header.time);
-    let span = u64::from(tip_rec.block.header.time.saturating_sub(old_time));
-    let target_span = u64::from(inner.chain.params.pow_target_spacing)
-        .saturating_mul(u64::from(inner.chain.params.pow_target_timespan_blocks));
-    minibtc_consensus::pow::retarget_bits(
-        tip_rec.block.header.bits,
-        span,
-        target_span,
-        inner.chain.params.pow_clamp_factor,
-    )
-    .map_err(|e| {
-        NodeError::Chain(minibtc_chainstate::ChainError::InvalidBlock(
-            minibtc_consensus::BlockError::Pow(e),
-        ))
-    })
 }
 
 impl NodeInner {

@@ -13,6 +13,8 @@
 
 use minibtc_crypto::Hash256;
 
+use crate::params::ChainParams;
+
 /// Errors decoding compact bits.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PowError {
@@ -22,14 +24,27 @@ pub enum PowError {
     /// Retarget inputs were degenerate.
     #[error("bad retarget input: {0}")]
     BadRetarget(&'static str),
+    /// The target is easier than the network's proof-of-work limit.
+    #[error("target of bits 0x{bits:08x} is above the pow limit 0x{limit:08x}")]
+    AboveLimit {
+        /// The block's compact bits.
+        bits: u32,
+        /// The network's `pow_limit_bits`.
+        limit: u32,
+    },
 }
 
+/// The compact format's sign bit (`0x00800000`). Bitcoin treats a set
+/// sign bit as a negative target, which `CheckProofOfWork` rejects.
+const COMPACT_SIGN_BIT: u32 = 0x0080_0000;
+
 /// Decode compact `bits` → 256-bit target as **big-endian** bytes (the
-/// integer's canonical order).
+/// integer's canonical order). Zero, negative (sign bit set) and
+/// overflowing encodings are rejected.
 pub fn decode_compact(bits: u32) -> Result<[u8; 32], PowError> {
     let exponent = (bits >> 24) as i64;
     let mantissa = bits & 0x007f_ffff;
-    if mantissa == 0 {
+    if mantissa == 0 || bits & COMPACT_SIGN_BIT != 0 {
         return Err(PowError::BadBits(bits));
     }
     let mut out = [0u8; 32];
@@ -74,7 +89,9 @@ pub fn decode_compact(bits: u32) -> Result<[u8; 32], PowError> {
 
 /// Encode a 256-bit big-endian target back to compact bits (round-trip
 /// helper — precision loss beyond 3 mantissa bytes is inherent to the
-/// format, same as Bitcoin).
+/// format, same as Bitcoin). Like Core's `GetCompact`, a mantissa whose
+/// top bit is set is shifted down one byte (exponent + 1) so the value
+/// never lands on the sign bit.
 pub fn encode_compact(target: &[u8; 32]) -> u32 {
     let mut i = 0usize;
     while i < 32 && target[i] == 0 {
@@ -90,7 +107,61 @@ pub fn encode_compact(target: &[u8; 32]) -> u32 {
         let b = if idx < 32 { u32::from(target[idx]) } else { 0 };
         mantissa = (mantissa << 8) | b;
     }
+    let mut exponent = exponent;
+    if mantissa & COMPACT_SIGN_BIT != 0 {
+        mantissa >>= 8;
+        exponent = exponent.saturating_add(1);
+    }
     (exponent << 24) | mantissa
+}
+
+/// The 256-bit big-endian target for `bits`, checked against the
+/// network's limit: Bitcoin Core's `CheckProofOfWork` range check
+/// (non-zero, not negative, no overflow, not above `powLimit`).
+pub fn checked_target(bits: u32, params: &ChainParams) -> Result<[u8; 32], PowError> {
+    let target = decode_compact(bits)?;
+    let limit = decode_compact(params.pow_limit_bits)?;
+    if target > limit {
+        return Err(PowError::AboveLimit {
+            bits,
+            limit: params.pow_limit_bits,
+        });
+    }
+    Ok(target)
+}
+
+/// Whether the block at `height` starts a new difficulty period (Bitcoin:
+/// `(pindexLast->nHeight + 1) % interval == 0`).
+pub fn is_retarget_height(params: &ChainParams, height: u64) -> bool {
+    let interval = u64::from(params.pow_target_timespan_blocks);
+    height > 0 && interval > 0 && height.is_multiple_of(interval)
+}
+
+/// Bits for the first block of a new period — Bitcoin Core's
+/// `CalculateNextWorkRequired`. `actual_span_secs` is the parent's time
+/// minus the time of the period's first block. The span is clamped to
+/// `[target / clamp, target × clamp]`, the target scales by
+/// `span / target_span`, and the result is capped at the pow limit.
+pub fn next_bits_for_period(
+    params: &ChainParams,
+    parent_bits: u32,
+    actual_span_secs: u64,
+) -> Result<u32, PowError> {
+    let target_span = u64::from(params.pow_target_spacing)
+        .saturating_mul(u64::from(params.pow_target_timespan_blocks));
+    if target_span == 0 {
+        return Err(PowError::BadRetarget("zero target timespan"));
+    }
+    let clamp = u64::from(params.pow_clamp_factor.max(1));
+    let span = actual_span_secs.clamp(
+        (target_span / clamp).max(1),
+        target_span.saturating_mul(clamp),
+    );
+    let old = decode_compact(parent_bits)?;
+    let wide = mul_wide256(&old, span);
+    let new = div_wide_by_u64(&wide, target_span)?;
+    let limit = decode_compact(params.pow_limit_bits)?;
+    Ok(encode_compact(if new > limit { &limit } else { &new }))
 }
 
 /// The PoW target for a block's `bits`, returned in the byte order
@@ -127,8 +198,15 @@ pub fn retarget_bits(
     let wide = mul_wide256(&old_target, actual_span_secs);
     let new_target = div_wide_by_u64(&wide, target_span_secs)?;
     let clamped = clamp_target(&new_target, &old_target, u64::from(clamp_factor.max(1)))?;
-    Ok(encode_compact(&clamped))
+    // Never emit bits the decoder refuses: cap at the largest target the
+    // compact format round-trips here (0x207fffff). Consensus callers use
+    // `next_bits_for_period`, which caps at the (smaller or equal) limit.
+    let max = decode_compact(MAX_COMPACT_BITS)?;
+    Ok(encode_compact(if clamped > max { &max } else { &clamped }))
 }
+
+/// The easiest target `decode_compact` accepts.
+const MAX_COMPACT_BITS: u32 = 0x207f_ffff;
 
 /// `a * factor` where `a` is 32-byte big-endian and `factor` ≤ u64::MAX.
 /// Saturates at 2^256−1 on overflow (safe direction: harder, never easier).
@@ -206,8 +284,10 @@ fn mul_wide256(a: &[u8; 32], factor: u64) -> [u8; 40] {
     product
 }
 
-/// Divide a 40-byte big-endian value by a u64; returns the LOW 32 bytes
-/// of the quotient (i.e. mod 2^256 — Bitcoin's wrap semantics).
+/// Divide a 40-byte big-endian value by a u64. A quotient above 2^256 − 1
+/// saturates (the safe direction: callers cap it at the pow limit).
+/// Wrapping it mod 2^256 turned a slow period at the devnet limit into a
+/// tiny target — mining became *harder* when blocks were slow.
 fn div_wide_by_u64(a: &[u8; 40], divisor: u64) -> Result<[u8; 32], PowError> {
     if divisor == 0 {
         return Err(PowError::BadRetarget("zero divisor"));
@@ -220,6 +300,9 @@ fn div_wide_by_u64(a: &[u8; 40], divisor: u64) -> Result<[u8; 32], PowError> {
         let q = rem / d;
         rem %= d;
         quot[i] = q as u8;
+    }
+    if quot[..8].iter().any(|&b| b != 0) {
+        return Ok([0xff; 32]);
     }
     let mut out = [0u8; 32];
     out.copy_from_slice(&quot[8..40]);

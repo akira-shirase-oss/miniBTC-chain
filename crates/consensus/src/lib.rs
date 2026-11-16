@@ -17,10 +17,14 @@ pub mod subsidy;
 pub mod txval;
 
 pub use blockval::{
-    BlockError, BlockValidation, median_time_past, validate_block, validate_block_with_time,
+    BlockContext, BlockError, BlockValidation, median_time_past, validate_block,
+    validate_block_in_context,
 };
 pub use genesis::{genesis_block, genesis_key, genesis_secret};
 pub use params::{ChainParams, ParamsError};
-pub use pow::{PowError, decode_compact, encode_compact, retarget_bits, target_for_bits};
+pub use pow::{
+    PowError, checked_target, decode_compact, encode_compact, is_retarget_height,
+    next_bits_for_period, retarget_bits, target_for_bits,
+};
 pub use subsidy::{SubsidyError, max_coinbase_value, subsidy_at};
 pub use txval::{TxError, UtxoView, validate_tx};

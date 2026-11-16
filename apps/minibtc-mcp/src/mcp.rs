@@ -1262,8 +1262,12 @@ const CONSENSUS_DOCS: &str = r#"# MiniBTC consensus rules (devnet preset)
 
 - **Proof of work**: block hash (double-SHA-256 of the 80-byte header,
   displayed reversed) must be ≤ the target encoded in `bits` (compact
-  format). Target retargets every 20 blocks toward 30-second spacing,
-  clamped to a ×4/÷4 factor per period. Genesis/limit bits: 0x207fffff.
+  format), and that target may not be easier than the pow limit
+  (0x207fffff; zero/negative encodings are invalid). `bits` must equal
+  the retarget schedule's value after the block's parent: unchanged
+  inside a period; every 20 blocks the target rescales by how long the
+  last period took against 20 × 30 s (span clamped ×4/÷4, result capped
+  at the limit). Validation enforces this, not just the miner.
 - **Subsidy**: 50 BTC (5_000_000_000 sats) at height 0, halving every
   150 blocks. Coinbase may claim subsidy + collected fees, nothing more.
 - **Maturity**: coinbase outputs are unspendable for 100 confirmations.

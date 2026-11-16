@@ -134,6 +134,24 @@ MiniBTC's posture:
   the attack lab's simulation hook — it performs only the spec'd
   encoding and does not assess entropy quality.
 
+### D-013 — Proof-of-work schedule is a validation rule (2026-11-16)
+
+Retargeting used to live only in the node's miner: validation checked
+`hash <= target(bits)` but never which `bits` a block may claim. A peer
+could choose any difficulty. Validation now matches Bitcoin Core's
+`ContextualCheckBlockHeader`/`CheckProofOfWork`: `bits` must equal
+`Chain::next_bits_after(parent)` (parent's bits inside a period; at a
+boundary `next_bits_for_period`, i.e. span clamped to `[T/4, 4T]`,
+target rescaled, capped at `pow_limit_bits`) and the target may not be
+above the pow limit. The miner calls the same function. Two encoding
+bugs were fixed with it: `encode_compact` now shifts a mantissa whose
+top bit is set (Core's `GetCompact`; the sign bit used to swallow it),
+`decode_compact` rejects negative encodings, and the retarget division
+saturates instead of wrapping mod 2^256 (a slow period at the devnet
+limit used to make mining *harder*). Consequence: devnet datadirs
+written before this change may hold blocks whose bits no longer match
+the schedule; `--reindex` would refuse them. Start such devnets fresh.
+
 ## Open questions
 
 - None blocking. Post-v1 candidates if revisited: SegWit/Taproot sighash

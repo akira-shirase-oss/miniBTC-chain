@@ -18,7 +18,10 @@
 //! agree — the consistency test replays blocks into a fresh chain and
 //! compares UTXO sets hash-for-hash.
 
-use minibtc_consensus::{BlockError, ChainParams, UtxoView, validate_block_with_time};
+use minibtc_consensus::{
+    BlockContext, BlockError, ChainParams, UtxoView, is_retarget_height, next_bits_for_period,
+    validate_block_in_context,
+};
 use minibtc_crypto::Hash256;
 use minibtc_primitives::{Block, OutPoint, Transaction, TxOutput};
 use std::collections::HashMap;
@@ -454,17 +457,9 @@ impl Chain {
         let work = self.header_work(&block.header)?;
         let cum_work = parent.cum_work.saturating_add(work);
 
-        // Validate against current UTXO set (blockval needs a view).
-        let adjusted = Some(self.adjusted_time());
-        let mtp = self.median_time_past();
-        validate_block_with_time(
-            &block,
-            &self.utxos,
-            &self.params,
-            u64::from(height),
-            adjusted,
-            mtp,
-        )?;
+        // Validate against current UTXO set, in the parent's context.
+        let ctx = self.context_for(block.header.prev_hash)?;
+        validate_block_in_context(&block, &self.utxos, &self.params, &ctx)?;
 
         let undo = self.apply_block_at(&block, height)?;
         self.blocks.insert(
@@ -543,16 +538,8 @@ impl Chain {
         // order during reorg for exactness — documented limitation; the
         // reorg path re-validates each block at connect time anyway via
         // apply (missing prevouts error there).
-        let adjusted = Some(self.adjusted_time());
-        let mtp = self.median_time_past();
-        validate_block_with_time(
-            &block,
-            &self.utxos,
-            &self.params,
-            u64::from(height),
-            adjusted,
-            mtp,
-        )?;
+        let ctx = self.context_for(parent_hash)?;
+        validate_block_in_context(&block, &self.utxos, &self.params, &ctx)?;
 
         if parent_hash == self.tip {
             // Direct extension.
@@ -675,11 +662,73 @@ impl Chain {
         now
     }
 
-    /// Median of up to `median_time_span` past block times (newest first).
-    /// Public so the miner/RPC can compute candidate timestamps.
+    /// The context a block whose parent is `parent` is validated in —
+    /// height, required bits, median-time-past, all from the parent's own
+    /// ancestry (never the active tip's).
+    pub fn context_for(&self, parent: Hash256) -> Result<BlockContext, ChainError> {
+        let rec = self
+            .blocks
+            .get(&parent)
+            .ok_or(ChainError::UnknownPrev(parent))?;
+        Ok(BlockContext {
+            height: u64::from(rec.height) + 1,
+            expected_bits: self.next_bits_after(parent)?,
+            median_time_past: self.median_time_past_at(parent).unwrap_or(0),
+            adjusted_time: self.adjusted_time(),
+        })
+    }
+
+    /// The compact bits a block built on `parent` must carry — Bitcoin
+    /// Core's `GetNextWorkRequired`: the parent's bits, except at a period
+    /// boundary, where the target is rescaled by how long the period took
+    /// (parent time − time of the period's first block). The miner and
+    /// validation both use this, so they can never disagree.
+    pub fn next_bits_after(&self, parent: Hash256) -> Result<u32, ChainError> {
+        let rec = self
+            .blocks
+            .get(&parent)
+            .ok_or(ChainError::UnknownPrev(parent))?;
+        let height = u64::from(rec.height) + 1;
+        if !is_retarget_height(&self.params, height) {
+            return Ok(rec.block.header.bits);
+        }
+        // First block of the period: interval − 1 blocks before the parent.
+        let first_height = rec
+            .height
+            .saturating_add(1)
+            .saturating_sub(self.params.pow_target_timespan_blocks);
+        let first = self
+            .ancestor_at(parent, first_height)
+            .ok_or(ChainError::UnknownPrev(parent))?;
+        let span = u64::from(
+            rec.block
+                .header
+                .time
+                .saturating_sub(first.block.header.time),
+        );
+        next_bits_for_period(&self.params, rec.block.header.bits, span)
+            .map_err(|e| ChainError::InvalidBlock(BlockError::Pow(e)))
+    }
+
+    /// The ancestor of `from` (inclusive) at `height`, walking the index.
+    pub fn ancestor_at(&self, from: Hash256, height: u32) -> Option<&IndexedBlock> {
+        let mut cur = self.blocks.get(&from)?;
+        while cur.height > height {
+            cur = self.blocks.get(&cur.block.header.prev_hash)?;
+        }
+        (cur.height == height).then_some(cur)
+    }
+
+    /// Median of up to `median_time_span` past block times (newest first)
+    /// at the tip. Public so the miner/RPC can compute candidate timestamps.
     pub fn median_time_past(&self) -> Option<u32> {
+        self.median_time_past_at(self.tip)
+    }
+
+    /// Median time of `from` and its ancestors (up to `median_time_span`).
+    pub fn median_time_past_at(&self, from: Hash256) -> Option<u32> {
         let mut times: Vec<u32> = Vec::with_capacity(self.params.median_time_span);
-        let mut cur = self.tip;
+        let mut cur = from;
         loop {
             let rec = self.blocks.get(&cur)?;
             times.push(rec.block.header.time);

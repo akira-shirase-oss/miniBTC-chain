@@ -66,7 +66,9 @@ fn build_block(
         prev_hash: prev.block_hash(),
         merkle_root: mr,
         time,
-        bits: params.pow_limit_bits,
+        // Parent's bits: what the schedule requires off a period boundary
+        // (these tests never cross one).
+        bits: prev.bits,
         nonce: 0,
     });
     Block { header, txs }
