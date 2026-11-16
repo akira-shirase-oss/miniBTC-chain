@@ -205,8 +205,10 @@ the model — as human approval. Now:
 Honest limit: an agent that has a shell *and* the wallet passphrase (for
 example exported in the same shell) can always run `minibtc-cli wallet
 send` itself; no MCP gate can stop that. Keep the passphrase out of any
-environment an agent can read. The passphrase prompt echoes (same as the
-CLI's other prompts; tracked with the CLI items). Existing wallets need
+environment an agent can read. Every CLI passphrase prompt (and the
+mnemonic prompt of `wallet restore`) reads with terminal echo off,
+switched off before the prompt appears (`stty -echo`, restored on exit;
+the read fails closed if echo cannot be disabled). Existing wallets need
 one passphrase-unlocked command (e.g. `wallet balance`) to write their
 watch-only file.
 

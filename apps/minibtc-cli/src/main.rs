@@ -97,9 +97,10 @@ enum WalletCmd {
     Restore {
         #[arg(long)]
         name: String,
-        /// The mnemonic words.
+        /// The mnemonic words. Omit it to type the words at a hidden prompt
+        /// instead (keeps them out of shell history and the process list).
         #[arg(long)]
-        mnemonic: String,
+        mnemonic: Option<String>,
         #[arg(long)]
         passphrase: Option<String>,
         #[arg(long)]
@@ -139,6 +140,10 @@ enum WalletCmd {
         fee_rate: u64,
         #[arg(long)]
         passphrase: Option<String>,
+        /// Broadcast without the interactive confirmation (for scripts; the
+        /// prompt is only shown when stdin is a terminal anyway).
+        #[arg(long)]
+        yes: bool,
     },
     /// Build an UNSIGNED payment from the wallet's watch-only file (public
     /// scripts only — no passphrase, no keys). Used by the MCP
@@ -345,11 +350,7 @@ fn keystore_passphrase(flag: Option<&str>, required: bool) -> Result<String> {
         return Ok(p);
     }
     if required {
-        eprint!("Keystore passphrase: ");
-        std::io::stderr().flush()?;
-        let mut line = String::new();
-        std::io::stdin().read_line(&mut line)?;
-        return Ok(line.trim_end().to_string());
+        return read_secret("Keystore passphrase: ");
     }
     Ok(String::new())
 }
@@ -440,6 +441,59 @@ fn require_interactive() -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Terminal echo switched off for as long as this guard lives (`stty
+/// -echo` on the terminal that is our stdin; `stty echo` on drop, also on
+/// error paths). No dependency needed on the unix systems this devnet
+/// targets.
+struct EchoOff;
+
+impl EchoOff {
+    fn new() -> Result<Self> {
+        let status = std::process::Command::new("stty")
+            .arg("-echo")
+            .stdin(std::process::Stdio::inherit())
+            .status()
+            .context("run stty to turn terminal echo off")?;
+        if !status.success() {
+            anyhow::bail!("could not turn terminal echo off; refusing to read a secret visibly");
+        }
+        Ok(Self)
+    }
+}
+
+impl Drop for EchoOff {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("stty")
+            .arg("echo")
+            .stdin(std::process::Stdio::inherit())
+            .status();
+    }
+}
+
+/// Read a secret after `prompt` without showing it. On a terminal, echo is
+/// off while the line is read (and the read fails closed if echo cannot be
+/// switched off); off a terminal (a script piping it in) there is nothing
+/// to echo to and the line is read as is.
+fn read_secret(prompt: &str) -> Result<String> {
+    use std::io::IsTerminal;
+    let mut line = String::new();
+    if std::io::stdin().is_terminal() {
+        // Echo goes off BEFORE the prompt appears: the terminal echoes keys
+        // as they are typed, so anything typed between the prompt and
+        // `stty -echo` would otherwise still be shown.
+        let _echo_off = EchoOff::new()?;
+        eprint!("{prompt}");
+        std::io::stderr().flush()?;
+        std::io::stdin().read_line(&mut line)?;
+        eprintln!(); // the Enter key was not echoed either
+    } else {
+        eprint!("{prompt}");
+        std::io::stderr().flush()?;
+        std::io::stdin().read_line(&mut line)?;
+    }
+    Ok(line.trim_end().to_string())
 }
 
 /// Read one line typed at the terminal after `prompt`.
@@ -594,7 +648,7 @@ async fn approve_draft(
     let tx = minibtc_primitives::Transaction::decode(&bytes).context("decode draft")?;
     ensure_unsigned(&tx)?;
 
-    let pp = prompt_line("Wallet passphrase (approves this payment): ")?;
+    let pp = read_secret("Wallet passphrase (approves this payment): ")?;
     let mut w = load_wallet(datadir, name, params, &pp)?;
     drop(pp);
     w.prime_lookahead(GAP_LIMIT)?;
@@ -722,6 +776,10 @@ async fn wallet_cmd(
             passphrase,
             mnemonic_passphrase,
         } => {
+            let mnemonic = match mnemonic {
+                Some(m) => m,
+                None => read_secret("Mnemonic words: ")?,
+            };
             let pp = keystore_passphrase(passphrase.as_deref(), true)?;
             let bip39_pass = mnemonic_passphrase
                 .or_else(|| std::env::var(BIP39_PASSPHRASE_ENV).ok())
@@ -808,6 +866,7 @@ async fn wallet_cmd(
             amount,
             fee_rate,
             passphrase,
+            yes,
         } => {
             let sats = parse_amount(&amount)?;
             let dest = Address::from_base58(&to, Some(params.address_version))
@@ -822,6 +881,35 @@ async fn wallet_cmd(
                 .context("build transaction")?;
             let txid = tx.txid();
             let hex = hex_encode(&tx.encode());
+            if !yes && std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                // Show exactly what was signed before it leaves the machine.
+                let in_sum: u64 = tx
+                    .inputs
+                    .iter()
+                    .filter_map(|i| w.utxos().iter().find(|u| u.outpoint == i.prev))
+                    .map(|u| u.output.value.sats())
+                    .sum();
+                let out_sum: u64 = tx.outputs.iter().map(|o| o.value.sats()).sum();
+                eprintln!("About to broadcast {}:", txid.to_hex());
+                for (i, o) in tx.outputs.iter().enumerate() {
+                    let addr = minibtc_wallet::draft::p2pkh_address(
+                        &o.script_pubkey,
+                        params.address_version,
+                    )
+                    .map(|a| a.to_string())
+                    .unwrap_or_else(|| hex_encode(&o.script_pubkey));
+                    let role = if w.owns_script(&o.script_pubkey) {
+                        "change"
+                    } else {
+                        "payment"
+                    };
+                    eprintln!("  output {i}: {} sats -> {addr} [{role}]", o.value.sats());
+                }
+                eprintln!("  fee: {} sats", in_sum.saturating_sub(out_sum));
+                if !prompt_line("Broadcast this transaction? [y/N] ")?.eq_ignore_ascii_case("y") {
+                    anyhow::bail!("not sent");
+                }
+            }
             match client.sendrawtransaction(&hex).await {
                 Ok(ret) => {
                     if json_out {

@@ -204,7 +204,7 @@ BAL_A_BEFORE=$(cli "$D1" $R1 wallet balance --name alice --passphrase "$WALLET_P
 echo "  alice balance before: $BAL_A_BEFORE sats"
 
 SEND_OUT=$(cli "$D1" $R1 wallet send --name alice --to "$ADDR_B" --amount 10 \
-  --passphrase "$WALLET_PASS" 2>&1) || { bad "send failed: $SEND_OUT"; SEND_OUT=""; }
+  --passphrase "$WALLET_PASS" --yes 2>&1) || { bad "send failed: $SEND_OUT"; SEND_OUT=""; }
 echo "  send result: $(echo "$SEND_OUT" | head -3 | tr '\n' ' ')"
 TXID=$(echo "$SEND_OUT" | python3 -c 'import json,sys
 try:
