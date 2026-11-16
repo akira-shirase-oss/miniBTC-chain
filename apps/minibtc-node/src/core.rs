@@ -305,6 +305,36 @@ pub fn open(datadir: &Path, params: ChainParams, reindex: bool) -> Result<Node, 
     })
 }
 
+/// A memory-only node (no datadir, no store) for in-process tests.
+#[cfg(test)]
+pub(crate) fn in_memory(params: ChainParams) -> Node {
+    let genesis = genesis_block(&params);
+    let chain = minibtc_chainstate::Chain::new(params.clone(), genesis)
+        .unwrap_or_else(|e| panic!("genesis: {e:?}"));
+    let tip = chain.tip;
+    let mut sync = Sync::new(params.clone(), tip);
+    sync.note_have(tip);
+    let inner = NodeInner {
+        chain,
+        mempool: Mempool::new(MempoolPolicy::default()),
+        peers: PeerManager::new(),
+        sync,
+        addrbook: Vec::new(),
+        txindex: HashMap::new(),
+        pending: PendingBlocks::default(),
+        requests: BlockRequests::default(),
+        claimed: HashMap::new(),
+        dialing: HashSet::new(),
+    };
+    Node {
+        params,
+        inner: Arc::new(Mutex::new(inner)),
+        store: None,
+        peer_tx: Arc::new(Mutex::new(HashMap::new())),
+        cancel: Arc::new(AtomicBool::new(false)),
+    }
+}
+
 /// Node errors (binary-facing; anyhow wraps at the edge).
 #[derive(Debug, thiserror::Error)]
 pub enum NodeError {
