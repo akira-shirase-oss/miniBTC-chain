@@ -769,18 +769,25 @@ impl Chain {
     /// Drop `bad` and every indexed descendant (all side-branch blocks)
     /// and remember their hashes as invalid.
     fn mark_invalid(&mut self, bad: Hash256) {
+        // One pass builds parent → children, then a walk collects every
+        // descendant: O(index + descendants). Rescanning the whole index
+        // once per generation was O(index × depth), which a long cheap
+        // devnet side branch could trigger.
+        let mut children: HashMap<Hash256, Vec<Hash256>> = HashMap::new();
+        for (h, r) in &self.blocks {
+            children
+                .entry(r.block.header.prev_hash)
+                .or_default()
+                .push(*h);
+        }
         let mut doomed: HashSet<Hash256> = HashSet::from([bad]);
-        loop {
-            let more: Vec<Hash256> = self
-                .blocks
-                .iter()
-                .filter(|(h, r)| !doomed.contains(*h) && doomed.contains(&r.block.header.prev_hash))
-                .map(|(h, _)| *h)
-                .collect();
-            if more.is_empty() {
-                break;
+        let mut stack = vec![bad];
+        while let Some(h) = stack.pop() {
+            for c in children.get(&h).into_iter().flatten() {
+                if doomed.insert(*c) {
+                    stack.push(*c);
+                }
             }
-            doomed.extend(more);
         }
         for h in doomed {
             // Never drop an active block (cannot happen: `bad` is past the
