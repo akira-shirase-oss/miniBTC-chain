@@ -3,7 +3,10 @@
 //! structural checks (decode, merkle, PoW) — ordered cheapest-first.
 
 use minibtc_crypto::Hash256;
-use minibtc_primitives::{Block, BlockHeader, MerkleError, Sats, check_merkle_root};
+use minibtc_primitives::{
+    Block, BlockHeader, MerkleError, OutPoint, Sats, Transaction, TxOutput, check_merkle_root,
+};
+use std::collections::{HashMap, HashSet};
 
 use crate::params::ChainParams;
 use crate::pow::{self, PowError};
@@ -71,14 +74,69 @@ pub struct BlockValidation {
     pub sigops: usize,
 }
 
+/// The view transaction *i* of a block is validated against: the
+/// pre-block view, plus outputs created by transactions `0..i` of the same
+/// block, minus the outpoints they spent — the per-block coins cache
+/// Bitcoin Core's `ConnectBlock` uses. Without it, two transactions can
+/// spend one coin (CVE-2018-17144's inflation case) and a child can never
+/// spend its parent in the same block.
+#[derive(Debug)]
+struct BlockView<'a, V: UtxoView> {
+    base: &'a V,
+    created: HashMap<OutPoint, TxOutput>,
+    spent: HashSet<OutPoint>,
+}
+
+impl<'a, V: UtxoView> BlockView<'a, V> {
+    fn new(base: &'a V) -> Self {
+        Self {
+            base,
+            created: HashMap::new(),
+            spent: HashSet::new(),
+        }
+    }
+
+    /// Record a validated transaction: its inputs are spent for every
+    /// later transaction, its outputs exist for them.
+    fn record(&mut self, tx: &Transaction, is_coinbase: bool) {
+        if !is_coinbase {
+            self.spent.extend(tx.inputs.iter().map(|i| i.prev));
+        }
+        let txid = tx.txid();
+        for (vout, out) in tx.outputs.iter().enumerate() {
+            let op = OutPoint {
+                txid,
+                vout: vout as u32,
+            };
+            self.created.insert(op, out.clone());
+        }
+    }
+}
+
+impl<V: UtxoView> UtxoView for BlockView<'_, V> {
+    fn get(&self, op: &OutPoint) -> Option<TxOutput> {
+        if self.spent.contains(op) {
+            return None;
+        }
+        if let Some(out) = self.created.get(op) {
+            return Some(out.clone());
+        }
+        self.base.get(op)
+    }
+}
+
 /// Validate a full block against the UTXO view *as it was before this
-/// block*. Checks, in order:
+/// block*; each transaction sees the effects of the ones before it (see
+/// [`BlockView`]). Checks, in order:
 ///
 /// 1. merkle root matches txs (with CVE-2012-2459 ambiguity check);
 /// 2. PoW: `bits` decodes and `hash <= target`;
 /// 3. size/tx-count limits;
 /// 4. first tx is coinbase-shaped; no other tx is;
-/// 5. every non-coinbase tx passes [`validate_tx`];
+/// 5. every non-coinbase tx passes [`validate_tx`] against the pre-block
+///    view updated by the earlier txs of this block (coinbase outputs
+///    included — spending them is refused by the maturity rule at
+///    connect time);
 /// 6. coinbase outputs ≤ subsidy(height) + fees — checked;
 /// 7. sigop total ≤ limit.
 ///
@@ -142,14 +200,17 @@ pub fn validate_block_with_time<V: UtxoView>(
         let _ = i;
     }
 
-    // 5./6./7. Transactions, fees, sigops.
+    // 5./6./7. Transactions, fees, sigops — tx i sees txs 0..i.
     let mut total_fees = Sats::ZERO;
     let mut sigops = 0usize;
+    let mut block_view = BlockView::new(view);
+    block_view.record(coinbase, true);
     for (i, tx) in block.txs.iter().enumerate().skip(1) {
-        let fee = validate_tx(tx, view, params).map_err(|e| BlockError::Tx {
+        let fee = validate_tx(tx, &block_view, params).map_err(|e| BlockError::Tx {
             index: i,
             source: e,
         })?;
+        block_view.record(tx, false);
         total_fees = total_fees
             .checked_add(fee)
             .ok_or(BlockError::Limits("fee overflow"))?;
