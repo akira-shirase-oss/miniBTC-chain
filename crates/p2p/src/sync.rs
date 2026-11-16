@@ -32,18 +32,47 @@ pub const SEEN_CAPACITY: usize = 100_000;
 /// Max getdata items per request message.
 pub const GETDATA_BATCH: usize = 1_000;
 
+/// Most headers-only entries (headers whose blocks have not connected yet)
+/// one peer may have in the header index. Entries leave when their block
+/// connects or the peer disconnects.
+pub const HEADERS_PER_PEER: usize = BLOCK_WINDOW;
+
 /// Errors from sync decisions.
 #[derive(Debug, thiserror::Error)]
 pub enum SyncError {
-    /// A headers chain broke linkage (prev_hash mismatch).
+    /// A header does not link to a known block or header.
     #[error("headers chain broken at {0}")]
     BrokenChain(Hash256),
     /// Header failed validation (bad PoW, bad time, bad bits).
     #[error("header invalid: {0}")]
     BadHeader(String),
-    /// We already have this block — nothing to fetch.
-    #[error("already have block")]
-    HaveBlock,
+    /// More headers in one message than `HEADERS_BATCH`.
+    #[error("{0} headers in one message (max {max})", max = HEADERS_BATCH)]
+    TooMany(usize),
+    /// The same header twice in one message.
+    #[error("header {0} repeated within one message")]
+    Repeated(Hash256),
+    /// The peer already has `HEADERS_PER_PEER` unconnected headers indexed.
+    #[error("peer exceeded its share of unconnected headers")]
+    PeerQuota,
+    /// An unsolicited headers message that contained nothing new.
+    #[error("unsolicited headers message with nothing new")]
+    NothingNew,
+}
+
+/// What header validation needs about a block or header: height, compact
+/// bits, timestamp and parent. The node supplies it for blocks in its
+/// index; the sync state keeps it for headers whose blocks it lacks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeaderInfo {
+    /// Height (genesis = 0).
+    pub height: u32,
+    /// Compact difficulty bits.
+    pub bits: u32,
+    /// Timestamp.
+    pub time: u32,
+    /// Parent hash.
+    pub prev: Hash256,
 }
 
 /// Per-peer download progress.
@@ -55,6 +84,9 @@ pub struct PeerDownload {
     pub wanted: VecDeque<Hash256>,
     /// Last time this peer sent us anything useful.
     pub last_progress: u64,
+    /// `getheaders` sent to this peer and not yet answered: an answer
+    /// that brings nothing new is expected then, not a fault.
+    pub headers_requested: u32,
 }
 
 /// The sync coordinator — one per node.
@@ -71,11 +103,11 @@ pub struct Sync {
     seen_set: HashSet<Hash256>,
     /// Per-peer download state.
     peers: HashMap<SocketAddr, PeerDownload>,
-    /// Headers accepted but whose blocks we haven't fetched yet —
-    /// the "headers chain" we're working through.
-    pending_headers: VecDeque<BlockHeader>,
-    /// Next expected prev_hash for the pending header chain.
-    expect_prev: Option<Hash256>,
+    /// Headers accepted whose blocks have not connected yet, with the peer
+    /// that sent them. Bounded per peer (`HEADERS_PER_PEER`); an entry
+    /// leaves when its block connects (`note_have`) or its peer leaves.
+    headers: HashMap<Hash256, (HeaderInfo, SocketAddr)>,
+    headers_per_peer: HashMap<SocketAddr, usize>,
 }
 
 impl Sync {
@@ -88,8 +120,8 @@ impl Sync {
             seen: VecDeque::new(),
             seen_set: HashSet::new(),
             peers: HashMap::new(),
-            pending_headers: VecDeque::new(),
-            expect_prev: None,
+            headers: HashMap::new(),
+            headers_per_peer: HashMap::new(),
         }
     }
 
@@ -97,6 +129,26 @@ impl Sync {
     /// startup and after each connect).
     pub fn note_have(&mut self, hash: Hash256) {
         self.have.insert(hash);
+        // The block index carries this header now.
+        if let Some((_, from)) = self.headers.remove(&hash) {
+            self.dec_headers(from);
+        }
+    }
+
+    fn dec_headers(&mut self, peer: SocketAddr) {
+        if let Some(n) = self.headers_per_peer.get_mut(&peer) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                self.headers_per_peer.remove(&peer);
+            }
+        }
+    }
+
+    /// Record that we sent `getheaders` to `peer` (its answer is solicited).
+    pub fn note_getheaders_sent(&mut self, peer: &SocketAddr) {
+        if let Some(pd) = self.peers.get_mut(peer) {
+            pd.headers_requested = pd.headers_requested.saturating_add(1);
+        }
     }
 
     /// Current tip (most-work chain head).
@@ -114,56 +166,167 @@ impl Sync {
         self.peers.entry(addr).or_default();
     }
 
-    /// Remove a peer (disconnect).
+    /// Remove a peer (disconnect), with the headers it alone vouched for.
     pub fn remove_peer(&mut self, addr: &SocketAddr) {
         self.peers.remove(addr);
+        if self.headers_per_peer.remove(addr).is_some() {
+            self.headers.retain(|_, (_, from)| from != addr);
+        }
     }
 
-    /// Process an incoming `headers` message from `peer`. Validates PoW,
-    /// linkage, and timestamps against our chain; queues blocks we lack.
-    /// Returns the hashes we should `getdata` next (bounded by window).
-    pub fn on_headers(
+    /// Process an incoming `headers` message from `peer` and return the
+    /// block hashes to `getdata` (bounded by the window).
+    ///
+    /// Every header is untrusted. Per message: at most `HEADERS_BATCH`
+    /// headers and no repeats. Headers we already know (a block in the
+    /// index, via `chain`, or an indexed header) are skipped. Each new one
+    /// must link to a known block or header, decode to a target within the
+    /// pow limit, meet it, carry exactly the bits the retarget schedule
+    /// gives after its parent, and not be more than `max_future_time_secs`
+    /// ahead. Only then is it indexed (bounded per peer). An unsolicited
+    /// message that brings nothing new is an error the caller penalises —
+    /// replaying one cheap header used to be free and grew memory without
+    /// limit.
+    pub fn on_headers<F>(
         &mut self,
         peer: SocketAddr,
         headers: &[BlockHeader],
-    ) -> Result<Vec<Hash256>, SyncError> {
-        let mut to_fetch = Vec::new();
-        for h in headers {
-            let hash = h.block_hash();
-            // Linkage: must build on previous header (or our tip/expect).
-            let expected = self.expect_prev.unwrap_or_else(|| {
-                self.pending_headers
-                    .back()
-                    .map(|p| p.block_hash())
-                    .unwrap_or(self.tip)
-            });
-            if h.prev_hash != expected {
-                // Allow the first header to build on our tip OR on a hash
-                // we already have — either is fine for headers-first.
-                if !(h.prev_hash == self.tip || self.have.contains(&h.prev_hash)) {
-                    return Err(SyncError::BrokenChain(hash));
-                }
+        chain: F,
+    ) -> Result<Vec<Hash256>, SyncError>
+    where
+        F: Fn(&Hash256) -> Option<HeaderInfo>,
+    {
+        let solicited = match self.peers.get_mut(&peer) {
+            Some(pd) if pd.headers_requested > 0 => {
+                pd.headers_requested -= 1;
+                true
             }
-            // PoW check.
-            let target = minibtc_consensus::pow::target_for_bits(h.bits)
-                .map_err(|e| SyncError::BadHeader(format!("bits: {e}")))?;
-            if !h.check_pow(&target) {
-                return Err(SyncError::BadHeader(format!("pow fail {hash}")));
-            }
-            self.pending_headers.push_back(*h);
-            self.expect_prev = Some(hash);
-            if !self.have.contains(&hash) {
-                to_fetch.push(hash);
-            }
+            _ => false,
+        };
+        if headers.len() > HEADERS_BATCH {
+            return Err(SyncError::TooMany(headers.len()));
         }
-        // Record in peer's wanted queue (bounded by window on drain).
+        // Structure first: a message with a repeated header is refused
+        // whole, before anything from it is indexed.
+        let hashes: Vec<Hash256> = headers.iter().map(BlockHeader::block_hash).collect();
+        let mut in_batch = HashSet::with_capacity(hashes.len());
+        if let Some(dup) = hashes.iter().find(|h| !in_batch.insert(**h)) {
+            return Err(SyncError::Repeated(*dup));
+        }
+        let mut to_fetch = Vec::new();
+        for (h, &hash) in headers.iter().zip(&hashes) {
+            if self.have.contains(&hash)
+                || self.headers.contains_key(&hash)
+                || chain(&hash).is_some()
+            {
+                continue; // already known
+            }
+            let parent = self
+                .lookup(&h.prev_hash, &chain)
+                .ok_or(SyncError::BrokenChain(hash))?;
+            let info = self.check_header(h, &parent, &chain)?;
+            let mine = self.headers_per_peer.get(&peer).copied().unwrap_or(0);
+            if mine >= HEADERS_PER_PEER {
+                return Err(SyncError::PeerQuota);
+            }
+            self.headers.insert(hash, (info, peer));
+            *self.headers_per_peer.entry(peer).or_insert(0) += 1;
+            to_fetch.push(hash);
+        }
+        if to_fetch.is_empty() && !headers.is_empty() && !solicited {
+            return Err(SyncError::NothingNew);
+        }
+        // Record in the peer's wanted queue (bounded by the window).
         if let Some(pd) = self.peers.get_mut(&peer) {
-            for h in to_fetch.iter().take(BLOCK_WINDOW) {
+            for h in &to_fetch {
+                if pd.wanted.len() >= BLOCK_WINDOW {
+                    break;
+                }
                 pd.wanted.push_back(*h);
             }
-            pd.last_progress = now();
+            if !to_fetch.is_empty() {
+                pd.last_progress = now();
+            }
         }
         Ok(to_fetch)
+    }
+
+    /// Height, bits, time and parent of a known block or indexed header.
+    fn lookup<F>(&self, hash: &Hash256, chain: &F) -> Option<HeaderInfo>
+    where
+        F: Fn(&Hash256) -> Option<HeaderInfo>,
+    {
+        self.headers
+            .get(hash)
+            .map(|(i, _)| *i)
+            .or_else(|| chain(hash))
+    }
+
+    /// The context-free and schedule checks for one header whose parent is
+    /// `parent`; returns its index entry.
+    fn check_header<F>(
+        &self,
+        h: &BlockHeader,
+        parent: &HeaderInfo,
+        chain: &F,
+    ) -> Result<HeaderInfo, SyncError>
+    where
+        F: Fn(&Hash256) -> Option<HeaderInfo>,
+    {
+        let hash = h.block_hash();
+        minibtc_consensus::checked_target(h.bits, &self.params)
+            .map_err(|e| SyncError::BadHeader(format!("bits: {e}")))?;
+        let target = minibtc_consensus::pow::target_for_bits(h.bits)
+            .map_err(|e| SyncError::BadHeader(format!("bits: {e}")))?;
+        if !h.check_pow(&target) {
+            return Err(SyncError::BadHeader(format!("pow fail {hash}")));
+        }
+        let height = parent.height.saturating_add(1);
+        let expected = self.expected_bits(h.prev_hash, parent, height, chain)?;
+        if h.bits != expected {
+            return Err(SyncError::BadHeader(format!(
+                "bits 0x{:08x}, schedule requires 0x{expected:08x}",
+                h.bits
+            )));
+        }
+        if !self.header_time_ok(h) {
+            return Err(SyncError::BadHeader(format!("time too far ahead {hash}")));
+        }
+        Ok(HeaderInfo {
+            height,
+            bits: h.bits,
+            time: h.time,
+            prev: h.prev_hash,
+        })
+    }
+
+    /// The bits the schedule requires for a header at `height` whose
+    /// parent is `parent_hash` (same rule as `Chain::next_bits_after`).
+    fn expected_bits<F>(
+        &self,
+        parent_hash: Hash256,
+        parent: &HeaderInfo,
+        height: u32,
+        chain: &F,
+    ) -> Result<u32, SyncError>
+    where
+        F: Fn(&Hash256) -> Option<HeaderInfo>,
+    {
+        if !minibtc_consensus::is_retarget_height(&self.params, u64::from(height)) {
+            return Ok(parent.bits);
+        }
+        let first_height = height.saturating_sub(self.params.pow_target_timespan_blocks);
+        let mut cur = (parent_hash, *parent);
+        while cur.1.height > first_height {
+            let prev = cur.1.prev;
+            let info = self
+                .lookup(&prev, chain)
+                .ok_or_else(|| SyncError::BadHeader("retarget ancestor unknown".to_string()))?;
+            cur = (prev, info);
+        }
+        let span = u64::from(parent.time.saturating_sub(cur.1.time));
+        minibtc_consensus::next_bits_for_period(&self.params, parent.bits, span)
+            .map_err(|e| SyncError::BadHeader(format!("retarget: {e}")))
     }
 
     /// Note an incoming `block` from `peer` (progress for stall
@@ -231,9 +394,9 @@ impl Sync {
             .collect()
     }
 
-    /// Headers we're still working through (for status/debug).
-    pub fn pending_header_count(&self) -> usize {
-        self.pending_headers.len()
+    /// Indexed headers whose blocks have not connected yet.
+    pub fn known_header_count(&self) -> usize {
+        self.headers.len()
     }
 
     /// Validate a header's timestamp is sane vs params (MTP needs chain
@@ -267,6 +430,34 @@ mod tests {
         format!("127.0.0.1:{}", 8000 + n as u16).parse().unwrap()
     }
 
+    const GENESIS_TIME: u32 = 1_700_000_000;
+
+    /// The node's block index in these tests: only the fake genesis.
+    fn genesis_only(genesis: Hash256) -> impl Fn(&Hash256) -> Option<HeaderInfo> {
+        move |h: &Hash256| {
+            (*h == genesis).then_some(HeaderInfo {
+                height: 0,
+                bits: ChainParams::devnet().pow_limit_bits,
+                time: GENESIS_TIME,
+                prev: Hash256::ZERO,
+            })
+        }
+    }
+
+    /// A chain of `n` headers on `genesis`, 32 s apart: every period takes
+    /// at least the target time, so the bits stay at the pow limit.
+    fn header_chain(genesis: Hash256, n: u32) -> Vec<BlockHeader> {
+        let p = params();
+        let mut prev = genesis;
+        (1..=n)
+            .map(|i| {
+                let h = header_at(prev, GENESIS_TIME + 32 * i, p.pow_limit_bits, 0);
+                prev = h.block_hash();
+                h
+            })
+            .collect()
+    }
+
     /// Build a valid header chain on devnet (trivial PoW).
     fn header_at(prev: Hash256, time: u32, bits: u32, nonce_start: u32) -> BlockHeader {
         let target = target_for_bits(bits).unwrap();
@@ -295,9 +486,11 @@ mod tests {
         sync.add_peer(a);
         let h1 = header_at(genesis_hash, 1_700_000_001, p.pow_limit_bits, 0);
         let h2 = header_at(h1.block_hash(), 1_700_000_002, p.pow_limit_bits, 0);
-        let to_fetch = sync.on_headers(a, &[h1, h2]).unwrap();
+        let to_fetch = sync
+            .on_headers(a, &[h1, h2], genesis_only(genesis_hash))
+            .unwrap();
         assert_eq!(to_fetch.len(), 2);
-        assert_eq!(sync.pending_header_count(), 2);
+        assert_eq!(sync.known_header_count(), 2);
     }
 
     #[test]
@@ -310,7 +503,7 @@ mod tests {
         // Header that doesn't build on tip or a held block.
         let bad = header_at(Hash256([0xEE; 32]), 1_700_000_001, p.pow_limit_bits, 0);
         assert!(matches!(
-            sync.on_headers(a, &[bad]),
+            sync.on_headers(a, &[bad], genesis_only(genesis)),
             Err(SyncError::BrokenChain(_))
         ));
     }
@@ -332,7 +525,7 @@ mod tests {
             nonce: 0,
         };
         assert!(matches!(
-            sync.on_headers(a, &[bad]),
+            sync.on_headers(a, &[bad], genesis_only(genesis)),
             Err(SyncError::BadHeader(_))
         ));
     }
@@ -344,18 +537,145 @@ mod tests {
         let mut sync = Sync::new(p.clone(), genesis);
         let a = peer(1);
         sync.add_peer(a);
-        // 20 headers → window caps getdata at BLOCK_WINDOW.
-        let mut prev = genesis;
-        let mut hs = Vec::new();
-        for i in 0..20u32 {
-            let h = header_at(prev, 1_700_000_001 + i, p.pow_limit_bits, 0);
-            prev = h.block_hash();
-            hs.push(h);
-        }
-        sync.on_headers(a, &hs).unwrap();
+        // 19 headers (no retarget boundary) → window caps getdata.
+        let hs = header_chain(genesis, 19);
+        sync.on_headers(a, &hs, genesis_only(genesis)).unwrap();
         let batch = sync.next_getdata(&a);
         assert!(batch.len() <= BLOCK_WINDOW || batch.len() <= GETDATA_BATCH);
         assert!(!batch.is_empty());
+    }
+
+    /// The 2026-11-16 headers flood: one cheap header replayed in message
+    /// after message used to be stored every time (1,000,000 entries after
+    /// 500 messages). It is now indexed once, repeats within a message are
+    /// refused, and unsolicited repeats are errors the node penalises.
+    #[test]
+    fn a_replayed_header_is_indexed_once_and_repeats_are_errors() {
+        let p = params();
+        let g = Hash256([0x01; 32]);
+        let mut sync = Sync::new(p.clone(), g);
+        let a = peer(1);
+        sync.add_peer(a);
+        let h = header_at(g, GENESIS_TIME + 31, p.pow_limit_bits, 0);
+        assert!(matches!(
+            sync.on_headers(a, &vec![h; 2_000], genesis_only(g)),
+            Err(SyncError::Repeated(_))
+        ));
+        assert_eq!(sync.on_headers(a, &[h], genesis_only(g)).unwrap().len(), 1);
+        for _ in 0..500 {
+            assert!(matches!(
+                sync.on_headers(a, &[h], genesis_only(g)),
+                Err(SyncError::NothingNew)
+            ));
+        }
+        assert_eq!(sync.known_header_count(), 1);
+        // An answer to our own getheaders may repeat what we know.
+        sync.note_getheaders_sent(&a);
+        assert!(
+            sync.on_headers(a, &[h], genesis_only(g))
+                .unwrap()
+                .is_empty()
+        );
+        // Once its block connects the header leaves the index.
+        sync.note_have(h.block_hash());
+        assert_eq!(sync.known_header_count(), 0);
+    }
+
+    #[test]
+    fn oversized_messages_and_off_schedule_headers_are_refused() {
+        let p = params();
+        let g = Hash256([0x01; 32]);
+        let mut sync = Sync::new(p.clone(), g);
+        let a = peer(1);
+        sync.add_peer(a);
+        let many = header_chain(g, HEADERS_BATCH as u32 + 1);
+        assert!(matches!(
+            sync.on_headers(a, &many, genesis_only(g)),
+            Err(SyncError::TooMany(_))
+        ));
+        // Harder than the schedule allows at a non-retarget height.
+        let harder = header_at(g, GENESIS_TIME + 31, 0x1f7f_ffff, 0);
+        assert!(matches!(
+            sync.on_headers(a, &[harder], genesis_only(g)),
+            Err(SyncError::BadHeader(_))
+        ));
+        // Easier than the pow limit of a harder network.
+        let mut hard = params();
+        hard.pow_limit_bits = 0x1f7f_ffff;
+        let mut sync = Sync::new(hard, g);
+        sync.add_peer(a);
+        let easy = header_at(g, GENESIS_TIME + 31, 0x207f_ffff, 0);
+        assert!(matches!(
+            sync.on_headers(a, &[easy], genesis_only(g)),
+            Err(SyncError::BadHeader(_))
+        ));
+        // Far in the future.
+        let mut sync = Sync::new(params(), g);
+        sync.add_peer(a);
+        let future = header_at(g, u32::MAX - 10, p.pow_limit_bits, 0);
+        assert!(matches!(
+            sync.on_headers(a, &[future], genesis_only(g)),
+            Err(SyncError::BadHeader(_))
+        ));
+    }
+
+    #[test]
+    fn a_retarget_header_must_carry_the_rescaled_bits() {
+        // 19 headers 1 s apart: the period took 19 s against 600 s, so
+        // header 20 must be four times harder (the clamp).
+        let p = params();
+        let g = Hash256([0x01; 32]);
+        let mut sync = Sync::new(p.clone(), g);
+        let a = peer(1);
+        sync.add_peer(a);
+        let mut prev = g;
+        let mut hs = Vec::new();
+        for i in 1..=19u32 {
+            let h = header_at(prev, GENESIS_TIME + i, p.pow_limit_bits, 0);
+            prev = h.block_hash();
+            hs.push(h);
+        }
+        sync.on_headers(a, &hs, genesis_only(g)).unwrap();
+        let stale = header_at(prev, GENESIS_TIME + 20, p.pow_limit_bits, 0);
+        assert!(sync.on_headers(a, &[stale], genesis_only(g)).is_err());
+        let want = minibtc_consensus::next_bits_for_period(&p, p.pow_limit_bits, 19).unwrap();
+        let ok = header_at(prev, GENESIS_TIME + 20, want, 0);
+        assert_eq!(sync.on_headers(a, &[ok], genesis_only(g)).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn one_peer_cannot_index_unbounded_headers() {
+        let p = params();
+        let g = Hash256([0x01; 32]);
+        let mut sync = Sync::new(p.clone(), g);
+        let a = peer(1);
+        sync.add_peer(a);
+        // A long valid chain from one peer, in full batches.
+        let mut prev = g;
+        let mut height = 0u32;
+        let mut quota_hit = false;
+        for _ in 0..3 {
+            let mut batch = Vec::new();
+            for _ in 0..HEADERS_BATCH {
+                height += 1;
+                let h = header_at(prev, GENESIS_TIME + 32 * height, p.pow_limit_bits, 0);
+                prev = h.block_hash();
+                batch.push(h);
+            }
+            sync.note_getheaders_sent(&a);
+            if matches!(
+                sync.on_headers(a, &batch, genesis_only(g)),
+                Err(SyncError::PeerQuota)
+            ) {
+                quota_hit = true;
+                break;
+            }
+        }
+        assert!(quota_hit, "per-peer quota must bind");
+        assert!(sync.known_header_count() <= HEADERS_PER_PEER);
+        // Disconnecting the peer releases its headers.
+        sync.remove_peer(&a);
+        assert_eq!(sync.known_header_count(), 0);
     }
 
     #[test]

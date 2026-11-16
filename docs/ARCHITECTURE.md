@@ -89,6 +89,14 @@ Hard rules:
   connected; otherwise the failing block and its descendants are marked
   invalid and the node keeps its old tip and UTXO set
   (`tests/attacks/tests/reorg.rs`).
+- **Header sync** keeps no unbounded state. Each new header must link to a
+  known block or header, carry a target within the pow limit that its hash
+  meets, match the retarget schedule after its parent, and not be too far
+  ahead. Accepted headers whose blocks have not connected are indexed per
+  peer (at most `HEADERS_PER_PEER`) and leave when the block connects or
+  the peer disconnects. A message may carry at most 2,000 headers and no
+  repeats; an unsolicited message that adds nothing is penalised, so a
+  replayed cheap header leads to a ban.
 - **Mempool** is local policy: removed on connect; after a reorg the
   disconnected blocks' transactions are re-validated against the new chain
   and re-admitted (oldest block first; conflicts and already-confirmed ones
