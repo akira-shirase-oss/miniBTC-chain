@@ -82,6 +82,17 @@ files; create/restore are UI flows (see below).
   Verified: restoring a phrase derives the identical first address.
 - `POST /unlock` — existing wallets (rate-limited, audited).
 
+### Watch-only file
+
+Create, restore, unlock and every send also write
+`<datadir>/wallets/<name>.watch.json`: the wallet's derived scripts (hashes
+of public keys, no keys or seed) and the change scripts not yet issued. The
+CLI's `wallet draft` (MCP `draft_payment`) builds unsigned payments from it
+without the passphrase, and the MCP gate reads it to tell change from
+payment. It maps every address to this wallet, so it is written owner-only
+(0600) through a temp file and a rename (`minibtc_wallet::watch`), by the
+CLI and this UI alike (D-015).
+
 ### Authed pages
 
 - `GET /wallet` — dashboard: confirmed/immature balance hero, action

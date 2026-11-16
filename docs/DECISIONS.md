@@ -221,8 +221,10 @@ environment an agent can read. Every CLI passphrase prompt (and the
 mnemonic prompt of `wallet restore`) reads with terminal echo off,
 switched off before the prompt appears (`stty -echo`, restored on exit;
 the read fails closed if echo cannot be disabled). Existing wallets need
-one passphrase-unlocked command (e.g. `wallet balance`) to write their
-watch-only file.
+one passphrase-unlocked command (e.g. `wallet balance`, or an unlock in the
+wallet UI) to write their watch-only file. The file holds public data but
+links every address to one wallet, so both the CLI and the wallet UI write
+it owner-only (0600) via a temp file and an atomic rename.
 
 ## Open questions
 

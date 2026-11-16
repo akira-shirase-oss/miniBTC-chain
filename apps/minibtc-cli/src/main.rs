@@ -402,20 +402,15 @@ fn save_wallet(
 
 /// The watch-only file next to a wallet: public scripts only.
 fn watch_path(datadir: &Path, name: &str) -> Result<PathBuf> {
-    Ok(wallet_path(datadir, name)?.with_extension("watch.json"))
+    wallet_path(datadir, name)?; // validates the name
+    Ok(minibtc_wallet::watch::watch_file_path(datadir, name))
 }
 
 /// Write the watch-only file (every derived script in the gap window and
-/// the change scripts not yet issued). Public data: hashes of public keys.
-/// Lets `wallet draft` build unsigned payments without the passphrase.
+/// the change scripts not yet issued; owner-only, atomic). Lets `wallet
+/// draft` build unsigned payments without the passphrase.
 fn write_watch_file(datadir: &Path, name: &str, w: &mut Wallet) -> Result<()> {
-    w.prime_lookahead(GAP_LIMIT)?;
-    let (all, fresh_change) = w.watch_scripts();
-    let v = json!({
-        "scripts": all.iter().map(|s| hex_encode(s)).collect::<Vec<_>>(),
-        "change_scripts": fresh_change.iter().map(|s| hex_encode(s)).collect::<Vec<_>>(),
-    });
-    std::fs::write(watch_path(datadir, name)?, serde_json::to_vec_pretty(&v)?)?;
+    minibtc_wallet::watch::write_watch_file(&watch_path(datadir, name)?, w, GAP_LIMIT)?;
     Ok(())
 }
 
@@ -943,25 +938,16 @@ async fn wallet_cmd(
             let dest_script = minibtc_script::Script::p2pkh(&dest.hash160)
                 .as_bytes()
                 .to_vec();
-            let watch_text =
-                std::fs::read_to_string(watch_path(datadir, &name)?).with_context(|| {
+            let watch = minibtc_wallet::watch::read_watch_file(&watch_path(datadir, &name)?)
+                .with_context(|| {
                     format!(
-                        "no watch-only file for wallet {name}: run any wallet command \
+                        "no usable watch-only file for wallet {name}: run any wallet command \
                          with the passphrase once (e.g. `wallet balance`) to create it"
                     )
                 })?;
-            let watch: Value = serde_json::from_str(&watch_text).context("watch file")?;
-            let decode_list = |key: &str| -> Result<Vec<Vec<u8>>> {
-                watch[key]
-                    .as_array()
-                    .context("watch file malformed")?
-                    .iter()
-                    .map(|v| hex_decode(v.as_str().unwrap_or("")).context("watch script hex"))
-                    .collect()
-            };
-            let scripts: std::collections::HashSet<Vec<u8>> =
-                decode_list("scripts")?.into_iter().collect();
-            let change = decode_list("change_scripts")?
+            let scripts = watch.scripts;
+            let change = watch
+                .fresh_change
                 .into_iter()
                 .next()
                 .context("watch file has no unused change script; refresh it")?;
