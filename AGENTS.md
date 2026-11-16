@@ -64,7 +64,7 @@ Run before every commit.
 ## Working rules
 
 - Work phase by phase per `docs/ROADMAP.md`; commit at each proof gate.
-- Commits stay local (no push — the remote is not set up yet).
+- Remote: `origin` = `akira-shirase-oss/miniBTC-chain` over the `github-learning` SSH alias. Work on a short fix branch, merge `--no-ff` into `main` when `scripts/check.sh` is green, and push both.
 - The journey is recorded in the build log at
   https://404human.dev (source: `akira-shirase-oss/site/minimal-portfolio`,
   `content/minibtc/`). Update it at each milestone.
