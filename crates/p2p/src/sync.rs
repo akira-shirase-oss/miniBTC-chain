@@ -170,12 +170,16 @@ impl Sync {
 
     /// Process an incoming `block`: stash it for the node to connect.
     /// Returns true if it's new (not already held).
+    ///
+    /// "Held" means *connected*: the hash enters `have` only through
+    /// [`Self::note_have`] after the node accepted the block. Marking it
+    /// here, before validation, let a mutated copy (same hash, CVE-2012-2459)
+    /// make the node drop the honest block forever.
     pub fn on_block(&mut self, peer: SocketAddr, block: Block) -> bool {
         let hash = block.header.block_hash();
         if self.have.contains(&hash) {
             return false;
         }
-        self.have.insert(hash);
         if let Some(pd) = self.peers.get_mut(&peer) {
             pd.received.push_back(block);
             pd.last_progress = now();
@@ -388,6 +392,37 @@ mod tests {
         assert_eq!(targets, vec![b]);
     }
 
+    /// CVE-2012-2459 poisoning: a mutated copy of a block has the honest
+    /// block's hash. Receiving it must not make the node treat that hash as
+    /// held — only a block that actually connected is.
+    #[test]
+    fn rejected_block_hash_is_not_remembered() {
+        let p = params();
+        let genesis = Hash256([0x01; 32]);
+        let mut sync = Sync::new(p.clone(), genesis);
+        let a = peer(1);
+        sync.add_peer(a);
+        let h = header_at(genesis, 1_700_000_001, p.pow_limit_bits, 0);
+        let mutated = Block {
+            header: h,
+            txs: vec![],
+        };
+        let honest = Block {
+            header: h,
+            txs: vec![],
+        };
+        assert!(sync.on_block(a, mutated), "first copy delivered");
+        // The node validated and rejected it (no note_have). The honest
+        // copy with the same hash must still be delivered.
+        assert!(
+            sync.on_block(a, honest.clone()),
+            "honest block must not be dropped as already held"
+        );
+        // Once it connects, the hash is held and later copies are dropped.
+        sync.note_have(h.block_hash());
+        assert!(!sync.on_block(a, honest), "connected block is held");
+    }
+
     #[test]
     fn on_block_dedup() {
         let p = params();
@@ -402,7 +437,8 @@ mod tests {
         };
         let hash = block.header.block_hash();
         assert!(sync.on_block(a, block.clone()));
-        assert!(!sync.on_block(a, block), "duplicate rejected");
+        sync.note_have(hash); // the node connected it
+        assert!(!sync.on_block(a, block), "duplicate of a held block");
         let got = sync.take_received(&a, 10);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].header.block_hash(), hash);

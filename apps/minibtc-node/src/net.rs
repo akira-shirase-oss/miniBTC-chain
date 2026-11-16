@@ -634,10 +634,20 @@ async fn handle_getdata(
 
 /// Queue an inbound block and drain whatever became connectable.
 async fn handle_block(node: &Node, addr: SocketAddr, block: Block, reply: &mpsc::Sender<Message>) {
+    // Context-free merkle check first (cheap). A mutated block
+    // (CVE-2012-2459) shares the honest block's hash, so it is dropped
+    // here without its hash entering `have` or the pending queue — the
+    // honest copy can still arrive and connect.
+    if let Err(e) = minibtc_primitives::check_merkle_root(&block.header, &block.txs) {
+        tracing::debug!(%addr, "block failed merkle check: {e}");
+        let mut inner = node.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.peers.score(&addr, SCORE_BAD_BLOCK);
+        return;
+    }
     {
         let mut inner = node.inner.lock().unwrap_or_else(|e| e.into_inner());
-        // sync.on_block marks `have` (headers dedup) and per-peer progress;
-        // returns false for duplicates.
+        // sync.on_block records per-peer progress and returns false for
+        // blocks already connected; `have` is set only after a connect.
         if !inner.sync.on_block(addr, block.clone()) {
             return;
         }

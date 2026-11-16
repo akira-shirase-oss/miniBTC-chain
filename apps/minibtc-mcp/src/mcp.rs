@@ -1268,9 +1268,12 @@ const CONSENSUS_DOCS: &str = r#"# MiniBTC consensus rules (devnet preset)
   150 blocks. Coinbase may claim subsidy + collected fees, nothing more.
 - **Maturity**: coinbase outputs are unspendable for 100 confirmations.
 - **Money**: all arithmetic checked; total money capped at 21M BTC.
-- **Block rules**: first tx must be coinbase; merkle root must match
-  (CVE-2012-2459 duplication rejected); timestamp > median of previous
-  11, ≤ now + 2h; size ≤ 1,000,000 bytes; ≤ 10,000 txs.
+- **Block rules**: first tx must be coinbase; merkle root must match,
+  and a tree with an identical hash pair at any level is rejected as
+  mutated (CVE-2012-2459) without remembering the shared block hash as
+  invalid; each tx is validated against the UTXO set as updated by the
+  earlier txs of the same block; timestamp > median of previous 11,
+  ≤ now + 2h; size ≤ 1,000,000 bytes; ≤ 10,000 txs.
 - **Tx rules**: no duplicate inputs; inputs must exist and be unspent;
   outputs positive and ≤ max money; fee = inputs − outputs ≥ 0;
   standardness is policy, not consensus.
