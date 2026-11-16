@@ -234,6 +234,29 @@ wallet UI) to write their watch-only file. The file holds public data but
 links every address to one wallet, so both the CLI and the wallet UI write
 it owner-only (0600) via a temp file and an atomic rename.
 
+### D-016 — What a failed reorg leaves behind (2026-11-16)
+
+`Chain::reorg_to` validates the heavier branch block by block on one
+UTXO overlay and commits only if the whole branch connects. When block
+*k* fails:
+
+- the node returns to its **old tip**, even if the valid prefix
+  (blocks before *k*) has more work than the old tip. Bitcoin Core would
+  stay on that prefix. MiniBTC can't reach that case today: blocks are
+  processed one at a time and a reorg starts at the first branch block
+  whose work exceeds the tip's, so every earlier prefix has at most the
+  tip's work. Revisit if blocks are ever connected in batches (for
+  example a parallel download that hands several blocks to
+  `consider_block` at once).
+- block *k* and all its descendants are dropped from the index, kept in
+  a bounded invalid-hash cache and deleted from disk
+  (`take_dropped` → `Store::delete_blocks`). The cache is forgotten on
+  restart, which is safe because the blocks are gone from disk too.
+- exception: a block that fails only "too far in the future"
+  (`TimeTooNew`) is kept and nothing is marked invalid, because that
+  verdict depends on the local clock (Core's `BLOCK_TIME_FUTURE` is
+  never cached either). A later block on the branch retries the reorg.
+
 ## Open questions
 
 - None blocking. Post-v1 candidates if revisited: SegWit/Taproot sighash
