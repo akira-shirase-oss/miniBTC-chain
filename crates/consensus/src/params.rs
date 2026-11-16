@@ -1,24 +1,19 @@
-//! Chain parameters — every consensus knob in one struct, loadable from a
-//! JSON config file so devnet can tune PoW/subsidy/maturity without
+//! Chain parameters — every consensus knob in one struct, parsed from a
+//! JSON document so devnet can tune PoW/subsidy/maturity without
 //! recompiling. Two presets ship: `mainnet`-like defaults and a `devnet`
 //! preset with trivial difficulty for tests.
+//!
+//! This crate is pure: it parses and validates text it is handed. Reading
+//! the file is the binary's job (see `minibtc-node --params`), so consensus
+//! never touches the filesystem.
 
 use minibtc_primitives::Sats;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
 
-/// Errors loading or validating parameters.
+/// Errors parsing or validating parameters.
 #[derive(Debug, thiserror::Error)]
 pub enum ParamsError {
-    /// The config file could not be read.
-    #[error("cannot read params file {path}: {source}")]
-    Io {
-        /// File path attempted.
-        path: String,
-        /// Underlying I/O error.
-        source: std::io::Error,
-    },
-    /// The config file was not valid JSON for this schema.
+    /// The document was not valid JSON for this schema.
     #[error("invalid params JSON: {0}")]
     Json(#[from] serde_json::Error),
     /// A parameter value is self-inconsistent (e.g. interval = 0).
@@ -148,15 +143,11 @@ impl ChainParams {
         }
     }
 
-    /// Load params from a JSON file; missing fields fall back to devnet
-    /// defaults via `#[serde(default)]` on a wrapper — here we require the
-    /// full struct so a config is explicit, not silently half-specified.
-    pub fn load(path: &Path) -> Result<Self, ParamsError> {
-        let text = std::fs::read_to_string(path).map_err(|e| ParamsError::Io {
-            path: path.display().to_string(),
-            source: e,
-        })?;
-        let params: Self = serde_json::from_str(&text)?;
+    /// Parse params from a JSON document and validate them. Every field
+    /// except the `#[serde(default)]` flags is required, so a config is
+    /// explicit, not silently half-specified. The caller reads the file.
+    pub fn from_json(text: &str) -> Result<Self, ParamsError> {
+        let params: Self = serde_json::from_str(text)?;
         params.validate()?;
         Ok(params)
     }
@@ -187,5 +178,33 @@ impl ChainParams {
     /// `Sats` view of the subsidy cap for checked arithmetic call sites.
     pub fn max_money_sats(&self) -> Sats {
         Sats(self.max_money)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_json_round_trips_a_preset() {
+        let text = serde_json::to_string(&ChainParams::devnet()).unwrap();
+        let parsed = ChainParams::from_json(&text).unwrap();
+        assert_eq!(parsed.name, "minibtc-devnet");
+        assert_eq!(parsed.pow_limit_bits, ChainParams::devnet().pow_limit_bits);
+    }
+
+    #[test]
+    fn from_json_rejects_invalid_values_and_bad_json() {
+        let mut p = ChainParams::devnet();
+        p.pow_target_timespan_blocks = 0;
+        let text = serde_json::to_string(&p).unwrap();
+        assert!(matches!(
+            ChainParams::from_json(&text),
+            Err(ParamsError::Invalid(_))
+        ));
+        assert!(matches!(
+            ChainParams::from_json("{\"name\": 1}"),
+            Err(ParamsError::Json(_))
+        ));
     }
 }

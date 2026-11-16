@@ -5,7 +5,9 @@
 //! with Bitcoin Core's mutation test, not just equality, because the
 //! odd-leaf duplication rule means two *different* transaction lists can
 //! hash to the same root (CVE-2012-2459). We detect that case explicitly
-//! and reject the block rather than picking a winner arbitrarily.
+//! and reject the block rather than picking a winner arbitrarily. A
+//! mutated block carries the honest block's hash, so callers must not
+//! remember the hash as invalid (see [`MerkleError::Ambiguous`]).
 
 use minibtc_crypto::{Hash256, double_sha256};
 use serde::{Deserialize, Serialize};
@@ -177,7 +179,9 @@ pub enum MerkleError {
     #[error("merkle root mismatch")]
     RootMismatch,
     /// CVE-2012-2459: two different transaction lists produce this root —
-    /// the block is ambiguous and must be rejected.
+    /// the block is ambiguous and must be rejected. The block hash is
+    /// shared with the honest list, so this rejection says nothing about
+    /// the hash: never cache it as an invalid block.
     #[error("ambiguous merkle root (CVE-2012-2459 duplicate-trailing-tx)")]
     Ambiguous,
 }
@@ -185,11 +189,25 @@ pub enum MerkleError {
 /// Compute the merkle root of `txids` using Bitcoin's duplication rule:
 /// an odd leaf is duplicated to make the level even.
 pub fn merkle_root_from_txids(txids: &[Hash256]) -> Hash256 {
+    merkle_root_and_mutation(txids).0
+}
+
+/// Merkle root plus Bitcoin Core's mutation flag (`ComputeMerkleRoot`
+/// with `mutated`): `true` when, at any level, a pair position holds two
+/// identical hashes. That is exactly the shape the odd-leaf padding
+/// produces, so a list with it hashes to the same root as a shorter list
+/// (CVE-2012-2459). The pair check runs before a level is padded, so an
+/// honest odd level is never flagged.
+pub fn merkle_root_and_mutation(txids: &[Hash256]) -> (Hash256, bool) {
     if txids.is_empty() {
-        return Hash256::ZERO;
+        return (Hash256::ZERO, false);
     }
+    let mut mutated = false;
     let mut level: Vec<Hash256> = txids.to_vec();
     while level.len() > 1 {
+        if level.as_chunks::<2>().0.iter().any(|[a, b]| a == b) {
+            mutated = true;
+        }
         let mut next = Vec::with_capacity(level.len().div_ceil(2));
         let mut i = 0;
         while i < level.len() {
@@ -205,7 +223,7 @@ pub fn merkle_root_from_txids(txids: &[Hash256]) -> Hash256 {
         }
         level = next;
     }
-    level[0]
+    (level[0], mutated)
 }
 
 /// Merkle root of a transaction list.
@@ -215,37 +233,18 @@ pub fn merkle_root(txs: &[Transaction]) -> Hash256 {
 }
 
 /// Verify `header.merkle_root` against `txs`, including the CVE-2012-2459
-/// mutation check: mutate the last transaction's first byte, recompute —
-/// if the root is unchanged the encoding is ambiguous and the block is
-/// rejected (this is Bitcoin Core's `CheckMerkleRoot` approach).
+/// mutation check from Bitcoin Core's `CheckBlock`: the root must match
+/// (`bad-txnmrklroot`) and no tree level may contain an identical pair
+/// (`bad-txns-duplicate`). Context-free and cheap — run it before a block
+/// is queued or its hash remembered.
 pub fn check_merkle_root(header: &BlockHeader, txs: &[Transaction]) -> Result<(), MerkleError> {
-    let computed = merkle_root(txs);
+    let txids: Vec<Hash256> = txs.iter().map(Transaction::txid).collect();
+    let (computed, mutated) = merkle_root_and_mutation(&txids);
     if computed != header.merkle_root {
         return Err(MerkleError::RootMismatch);
     }
-    // Mutation check: flip a bit in the last tx, recompute. If the root
-    // stays the same, the original list was ambiguous.
-    if let Some(last) = txs.last() {
-        let mut mutated = last.clone();
-        if let Some(first) = mutated.inputs.first_mut() {
-            if !first.script_sig.is_empty() {
-                first.script_sig[0] ^= 0x01;
-            } else {
-                // No scriptSig to mutate — mutate an output script instead.
-                if let Some(out) = mutated.outputs.first_mut()
-                    && !out.script_pubkey.is_empty()
-                {
-                    out.script_pubkey[0] ^= 0x01;
-                }
-            }
-        }
-        let mut mutated_txs = txs.to_vec();
-        if let Some(slot) = mutated_txs.last_mut() {
-            *slot = mutated;
-        }
-        if merkle_root(&mutated_txs) == header.merkle_root {
-            return Err(MerkleError::Ambiguous);
-        }
+    if mutated {
+        return Err(MerkleError::Ambiguous);
     }
     Ok(())
 }

@@ -13,10 +13,14 @@
 
 pub mod bip32;
 pub mod bip39;
+pub mod draft;
 pub mod keystore;
 pub mod wallet;
 
 pub use bip32::{ChildNumber, DerivationPath, Xpriv};
 pub use bip39::{Mnemonic, generate_mnemonic, mnemonic_from_phrase, seed_from_mnemonic};
 pub use keystore::{Keystore, decrypt_keystore, encrypt_keystore};
-pub use wallet::{CoinSelection, Wallet, WalletError};
+pub use wallet::{
+    CoinSelection, UnsignedPayment, Wallet, WalletError, WalletUtxo, build_unsigned_payment,
+    select_coins_from,
+};

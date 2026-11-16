@@ -22,7 +22,7 @@ the contract; this document records how the pieces fit in *this* workspace.
 | CLI | `apps/minibtc-cli` | All blueprint §6 commands; human + `--json` output. |
 | Explorer | `apps/minibtc-explorer` | Read-only axum UI over the node RPC (search, pagination, dashboard, watch-only address views). |
 | Wallet UI | `apps/minibtc-wallet-ui` | Key-holding local web UI (D-011): passphrase→in-memory session, CSRF, audit, send flow. Separate binary so the explorer stays read-only. |
-| MCP | `apps/minibtc-mcp` | rmcp server; RPC client only; gated writes; audit log. |
+| MCP | `apps/minibtc-mcp` | rmcp server; RPC client only; audit log. Writes are gated (D-015): drafts are unsigned and built watch-only; the owner signs with `minibtc-cli wallet approve-draft` at a terminal; `request_send` broadcasts only that signed tx, capped from its bytes. |
 | Attack lab | `tests/attacks` | One test per blueprint §8 row. |
 
 ## The life of a transaction (the path every feature must preserve)
@@ -66,10 +66,24 @@ Hard rules:
 - **UTXO set** is derived state, rebuildable by replaying blocks
   (`--reindex`). Storage commits a block, its undo data and index updates in
   one redb transaction.
+- **Block apply is atomic.** Connect applies a block's transactions to a
+  `UtxoOverlay` (reads fall through to the UTXO set, writes stay in the
+  overlay) and commits only when every transaction applied; a block
+  rejected half-way leaves the set, tip and index untouched
+  (`tests/attacks/tests/block_apply.rs`).
 - **Block index** tracks every known header with height, cumulative work and
   status (valid / invalid / headers-only / assumevalid-none).
-- **Reorgs** disconnect blocks in reverse using undo data (restores spent
-  outputs, removes created ones), then connect the heavier branch.
+- **Side branches** are judged by their own history: on arrival a
+  non-tip block gets the header rules from its parent (bits schedule,
+  median-time-past) and every rule that needs no UTXO set; its
+  transactions are checked during activation against the fork point's
+  state plus the branch's earlier blocks.
+- **Reorgs** run on one `UtxoOverlay`: undo the active blocks back to the
+  fork (exact undo data), then validate and apply each branch block. The
+  overlay is committed and the index switched only if the whole branch
+  connected; otherwise the failing block and its descendants are marked
+  invalid and the node keeps its old tip and UTXO set
+  (`tests/attacks/tests/reorg.rs`).
 - **Mempool** is local policy: removed on connect, re-added (re-validated)
   on disconnect.
 - **Wallet** state is local files under the datadir; it learns chain facts

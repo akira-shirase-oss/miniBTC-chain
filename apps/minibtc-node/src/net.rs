@@ -12,10 +12,11 @@ use minibtc_p2p::peer::{SCORE_BAD_BLOCK, SCORE_BAD_MESSAGE, SCORE_GOOD_BLOCK, SC
 use minibtc_primitives::Block;
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::time::timeout;
 
 /// Per-peer outbound queue depth — a stalled peer drops announcements.
@@ -42,6 +43,10 @@ const USER_AGENT: &str = "/MiniBTC:0.1.0/";
 const ADDR_LEARN_CAP: usize = 100;
 /// Max inv items processed per message.
 const INV_PROCESS_CAP: usize = 1_024;
+/// Accepted sockets allowed to be mid-handshake at once. Further inbound
+/// connections are closed immediately instead of each holding a task, a
+/// socket and (once admitted) a peer slot for the handshake timeout.
+const MAX_PENDING_HANDSHAKES: usize = 16;
 
 /// Start the P2P subsystem: listener + dialer + maintenance sweeps.
 /// Returns when `node.cancel` is set or the listener fails to bind.
@@ -75,8 +80,10 @@ pub async fn run(node: Node, listen: SocketAddr, connect: Vec<SocketAddr>) {
         });
     }
 
-    // Accept loop.
+    // Accept loop. A permit from `handshakes` is taken before a session
+    // task exists and held until its handshake ends.
     let accept_node = node.clone();
+    let handshakes = Arc::new(Semaphore::new(MAX_PENDING_HANDSHAKES));
     let accept = tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -84,9 +91,14 @@ pub async fn run(node: Node, listen: SocketAddr, connect: Vec<SocketAddr>) {
                 res = listener.accept() => {
                     match res {
                         Ok((stream, addr)) => {
+                            let Ok(permit) = handshakes.clone().try_acquire_owned() else {
+                                tracing::debug!(%addr, "too many pending handshakes; closing");
+                                drop(stream);
+                                continue;
+                            };
                             let n = accept_node.clone();
                             tokio::spawn(async move {
-                                accept_session(n, stream, addr).await;
+                                accept_session(n, stream, addr, permit).await;
                             });
                         }
                         Err(e) => {
@@ -137,10 +149,14 @@ fn disconnect(node: &Node, addr: SocketAddr) {
     // exits; the peer table entry is already gone.
 }
 
-/// Sweep: disconnect stalled + over-handshake-timeout peers.
+/// Sweep: disconnect stalled + over-handshake-timeout peers, and expire
+/// queued orphan blocks and unanswered block requests.
 async fn sweep(node: &Node) {
     let bad: Vec<SocketAddr> = {
-        let inner = node.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut inner = node.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let now = std::time::Instant::now();
+        inner.pending.expire(now);
+        inner.requests.expire(now);
         inner
             .peers
             .snapshot()
@@ -191,6 +207,7 @@ async fn dial_and_session(node: Node, addr: SocketAddr) {
         if inner.peers.get(&addr).is_some() || !inner.dialing.insert(addr) {
             return;
         }
+        // admit() reserves the slot until the session ends.
         if let Err(e) = inner.peers.admit(addr, true) {
             inner.dialing.remove(&addr);
             tracing::debug!(%addr, "dial rejected: {e}");
@@ -200,16 +217,14 @@ async fn dial_and_session(node: Node, addr: SocketAddr) {
     let stream = match timeout(Duration::from_secs(10), TcpStream::connect(addr)).await {
         Ok(Ok(s)) => s,
         _ => {
-            node.inner
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .dialing
-                .remove(&addr);
+            let mut inner = node.inner.lock().unwrap_or_else(|e| e.into_inner());
+            inner.dialing.remove(&addr);
+            inner.peers.remove(&addr); // release the reservation
             return;
         }
     };
     let _ = stream.set_nodelay(true);
-    session(node.clone(), stream, addr, true).await;
+    session(node.clone(), stream, addr, true, None).await;
     node.inner
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -217,20 +232,27 @@ async fn dial_and_session(node: Node, addr: SocketAddr) {
         .remove(&addr);
 }
 
-/// Inbound accept path.
-pub async fn accept_session(node: Node, stream: TcpStream, addr: SocketAddr) {
+/// Inbound accept path. `permit` bounds concurrent pre-handshake sockets.
+pub async fn accept_session(
+    node: Node,
+    stream: TcpStream,
+    addr: SocketAddr,
+    permit: OwnedSemaphorePermit,
+) {
     {
-        let inner = node.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut inner = node.inner.lock().unwrap_or_else(|e| e.into_inner());
         if inner.peers.is_banned(&addr.ip()) {
             return;
         }
+        // admit() reserves the slot: concurrent handshakes count against
+        // the per-IP, per-/16 and inbound caps from this moment.
         if let Err(e) = inner.peers.admit(addr, false) {
             tracing::debug!(%addr, "inbound rejected: {e}");
             return;
         }
     }
     let _ = stream.set_nodelay(true);
-    session(node, stream, addr, false).await;
+    session(node, stream, addr, false, Some(permit)).await;
 }
 
 /// Our `version` message payload — `start_height` is our real tip so a
@@ -258,7 +280,15 @@ fn our_version_msg(params: &ChainParams, start_height: i32) -> Message {
 }
 
 /// One peer connection end-to-end: handshake → message loop → cleanup.
-async fn session(node: Node, stream: TcpStream, addr: SocketAddr, outbound: bool) {
+/// The caller has reserved `addr`'s slot (admit); every exit releases it.
+/// `handshake_permit` (inbound only) is released once the handshake ends.
+async fn session(
+    node: Node,
+    stream: TcpStream,
+    addr: SocketAddr,
+    outbound: bool,
+    handshake_permit: Option<OwnedSemaphorePermit>,
+) {
     let params = node.params.clone();
     let (mut rd, mut wr) = tokio::io::split(stream);
 
@@ -268,23 +298,31 @@ async fn session(node: Node, stream: TcpStream, addr: SocketAddr, outbound: bool
         inner.chain.height().min(i32::MAX as u32) as i32
     };
     let our_version = our_version_msg(&params, our_height);
-    if codec::write_message(&mut wr, &our_version, &params)
-        .await
-        .is_err()
+    if timeout(
+        codec::HANDSHAKE_TIMEOUT,
+        codec::write_message(&mut wr, &our_version, &params),
+    )
+    .await
+    .map_or(true, |r| r.is_err())
     {
+        cleanup(&node, addr).await;
         return;
     }
     let their_version = match timeout(codec::HANDSHAKE_TIMEOUT, codec::recv(&mut rd, &params)).await
     {
         Ok(Ok(m @ Message::Version { .. })) => m,
-        _ => return,
+        _ => {
+            cleanup(&node, addr).await;
+            return;
+        }
     };
 
-    // Register the peer (diversity/ban already checked at admit()).
+    // Fill the reserved slot (caps were applied when it was reserved).
     {
         let mut inner = node.inner.lock().unwrap_or_else(|e| e.into_inner());
         if let Err(e) = inner.peers.register(addr, outbound, &their_version) {
             tracing::debug!(%addr, "register rejected: {e}");
+            inner.peers.remove(&addr);
             return;
         }
     }
@@ -305,7 +343,8 @@ async fn session(node: Node, stream: TcpStream, addr: SocketAddr, outbound: bool
         }
     }
 
-    // Handshake complete.
+    // Handshake complete: free the pre-handshake permit.
+    drop(handshake_permit);
     {
         let mut inner = node.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.peers.mark_handshaken(&addr);
@@ -562,14 +601,14 @@ async fn handle_message(
 /// Process an `inv`: request what we don't have (bounded).
 async fn handle_inv(
     node: &Node,
-    _addr: SocketAddr,
+    addr: SocketAddr,
     items: &[minibtc_p2p::codec::InvItem],
     reply: &mpsc::Sender<Message>,
 ) {
     use minibtc_p2p::codec::InvType;
     let mut want: Vec<minibtc_p2p::codec::InvItem> = Vec::new();
     {
-        let inner = node.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut inner = node.inner.lock().unwrap_or_else(|e| e.into_inner());
         for item in items.iter().take(INV_PROCESS_CAP) {
             match item.kind {
                 InvType::Tx => {
@@ -591,6 +630,12 @@ async fn handle_inv(
             if want.len() >= GETDATA_BATCH {
                 break;
             }
+        }
+        // Remember which blocks we asked this peer for: only those may wait
+        // in the out-of-order queue.
+        let now = std::time::Instant::now();
+        for item in want.iter().filter(|i| i.kind == InvType::Block) {
+            inner.requests.note(item.hash, addr, now);
         }
     }
     if !want.is_empty() {
@@ -634,15 +679,35 @@ async fn handle_getdata(
 
 /// Queue an inbound block and drain whatever became connectable.
 async fn handle_block(node: &Node, addr: SocketAddr, block: Block, reply: &mpsc::Sender<Message>) {
+    // Context-free checks first (cheap, no lock): merkle root + mutation
+    // and proof of work. A mutated block (CVE-2012-2459) shares the honest
+    // block's hash, so it is dropped here without its hash entering `have`
+    // or the pending queue — the honest copy can still arrive and connect.
+    if let Err(e) = crate::core::precheck_block(&node.params, &block) {
+        tracing::debug!(%addr, "block failed precheck: {e}");
+        let mut inner = node.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.peers.score(&addr, SCORE_BAD_BLOCK);
+        return;
+    }
     {
         let mut inner = node.inner.lock().unwrap_or_else(|e| e.into_inner());
-        // sync.on_block marks `have` (headers dedup) and per-peer progress;
-        // returns false for duplicates.
-        if !inner.sync.on_block(addr, block.clone()) {
+        let now = std::time::Instant::now();
+        let hash = block.header.block_hash();
+        // Only a block we asked this peer for may wait for its parent; an
+        // unasked block is processed only if it can connect right now.
+        let requested = inner.requests.take(&hash, addr, now);
+        let parent_known = inner.chain.blocks.contains_key(&block.header.prev_hash);
+        if !requested && !parent_known {
+            tracing::debug!(%addr, %hash, "dropping unrequested orphan block");
             return;
         }
-        if !inner.pending.push(block) {
-            return; // queue full — already counted as `have`
+        // sync.on_block records per-peer progress and returns false for
+        // blocks already connected; `have` is set only after a connect.
+        if !inner.sync.on_block(addr, &block) {
+            return;
+        }
+        if !inner.pending.push(block, now) {
+            return; // queue full (count or bytes) or already queued
         }
     }
     drain_pending(node, addr, reply).await;
@@ -701,7 +766,8 @@ async fn drain_pending(node: &Node, origin: SocketAddr, reply: &mpsc::Sender<Mes
     }
 }
 
-/// Pop all wanted block hashes for `peer`, chunked for getdata.
+/// Pop all wanted block hashes for `peer`, chunked for getdata, and
+/// record them as requested from that peer.
 fn drain_wanted(inner: &mut NodeInner, peer: SocketAddr) -> Vec<Hash256> {
     let mut out = Vec::new();
     loop {
@@ -713,6 +779,10 @@ fn drain_wanted(inner: &mut NodeInner, peer: SocketAddr) -> Vec<Hash256> {
         if out.len() >= 8_192 {
             break; // sanity cap — wanted is already window-bounded
         }
+    }
+    let now = std::time::Instant::now();
+    for h in &out {
+        inner.requests.note(*h, peer, now);
     }
     out
 }

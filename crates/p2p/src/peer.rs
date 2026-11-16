@@ -176,9 +176,40 @@ impl PeerManager {
         self.bans.remove(ip);
     }
 
-    /// Check whether a new connection from `addr` is allowed: not banned,
-    /// under per-IP/per-subnet/total/inbound caps.
-    pub fn admit(&self, addr: SocketAddr, outbound: bool) -> Result<(), PeerError> {
+    /// Admit a new connection from `addr` if it is not banned and under
+    /// the per-IP/per-subnet/total/inbound caps — and **reserve its slot
+    /// now** (a placeholder entry with `handshaken = false`). Checking the
+    /// caps here but taking the slot only after the handshake let many
+    /// concurrent connections all pass against the same table. `register`
+    /// fills the reservation; `remove` releases it (the sweep also drops
+    /// reservations whose handshake never finished).
+    pub fn admit(&mut self, addr: SocketAddr, outbound: bool) -> Result<(), PeerError> {
+        if self.peers.contains_key(&addr) {
+            return Err(PeerError::AddrLimit);
+        }
+        self.check_caps(addr, outbound)?;
+        let now = Instant::now();
+        self.peers.insert(
+            addr,
+            PeerState {
+                addr,
+                outbound,
+                version: 0,
+                services: 0,
+                start_height: 0,
+                user_agent: String::new(),
+                score: 0,
+                connected_at: now,
+                last_msg: now,
+                handshaken: false,
+                banned_until: 0,
+            },
+        );
+        Ok(())
+    }
+
+    /// Whether a connection from `addr` would fit under every cap.
+    fn check_caps(&self, addr: SocketAddr, outbound: bool) -> Result<(), PeerError> {
         if self.is_banned(&addr.ip()) {
             return Err(PeerError::Banned);
         }
@@ -213,7 +244,9 @@ impl PeerManager {
         Ok(())
     }
 
-    /// Record a peer after handshake completes.
+    /// Record a peer's `version` once its handshake completes. Fills the
+    /// slot `admit` reserved; without a reservation it admits first, so a
+    /// registration can never exceed a cap.
     pub fn register(
         &mut self,
         addr: SocketAddr,
@@ -231,25 +264,20 @@ impl PeerManager {
         else {
             return Err(PeerError::Handshake("expected version".into()));
         };
+        if !self.peers.contains_key(&addr) {
+            self.admit(addr, outbound)?;
+        }
         if *nonce == self.our_nonce {
+            self.peers.remove(&addr);
             return Err(PeerError::Handshake("self-connection".into()));
         }
-        self.peers.insert(
-            addr,
-            PeerState {
-                addr,
-                outbound,
-                version: *version,
-                services: *services,
-                start_height: *start_height,
-                user_agent: user_agent.clone(),
-                score: 0,
-                connected_at: Instant::now(),
-                last_msg: Instant::now(),
-                handshaken: false,
-                banned_until: 0,
-            },
-        );
+        let p = self.peers.get_mut(&addr).ok_or(PeerError::UnknownPeer)?;
+        p.outbound = outbound;
+        p.version = *version;
+        p.services = *services;
+        p.start_height = *start_height;
+        p.user_agent.clone_from(user_agent);
+        p.last_msg = Instant::now();
         Ok(())
     }
 

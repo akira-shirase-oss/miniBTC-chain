@@ -26,7 +26,8 @@ fn p2pkh_tx(miner: &Keypair, height: u32, value: u64) -> Transaction {
         inputs: vec![TxInput {
             prev: OutPoint::NULL,
             script_sig: {
-                let mut s = vec![0x02, height as u8];
+                // BIP34: the exact height push consensus requires.
+                let mut s = minibtc_consensus::coinbase_height_prefix(u64::from(height));
                 s.extend_from_slice(b"minibtc");
                 s
             },
@@ -265,4 +266,44 @@ fn snapshot_is_atomic_wipe_and_rewrite() {
     let loaded = store.load(params, genesis).unwrap().unwrap();
     assert_eq!(loaded.utxos.len(), chain.utxos.len());
     assert_eq!(loaded.blocks.len(), chain.blocks.len());
+}
+
+#[test]
+fn side_block_is_persisted_without_touching_chain_state() {
+    // A side-branch block is stored as block + inactive meta only; the
+    // recorded tip and UTXO set stay as they were.
+    let (mut chain, miner, params) = build_chain(3);
+    let (dir, _g) = tempdir();
+    let store = Store::open(&dir).unwrap();
+    store.snapshot(&chain).unwrap();
+
+    let genesis_hdr = chain.blocks[&chain.genesis].block.header;
+    let cb = p2pkh_tx(&miner, 1, params.subsidy_start);
+    let side = Block {
+        header: mine_header(BlockHeader {
+            version: 1,
+            prev_hash: genesis_hdr.block_hash(),
+            merkle_root: merkle_root(std::slice::from_ref(&cb)),
+            time: genesis_hdr.time + 7,
+            bits: params.pow_limit_bits,
+            nonce: 0,
+        }),
+        txs: vec![cb],
+    };
+    let side_hash = side.header.block_hash();
+    let tip = chain.tip;
+    chain.consider_block(side).unwrap();
+    assert_eq!(chain.tip, tip, "less work: tip unchanged");
+    store.put_side_block(&chain, &side_hash).unwrap();
+    drop(store);
+
+    let store = Store::open(&dir).unwrap();
+    let genesis = chain.blocks[&chain.genesis].block.clone();
+    let loaded = store.load(params, genesis).unwrap().unwrap();
+    assert_eq!(loaded.tip, tip);
+    assert_eq!(loaded.utxos.fingerprint(), chain.utxos.fingerprint());
+    assert_eq!(
+        loaded.blocks.get(&side_hash).map(|r| r.status),
+        Some(minibtc_chainstate::BlockStatus::Inactive)
+    );
 }

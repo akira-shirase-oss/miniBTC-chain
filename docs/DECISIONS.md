@@ -48,9 +48,11 @@ conceptually; sent as `Authorization: Bearer`). Binds `127.0.0.1` by default;
 
 `ChainParams` (subsidy, halving interval, powLimit, retarget interval &
 timespan, coinbase maturity, max block weight/size, min relay fee, ports,
-genesis message/time) loads from a TOML file per datadir with
-`minibtc-node --params`. Defaults target a watchable devnet (fast blocks,
-short retarget window); nothing assumes mainnet values.
+genesis message/time) loads from a JSON file passed with `--params`
+(node, CLI, MCP, wallet UI). The binary reads the file; consensus only
+parses and validates the text (`ChainParams::from_json`), so the pure
+crate never touches the filesystem. Defaults target a watchable devnet
+(fast blocks, short retarget window); nothing assumes mainnet values.
 
 ### D-007 — Sighash scope: SIGHASH_ALL now, others reserved
 
@@ -131,6 +133,82 @@ MiniBTC's posture:
 - `mnemonic_from_entropy` exists as a legitimate restore path and as
   the attack lab's simulation hook — it performs only the spec'd
   encoding and does not assess entropy quality.
+
+### D-013 — Proof-of-work schedule is a validation rule (2026-11-16)
+
+Retargeting used to live only in the node's miner: validation checked
+`hash <= target(bits)` but never which `bits` a block may claim. A peer
+could choose any difficulty. Validation now matches Bitcoin Core's
+`ContextualCheckBlockHeader`/`CheckProofOfWork`: `bits` must equal
+`Chain::next_bits_after(parent)` (parent's bits inside a period; at a
+boundary `next_bits_for_period`, i.e. span clamped to `[T/4, 4T]`,
+target rescaled, capped at `pow_limit_bits`) and the target may not be
+above the pow limit. The miner calls the same function. Two encoding
+bugs were fixed with it: `encode_compact` now shifts a mantissa whose
+top bit is set (Core's `GetCompact`; the sign bit used to swallow it),
+`decode_compact` rejects negative encodings, and the retarget division
+saturates instead of wrapping mod 2^256 (a slow period at the devnet
+limit used to make mining *harder*). Consequence: devnet datadirs
+written before this change may hold blocks whose bits no longer match
+the schedule; `--reindex` would refuse them. Start such devnets fresh.
+
+### D-014 — BIP34 coinbase height + BIP30 no-overwrite (2026-11-16)
+
+The blueprint's Tier-1 table does not list either rule, and nothing in
+it forbids them; both close a real hole. Without them two identical
+coinbases (same payout, value and scriptSig — the old miner wrote the
+height as a wrapping `u16`) share a txid, the second overwrites the
+first's unspent coin, and disconnecting it deletes the original.
+
+- **BIP34**: for every block at height ≥ 1 the coinbase scriptSig must
+  start with `coinbase_height_prefix(height)`, byte-for-byte Bitcoin
+  Core's `CScript() << nHeight` (OP_0 / OP_1..OP_16 / minimal
+  script-number push). Genesis is exempt (it is never validated), so the
+  genesis hash is unchanged. The miner and test fixtures use the same
+  function.
+- **BIP30**: always on (Core skips it after BIP34 activation for speed;
+  MiniBTC keeps it because the check is a hash lookup). A tx whose
+  outpoints already exist unspent — in the UTXO set or earlier in the
+  same block — is rejected; the UTXO overlay also refuses to overwrite
+  as a backstop.
+
+Consequence: blocks mined before this change carry the old `0x02 <u16>`
+height and fail BIP34, so older devnet datadirs cannot `--reindex`;
+start them fresh (same note as D-013).
+
+### D-015 — MCP spend gate: unsigned drafts, the signature is the approval (2026-11-16)
+
+The first MCP gate signed the payment at draft time (the blueprint asks
+for an unsigned draft), showed and capped the JSON fields stored next to
+the hex rather than the hex itself, and treated `<id>.approved` — a
+file any same-user process could write, minted by a command printed to
+the model — as human approval. Now:
+
+1. `draft_payment` runs `minibtc-cli wallet draft`, which builds an
+   **unsigned** transaction from `<wallet>.watch.json` (public scripts
+   only, refreshed whenever the owner uses the wallet with its
+   passphrase). The child process gets no keystore passphrase; the MCP
+   server never holds keys or the passphrase.
+2. **Approval is the owner's signature.** `minibtc-cli wallet
+   approve-draft` refuses to run unless stdin/stderr are a terminal,
+   decodes the draft's bytes, shows every output (address, amount,
+   change/payment) and the fee, reads the wallet passphrase from the
+   terminal (never from a flag or the environment), and signs only when
+   the owner types `sign`. The result, `<id>.signed.json`, cannot be
+   produced without the wallet's keys.
+3. `request_send` broadcasts only a signed transaction that is exactly
+   the draft plus signatures (`minibtc_wallet::draft::matches_draft`),
+   with input values fetched from the node, and applies the per-request
+   and per-day caps to the spend decoded from those bytes (outputs that
+   are not change, plus fee).
+
+Honest limit: an agent that has a shell *and* the wallet passphrase (for
+example exported in the same shell) can always run `minibtc-cli wallet
+send` itself; no MCP gate can stop that. Keep the passphrase out of any
+environment an agent can read. The passphrase prompt echoes (same as the
+CLI's other prompts; tracked with the CLI items). Existing wallets need
+one passphrase-unlocked command (e.g. `wallet balance`) to write their
+watch-only file.
 
 ## Open questions
 

@@ -34,7 +34,8 @@ pub fn coinbase_tx(miner: &Keypair, height: u32, value: u64) -> Transaction {
         inputs: vec![TxInput {
             prev: OutPoint::NULL,
             script_sig: {
-                let mut s = vec![0x02, height as u8];
+                // BIP34: the exact height push consensus requires.
+                let mut s = minibtc_consensus::coinbase_height_prefix(u64::from(height));
                 s.extend_from_slice(b"minibtc");
                 s
             },
@@ -49,12 +50,26 @@ pub fn coinbase_tx(miner: &Keypair, height: u32, value: u64) -> Transaction {
 }
 
 /// Assemble + mine a block on `prev`. `txs` must already include a
-/// coinbase first if desired; otherwise one is prepended.
+/// coinbase first if desired; otherwise one is prepended. The block
+/// carries its parent's bits, which is what the retarget schedule requires
+/// everywhere except at a period boundary (use [`build_block_with_bits`]
+/// there, with `Chain::next_bits_after`).
 pub fn build_block(
     prev: &BlockHeader,
     txs: Vec<Transaction>,
     time: u32,
     params: &ChainParams,
+) -> Block {
+    build_block_with_bits(prev, txs, time, params, prev.bits)
+}
+
+/// [`build_block`] with explicit compact `bits`.
+pub fn build_block_with_bits(
+    prev: &BlockHeader,
+    txs: Vec<Transaction>,
+    time: u32,
+    params: &ChainParams,
+    bits: u32,
 ) -> Block {
     let mut txs = txs;
     if txs.is_empty() || !txs[0].is_coinbase() {
@@ -73,7 +88,7 @@ pub fn build_block(
         prev_hash: prev.block_hash(),
         merkle_root: mr,
         time,
-        bits: params.pow_limit_bits,
+        bits,
         nonce: 0,
     });
     Block { header, txs }
@@ -110,7 +125,10 @@ pub fn mine_empty(chain: &mut Chain, miner: &Keypair, n: u32) {
     for h in 1..=(chain.height() + n) {
         time += 31;
         let cb = coinbase_tx(miner, h, chain.params.subsidy_start);
-        let blk = build_block(&prev, vec![cb], time, &chain.params);
+        let bits = chain
+            .next_bits_after(prev.block_hash())
+            .unwrap_or_else(|e| panic!("next bits: {e:?}"));
+        let blk = build_block_with_bits(&prev, vec![cb], time, &chain.params, bits);
         chain
             .consider_block(blk.clone())
             .unwrap_or_else(|e| panic!("consider_block failed: {e:?}"));

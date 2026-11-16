@@ -1459,7 +1459,12 @@ async fn main() -> Result<()> {
         .init();
     let args = Args::parse();
     let params = match &args.params {
-        Some(p) => ChainParams::load(p).context("load chain params")?,
+        Some(p) => {
+            let text = tokio::fs::read_to_string(p)
+                .await
+                .with_context(|| format!("read params file {}", p.display()))?;
+            ChainParams::from_json(&text).context("parse chain params")?
+        }
         None => ChainParams::devnet(),
     };
     let rpc = RpcClient::from_datadir(&args.datadir, args.rpc_port)

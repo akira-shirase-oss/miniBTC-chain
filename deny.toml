@@ -1,6 +1,5 @@
 [graph]
 all-features = true
-all-targets = true
 
 [advisories]
 ignore = []
@@ -15,6 +14,10 @@ ignore = true
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# Workspace members depend on each other by path with no version; every
+# member is `publish = false`, so those path deps are not wildcards that
+# could resolve to an unexpected registry crate.
+allow-wildcard-paths = true
 highlight = "all"
 deny = [
     { crate = "openssl-sys", reason = "one TLS stack: rustls via reqwest defaults; we never need OpenSSL" },

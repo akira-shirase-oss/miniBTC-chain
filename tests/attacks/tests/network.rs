@@ -475,11 +475,16 @@ fn attack_eclipse_diversity_limits_hold() {
     let mut pm = PeerManager::new();
     let mk_ver = || version_msg();
 
-    // Attacker registers 10 peers, all inside 10.9.x.x (one /16 subnet).
+    // Attacker tries to register 10 peers inside 10.9.x.x (one /16):
+    // registration applies the caps too, so only MAX_PER_SUBNET land.
+    let mut landed = 0usize;
     for i in 0..10u8 {
         let addr: SocketAddr = SocketAddr::from(([10, 9, 0, i], 18445));
-        pm.register(addr, false, &mk_ver()).unwrap();
+        if pm.register(addr, false, &mk_ver()).is_ok() {
+            landed += 1;
+        }
     }
+    assert_eq!(landed, minibtc_p2p::peer::MAX_PER_SUBNET);
     // Honest peers from diverse subnets fill remaining slots.
     for i in 0..20u8 {
         let addr: SocketAddr = SocketAddr::from(([192, 168, i, 1], 18445));
@@ -498,8 +503,8 @@ fn attack_eclipse_diversity_limits_hold() {
     let mut pm2 = PeerManager::new();
     for port in 1..=3u16 {
         let addr: SocketAddr = SocketAddr::from(([8, 8, 8, 8], port));
-        pm2.register(addr, false, &mk_ver()).unwrap();
-        let _ = pm2.admit(addr, false);
+        let res = pm2.register(addr, false, &mk_ver());
+        assert_eq!(res.is_ok(), port <= 2, "port {port}: {res:?}");
     }
     let fourth: SocketAddr = SocketAddr::from(([8, 8, 8, 8], 9999));
     let res = pm2.admit(fourth, false);
@@ -512,7 +517,11 @@ fn attack_eclipse_diversity_limits_hold() {
     let mut pm3 = PeerManager::new();
     for i in 0..5u8 {
         let addr: SocketAddr = SocketAddr::from(([172, 16, 0, i], 18445));
-        pm3.register(addr, false, &mk_ver()).unwrap();
+        let res = pm3.register(addr, false, &mk_ver());
+        assert_eq!(
+            res.is_ok(),
+            usize::from(i) < minibtc_p2p::peer::MAX_PER_SUBNET
+        );
     }
     let fifth: SocketAddr = SocketAddr::from(([172, 16, 9, 9], 18445));
     assert!(matches!(pm3.admit(fifth, false), Err(PeerError::AddrLimit)));

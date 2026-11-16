@@ -137,12 +137,38 @@ enum WalletCmd {
         /// Fee rate in sats/kvB.
         #[arg(long, default_value_t = 5)]
         fee_rate: u64,
-        /// Build and sign only — print the transaction hex + summary,
-        /// do NOT broadcast. Used by the MCP draft/payment gate.
-        #[arg(long)]
-        draft: bool,
         #[arg(long)]
         passphrase: Option<String>,
+    },
+    /// Build an UNSIGNED payment from the wallet's watch-only file (public
+    /// scripts only — no passphrase, no keys). Used by the MCP
+    /// draft_payment tool; prints the unsigned transaction as JSON.
+    Draft {
+        #[arg(long)]
+        name: String,
+        /// Destination address.
+        #[arg(long)]
+        to: String,
+        /// Amount in BTC (e.g. 1.5).
+        #[arg(long)]
+        amount: String,
+        /// Fee rate in sats/kvB.
+        #[arg(long, default_value_t = 5)]
+        fee_rate: u64,
+    },
+    /// Human approval of an MCP payment draft: decodes the draft's
+    /// bytes, shows every output and the fee, asks for the wallet
+    /// passphrase at this terminal, and signs only if you type `sign`.
+    /// Never reads the passphrase from flags or the environment.
+    ApproveDraft {
+        #[arg(long)]
+        name: String,
+        /// Draft id from the MCP draft_payment result.
+        #[arg(long)]
+        draft_id: String,
+        /// Draft store (default `<datadir>/mcp/drafts`).
+        #[arg(long)]
+        drafts_dir: Option<PathBuf>,
     },
     /// Wallet transaction history (received outputs + spends visible
     /// in current UTXOs).
@@ -218,7 +244,7 @@ async fn main() -> Result<()> {
         .with_target(false)
         .init();
     let cli = Cli::parse();
-    let params = load_params(&cli)?;
+    let params = load_params(&cli).await?;
     let datadir = cli.datadir.clone();
     let json_out = cli.json;
     let client = RpcClient::from_datadir(&cli.datadir, cli.rpc_port)
@@ -243,9 +269,15 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn load_params(cli: &Cli) -> Result<ChainParams> {
+/// Chain params: read the file here (consensus only parses), else devnet.
+async fn load_params(cli: &Cli) -> Result<ChainParams> {
     match &cli.params {
-        Some(p) => ChainParams::load(p).context("load chain params"),
+        Some(p) => {
+            let text = tokio::fs::read_to_string(p)
+                .await
+                .with_context(|| format!("read params file {}", p.display()))?;
+            ChainParams::from_json(&text).context("parse chain params")
+        }
         None => Ok(ChainParams::devnet()),
     }
 }
@@ -367,6 +399,58 @@ fn save_wallet(
     Ok(())
 }
 
+/// The watch-only file next to a wallet: public scripts only.
+fn watch_path(datadir: &Path, name: &str) -> Result<PathBuf> {
+    Ok(wallet_path(datadir, name)?.with_extension("watch.json"))
+}
+
+/// Write the watch-only file (every derived script in the gap window and
+/// the change scripts not yet issued). Public data: hashes of public keys.
+/// Lets `wallet draft` build unsigned payments without the passphrase.
+fn write_watch_file(datadir: &Path, name: &str, w: &mut Wallet) -> Result<()> {
+    w.prime_lookahead(GAP_LIMIT)?;
+    let (all, fresh_change) = w.watch_scripts();
+    let v = json!({
+        "scripts": all.iter().map(|s| hex_encode(s)).collect::<Vec<_>>(),
+        "change_scripts": fresh_change.iter().map(|s| hex_encode(s)).collect::<Vec<_>>(),
+    });
+    std::fs::write(watch_path(datadir, name)?, serde_json::to_vec_pretty(&v)?)?;
+    Ok(())
+}
+
+/// Persist issuance counters (`next_receive`, `next_change`).
+fn save_indices(datadir: &Path, name: &str, indices: (u32, u32)) -> Result<()> {
+    let state = json!({ "next_receive": indices.0, "next_change": indices.1 });
+    std::fs::write(
+        wallet_path(datadir, name)?.with_extension("state.json"),
+        serde_json::to_string_pretty(&state)?,
+    )?;
+    Ok(())
+}
+
+/// The approval gate runs only where a person can type: stdin and stderr
+/// must be a terminal, so a script or an agent piping input cannot drive
+/// it.
+fn require_interactive() -> Result<()> {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        anyhow::bail!(
+            "approve-draft must be run by a person at an interactive terminal \
+             (stdin/stderr are not a terminal)"
+        );
+    }
+    Ok(())
+}
+
+/// Read one line typed at the terminal after `prompt`.
+fn prompt_line(prompt: &str) -> Result<String> {
+    eprint!("{prompt}");
+    std::io::stderr().flush()?;
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    Ok(line.trim_end().to_string())
+}
+
 /// Load + decrypt a wallet file into a `Wallet` (not yet scanned).
 fn load_wallet(
     datadir: &Path,
@@ -462,11 +546,125 @@ async fn load_and_scan(
     let pp = keystore_passphrase(passphrase, false)?;
     let mut w = load_wallet(datadir, name, params, &pp)?;
     // Derive the used+lookahead window so scan sees every address that
-    // could hold funds (past sessions' indices included).
-    w.prime_lookahead(GAP_LIMIT)?;
+    // could hold funds (past sessions' indices included), and refresh the
+    // public watch-only file for passphrase-free drafting.
+    write_watch_file(datadir, name, &mut w)?;
     let (view, tip) = fetch_utxo_view(client).await?;
     w.scan(&view, tip);
     Ok((w, tip))
+}
+
+/// The human gate for an MCP payment draft (see `WalletCmd::ApproveDraft`).
+/// Writes `<id>.signed.json` next to the draft only after the person at
+/// the terminal saw the decoded transaction, typed the wallet passphrase
+/// and typed `sign`.
+async fn approve_draft(
+    datadir: &Path,
+    client: &RpcClient,
+    params: &ChainParams,
+    name: &str,
+    draft_id: &str,
+    drafts_dir: Option<PathBuf>,
+) -> Result<()> {
+    use minibtc_wallet::draft::{ensure_unsigned, p2pkh_address, spend_summary};
+    require_interactive()?;
+    if draft_id.is_empty()
+        || draft_id.len() > 64
+        || !draft_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+    {
+        anyhow::bail!("invalid draft id");
+    }
+    let dir = drafts_dir.unwrap_or_else(|| datadir.join("mcp").join("drafts"));
+    let draft_text = std::fs::read_to_string(dir.join(format!("{draft_id}.json")))
+        .with_context(|| format!("no such draft {draft_id}"))?;
+    let draft: Value = serde_json::from_str(&draft_text).context("draft file")?;
+    if draft["wallet"].as_str() != Some(name) {
+        anyhow::bail!("draft {draft_id} is not for wallet {name}");
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if draft["expires_unix"].as_u64().unwrap_or(0) < now {
+        anyhow::bail!("draft {draft_id} expired; ask for a new draft");
+    }
+    let bytes = hex_decode(draft["unsigned_hex"].as_str().unwrap_or("")).context("draft hex")?;
+    let tx = minibtc_primitives::Transaction::decode(&bytes).context("decode draft")?;
+    ensure_unsigned(&tx)?;
+
+    let pp = prompt_line("Wallet passphrase (approves this payment): ")?;
+    let mut w = load_wallet(datadir, name, params, &pp)?;
+    drop(pp);
+    w.prime_lookahead(GAP_LIMIT)?;
+    let (view, tip) = fetch_utxo_view(client).await?;
+    w.scan(&view, tip);
+
+    // Every input must be a spendable coin of this wallet.
+    let mut values = Vec::with_capacity(tx.inputs.len());
+    for inp in &tx.inputs {
+        let u = w
+            .utxos()
+            .iter()
+            .find(|u| u.outpoint == inp.prev && u.spendable(params.coinbase_maturity))
+            .with_context(|| format!("input {} is not a spendable coin of {name}", inp.prev))?;
+        values.push(u.output.value);
+    }
+    let change: Vec<usize> = tx
+        .outputs
+        .iter()
+        .enumerate()
+        .filter(|(_, o)| w.owns_script(&o.script_pubkey))
+        .map(|(i, _)| i)
+        .collect();
+    let s = spend_summary(&tx, &values, &change)?;
+
+    eprintln!("\n=== PAYMENT DRAFT {draft_id} (decoded from the transaction bytes) ===");
+    for (i, o) in tx.outputs.iter().enumerate() {
+        let to = p2pkh_address(&o.script_pubkey, params.address_version)
+            .map(|a| a.to_string())
+            .unwrap_or_else(|| format!("script {}", hex_encode(&o.script_pubkey)));
+        let tag = if change.contains(&i) {
+            "change (back to this wallet)"
+        } else {
+            "PAYMENT"
+        };
+        eprintln!("  output {i}: {} sats -> {to}  [{tag}]", o.value.sats());
+    }
+    eprintln!(
+        "  inputs: {} coins, {} sats",
+        tx.inputs.len(),
+        s.total_in.sats()
+    );
+    eprintln!("  fee:    {} sats", s.fee.sats());
+    eprintln!("  leaves the wallet: {} sats", s.spend.sats());
+    if prompt_line("Type `sign` to sign exactly this transaction: ")? != "sign" {
+        anyhow::bail!("not approved; nothing signed");
+    }
+    let signed = w.sign_payment(&tx).context("sign")?;
+    for &i in &change {
+        w.mark_change_used(&tx.outputs[i].script_pubkey);
+    }
+    save_indices(datadir, name, w.indices())?;
+    write_watch_file(datadir, name, &mut w)?;
+    let path = dir.join(format!("{draft_id}.signed.json"));
+    let rec = json!({
+        "draft_id": draft_id,
+        "signed_hex": hex_encode(&signed.encode()),
+        "change_outputs": change,
+        "approved_unix": now,
+    });
+    std::fs::write(&path, serde_json::to_vec_pretty(&rec)?)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    eprintln!(
+        "signed. The assistant may now call request_send for {draft_id}; spend caps still apply."
+    );
+    Ok(())
 }
 
 // ---------- command handlers ----------
@@ -508,12 +706,13 @@ async fn wallet_cmd(
             // The mnemonic IS the wallet — show it once, loudly.
             println!("=== WALLET CREATED: {} ===", name);
             println!("MNEMONIC (back this up NOW — never shown again):");
-            println!("{}", mnemonic.phrase());
+            println!("{}", mnemonic.phrase()); // secret-display-once: wallet create shows the new seed exactly once
             // First address, then persist seed + issuance counters.
             let addr = w.new_address()?;
             let seed = minibtc_wallet::seed_from_mnemonic(&mnemonic.phrase(), &bip39_pass)
                 .context("derive seed")?;
             save_wallet(datadir, &name, &seed, &pp, w.indices())?;
+            write_watch_file(datadir, &name, &mut w)?;
             println!("first address: {}", addr);
             Ok(())
         }
@@ -553,6 +752,7 @@ async fn wallet_cmd(
             )?;
             let addr = w0.new_address()?;
             save_wallet(datadir, &name, &seed, &pp, w0.indices())?;
+            write_watch_file(datadir, &name, &mut w0)?;
             println!("=== WALLET RESTORED: {} ===", name);
             println!("first address: {}", addr);
             Ok(())
@@ -607,7 +807,6 @@ async fn wallet_cmd(
             to,
             amount,
             fee_rate,
-            draft,
             passphrase,
         } => {
             let sats = parse_amount(&amount)?;
@@ -621,45 +820,8 @@ async fn wallet_cmd(
             let tx = w
                 .build_and_sign(&dest_script, Sats(sats), fee_rate, 0)
                 .context("build transaction")?;
-            // Local sanity re-validation before broadcasting.
             let txid = tx.txid();
             let hex = hex_encode(&tx.encode());
-            if draft {
-                // Fee = sum(inputs) - sum(outputs); inputs resolve via
-                // the wallet's scanned UTXO set.
-                let mut in_sum = 0u64;
-                for inp in &tx.inputs {
-                    if let Some(u) = w.utxos().iter().find(|u| u.outpoint == inp.prev) {
-                        in_sum = in_sum.saturating_add(u.output.value.sats());
-                    }
-                }
-                let out_sum: u64 = tx.outputs.iter().map(|o| o.value.sats()).sum();
-                let outs: Vec<Value> = tx
-                    .outputs
-                    .iter()
-                    .enumerate()
-                    .map(|(i, o)| {
-                        json!({
-                            "n": i,
-                            "value_sats": o.value.sats(),
-                            "script_pubkey_hex": hex_encode(&o.script_pubkey),
-                        })
-                    })
-                    .collect();
-                println!(
-                    "{}",
-                    json!({
-                        "draft": true,
-                        "txid": txid.to_hex(),
-                        "hex": hex,
-                        "fee_sats": in_sum.saturating_sub(out_sum),
-                        "inputs": tx.inputs.len(),
-                        "outputs": outs,
-                        "note": "signed but NOT broadcast — review before sending",
-                    })
-                );
-                return Ok(());
-            }
             match client.sendrawtransaction(&hex).await {
                 Ok(ret) => {
                     if json_out {
@@ -680,6 +842,94 @@ async fn wallet_cmd(
                 }
             }
         }
+        WalletCmd::Draft {
+            name,
+            to,
+            amount,
+            fee_rate,
+        } => {
+            let sats = parse_amount(&amount)?;
+            let dest = Address::from_base58(&to, Some(params.address_version))
+                .context("invalid destination address")?;
+            let dest_script = minibtc_script::Script::p2pkh(&dest.hash160)
+                .as_bytes()
+                .to_vec();
+            let watch_text =
+                std::fs::read_to_string(watch_path(datadir, &name)?).with_context(|| {
+                    format!(
+                        "no watch-only file for wallet {name}: run any wallet command \
+                         with the passphrase once (e.g. `wallet balance`) to create it"
+                    )
+                })?;
+            let watch: Value = serde_json::from_str(&watch_text).context("watch file")?;
+            let decode_list = |key: &str| -> Result<Vec<Vec<u8>>> {
+                watch[key]
+                    .as_array()
+                    .context("watch file malformed")?
+                    .iter()
+                    .map(|v| hex_decode(v.as_str().unwrap_or("")).context("watch script hex"))
+                    .collect()
+            };
+            let scripts: std::collections::HashSet<Vec<u8>> =
+                decode_list("scripts")?.into_iter().collect();
+            let change = decode_list("change_scripts")?
+                .into_iter()
+                .next()
+                .context("watch file has no unused change script; refresh it")?;
+            let (view, tip) = fetch_utxo_view(client).await?;
+            let mut coins: Vec<minibtc_wallet::WalletUtxo> = view
+                .map
+                .iter()
+                .filter(|(_, e)| scripts.contains(&e.output.script_pubkey))
+                .map(|(op, e)| minibtc_wallet::WalletUtxo {
+                    outpoint: *op,
+                    output: e.output.clone(),
+                    height: e.height,
+                    coinbase: e.coinbase,
+                    tip_height: tip,
+                })
+                .filter(|u| u.spendable(params.coinbase_maturity))
+                .collect();
+            coins.sort_by_key(|u| (u.outpoint.txid, u.outpoint.vout)); // deterministic
+            let p = minibtc_wallet::build_unsigned_payment(
+                &coins,
+                &change,
+                &dest_script,
+                Sats(sats),
+                fee_rate,
+                0,
+            )
+            .context("build unsigned payment")?;
+            let inputs: Vec<Value> =
+                p.tx.inputs
+                    .iter()
+                    .zip(&p.prevouts)
+                    .map(|(i, prev)| {
+                        json!({
+                            "txid": i.prev.txid.to_hex(),
+                            "vout": i.prev.vout,
+                            "value_sats": prev.value.sats(),
+                        })
+                    })
+                    .collect();
+            println!(
+                "{}",
+                json!({
+                    "draft": true,
+                    "unsigned": true,
+                    "unsigned_hex": hex_encode(&p.tx.encode()),
+                    "inputs": inputs,
+                    "change_index": p.change_index,
+                    "fee_sats": p.fee.sats(),
+                })
+            );
+            Ok(())
+        }
+        WalletCmd::ApproveDraft {
+            name,
+            draft_id,
+            drafts_dir,
+        } => approve_draft(datadir, client, params, &name, &draft_id, drafts_dir).await,
         WalletCmd::History { name, passphrase } => {
             let (w, _tip) =
                 load_and_scan(datadir, client, params, &name, passphrase.as_deref()).await?;

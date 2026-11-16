@@ -14,7 +14,7 @@ pub mod tx;
 
 pub use block::{
     Block, BlockHeader, MAX_BLOCK_SIZE, MAX_BLOCK_TXS, MerkleError, check_merkle_root, merkle_root,
-    merkle_root_from_txids,
+    merkle_root_and_mutation, merkle_root_from_txids,
 };
 pub use de::{ReadError, Reader};
 pub use money::{MoneyError, Sats};
