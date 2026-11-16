@@ -58,3 +58,16 @@ evidence — never a claim without a run.
 - `docs/ROADMAP.md` — P0–P13 order and proof gates
 - `docs/DECISIONS.md` — deliberate deviations and open questions
 - `docs/UI.md` — explorer + wallet web UI routes, session/CSRF model, send flow
+
+## License
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+at your option, matching `license = "Apache-2.0 OR MIT"` in `Cargo.toml`.
+Unless you explicitly state otherwise, any contribution intentionally
+submitted for inclusion in this work by you, as defined in the Apache-2.0
+license, shall be dual licensed as above, without any additional terms or
+conditions.
