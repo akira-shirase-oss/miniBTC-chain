@@ -10,6 +10,9 @@
 //!   ties break toward the earlier-seen tip (Bitcoin's behavior).
 //! - Coinbase outputs are unspendable until `params.coinbase_maturity`
 //!   confirmations deep — checked at *connect* time, not mempool time.
+//! - Applying a block is atomic: transactions are applied to a
+//!   [`UtxoOverlay`] and the base set changes only when every transaction
+//!   succeeded. A block rejected half-way leaves no trace.
 //!
 //! This crate owns memory state; `minibtc-storage` persists it. Both must
 //! agree — the consistency test replays blocks into a fresh chain and
@@ -35,6 +38,190 @@ pub struct UtxoEntry {
 #[derive(Debug, Default)]
 pub struct UtxoSet {
     map: HashMap<OutPoint, UtxoEntry>,
+}
+
+/// Read access to full UTXO entries (output + height + coinbase flag) —
+/// what connect-time rules such as coinbase maturity need. Implemented by
+/// the base [`UtxoSet`] and by every [`UtxoOverlay`] stacked on it.
+pub trait CoinView {
+    /// The unspent entry at `op`, if any.
+    fn coin(&self, op: &OutPoint) -> Option<&UtxoEntry>;
+}
+
+impl CoinView for UtxoSet {
+    fn coin(&self, op: &OutPoint) -> Option<&UtxoEntry> {
+        self.map.get(op)
+    }
+}
+
+/// A batch of UTXO changes produced by an overlay: `Some` = the outpoint
+/// is (now) unspent with this entry, `None` = it is spent/removed.
+#[derive(Debug, Default)]
+pub struct UtxoChanges(HashMap<OutPoint, Option<UtxoEntry>>);
+
+impl UtxoChanges {
+    /// Number of touched outpoints.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether nothing was touched.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// A scratch view over a [`CoinView`]: reads fall through to the base,
+/// writes stay here. Blocks are applied to an overlay and the result is
+/// committed with [`UtxoSet::commit`] only if the whole block applied —
+/// so a failure at transaction *k* cannot leave transactions `0..k`
+/// applied. Overlays stack (a block overlay over a reorg overlay).
+#[derive(Debug)]
+pub struct UtxoOverlay<'a, B: CoinView + ?Sized = UtxoSet> {
+    base: &'a B,
+    changes: HashMap<OutPoint, Option<UtxoEntry>>,
+}
+
+impl<B: CoinView + ?Sized> CoinView for UtxoOverlay<'_, B> {
+    fn coin(&self, op: &OutPoint) -> Option<&UtxoEntry> {
+        match self.changes.get(op) {
+            Some(change) => change.as_ref(),
+            None => self.base.coin(op),
+        }
+    }
+}
+
+impl<B: CoinView + ?Sized> UtxoView for UtxoOverlay<'_, B> {
+    fn get(&self, op: &OutPoint) -> Option<TxOutput> {
+        self.coin(op).map(|e| e.output.clone())
+    }
+}
+
+impl<'a, B: CoinView + ?Sized> UtxoOverlay<'a, B> {
+    /// An empty overlay over `base`.
+    pub fn new(base: &'a B) -> Self {
+        Self {
+            base,
+            changes: HashMap::new(),
+        }
+    }
+
+    /// Spend `op`: returns the entry it held, or `MissingPrevout`.
+    fn spend(&mut self, op: OutPoint) -> Result<UtxoEntry, ChainError> {
+        let entry = self
+            .coin(&op)
+            .cloned()
+            .ok_or(ChainError::MissingPrevout(op))?;
+        self.changes.insert(op, None);
+        Ok(entry)
+    }
+
+    /// Make `op` unspent with `entry` (create, or restore during undo).
+    fn put(&mut self, op: OutPoint, entry: UtxoEntry) {
+        self.changes.insert(op, Some(entry));
+    }
+
+    /// Remove `op` unconditionally (undo of a created output).
+    fn erase(&mut self, op: OutPoint) {
+        self.changes.insert(op, None);
+    }
+
+    /// Layer a child overlay's changes on top of this one.
+    pub fn absorb(&mut self, changes: UtxoChanges) {
+        self.changes.extend(changes.0);
+    }
+
+    /// The accumulated changes, to commit or drop.
+    pub fn into_changes(self) -> UtxoChanges {
+        UtxoChanges(self.changes)
+    }
+
+    /// Apply one transaction at `height`; returns its undo record. All
+    /// inputs must exist (in the overlay or the base).
+    pub fn apply_tx(
+        &mut self,
+        tx: &Transaction,
+        txid: Hash256,
+        height: u32,
+        is_coinbase: bool,
+    ) -> Result<UndoTx, ChainError> {
+        let mut undo = UndoTx::default();
+        if !is_coinbase {
+            for inp in &tx.inputs {
+                let entry = self.spend(inp.prev)?;
+                undo.spent.push((inp.prev, entry));
+            }
+        }
+        for (vout, out) in tx.outputs.iter().enumerate() {
+            let op = OutPoint {
+                txid,
+                vout: vout as u32,
+            };
+            self.put(
+                op,
+                UtxoEntry {
+                    output: out.clone(),
+                    height,
+                    coinbase: is_coinbase,
+                },
+            );
+            undo.created.push(op);
+        }
+        Ok(undo)
+    }
+
+    /// Reverse one transaction's application (exact, via its undo record).
+    pub fn undo_tx(&mut self, undo: &UndoTx) {
+        for op in &undo.created {
+            self.erase(*op);
+        }
+        for (op, entry) in undo.spent.iter().rev() {
+            self.put(*op, entry.clone());
+        }
+    }
+
+    /// Apply every transaction of `block` at `height`, enforcing coinbase
+    /// maturity against this view (so a coinbase created earlier in the
+    /// same block is immature too). On error the overlay must be dropped:
+    /// it may hold the effects of the transactions before the failure.
+    pub fn apply_block(
+        &mut self,
+        block: &Block,
+        height: u32,
+        coinbase_maturity: u32,
+    ) -> Result<UndoData, ChainError> {
+        let mut undo = UndoData::default();
+        for (i, tx) in block.txs.iter().enumerate() {
+            let is_cb = i == 0;
+            if !is_cb {
+                self.check_maturity(tx, height, coinbase_maturity)?;
+            }
+            let u = self.apply_tx(tx, tx.txid(), height, is_cb)?;
+            undo.txs.push(u);
+        }
+        Ok(undo)
+    }
+
+    /// Enforce coinbase maturity for every input of `tx` spent at
+    /// `spend_height`. Missing prevouts are left to `apply_tx`.
+    fn check_maturity(
+        &self,
+        tx: &Transaction,
+        spend_height: u32,
+        maturity: u32,
+    ) -> Result<(), ChainError> {
+        for inp in &tx.inputs {
+            if let Some(entry) = self.coin(&inp.prev)
+                && entry.coinbase
+            {
+                let depth = spend_height.saturating_sub(entry.height);
+                if depth < maturity {
+                    return Err(ChainError::ImmatureCoinbase { depth, maturity });
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// What applying one transaction did — the unit of undo data.
@@ -107,9 +294,9 @@ impl UtxoSet {
     /// `is_coinbase` marks the tx (its inputs are not spent — coinbase
     /// creates outputs from nothing).
     ///
-    /// Panics-free: returns `Err` on any inconsistency — callers treat
-    /// that as "this block is invalid", which validation should have
-    /// caught earlier (defense in depth).
+    /// Atomic and panic-free: on `Err` (a missing prevout, which
+    /// validation should have caught — defense in depth) the set is
+    /// unchanged.
     pub fn apply_tx(
         &mut self,
         tx: &Transaction,
@@ -117,42 +304,35 @@ impl UtxoSet {
         height: u32,
         is_coinbase: bool,
     ) -> Result<UndoTx, ChainError> {
-        let mut undo = UndoTx::default();
-        if !is_coinbase {
-            for inp in &tx.inputs {
-                let entry = self
-                    .map
-                    .remove(&inp.prev)
-                    .ok_or(ChainError::MissingPrevout(inp.prev))?;
-                undo.spent.push((inp.prev, entry));
-            }
-        }
-        for (vout, out) in tx.outputs.iter().enumerate() {
-            let op = OutPoint {
-                txid,
-                vout: vout as u32,
-            };
-            self.map.insert(
-                op,
-                UtxoEntry {
-                    output: out.clone(),
-                    height,
-                    coinbase: is_coinbase,
-                },
-            );
-            undo.created.push(op);
-        }
+        let mut overlay = UtxoOverlay::new(&*self);
+        let undo = overlay.apply_tx(tx, txid, height, is_coinbase)?;
+        let changes = overlay.into_changes();
+        self.commit(changes);
         Ok(undo)
     }
 
     /// Reverse one transaction's application.
-    pub fn undo_tx(&mut self, _tx: &Transaction, txid: Hash256, undo: &UndoTx) {
+    pub fn undo_tx(&mut self, undo: &UndoTx) {
         for op in &undo.created {
             self.map.remove(op);
         }
-        let _ = txid;
         for (op, entry) in undo.spent.iter().rev() {
             self.map.insert(*op, entry.clone());
+        }
+    }
+
+    /// Write an overlay's changes into the set. Only called once the
+    /// whole block (or reorg) the overlay holds has succeeded.
+    pub fn commit(&mut self, changes: UtxoChanges) {
+        for (op, change) in changes.0 {
+            match change {
+                Some(entry) => {
+                    self.map.insert(op, entry);
+                }
+                None => {
+                    self.map.remove(&op);
+                }
+            }
         }
     }
 }
@@ -262,26 +442,6 @@ impl Chain {
             .map_err(|e| ChainError::InvalidBlock(BlockError::Pow(e)))
     }
 
-    /// Enforce coinbase maturity for every input of `tx`.
-    fn check_maturity(&self, tx: &Transaction, spend_height: u32) -> Result<(), ChainError> {
-        for inp in &tx.inputs {
-            if let Some(entry) = self.utxos.get(&inp.prev)
-                && entry.coinbase
-            {
-                let depth = spend_height.saturating_sub(entry.height);
-                if depth < self.params.coinbase_maturity {
-                    return Err(ChainError::ImmatureCoinbase {
-                        depth,
-                        maturity: self.params.coinbase_maturity,
-                    });
-                }
-            }
-            // Missing prevouts are validation's job; here we only check
-            // maturity for entries that exist.
-        }
-        Ok(())
-    }
-
     /// Connect `block` as the new tip — caller guarantees it builds on
     /// current tip and is fully validated. Applies UTXOs, stores undo.
     pub fn connect_tip(&mut self, block: Block) -> Result<(), ChainError> {
@@ -322,18 +482,14 @@ impl Chain {
     }
 
     /// Apply block txs at an explicit height (used by connect_tip and
-    /// reorg paths where height is already known).
+    /// reorg paths where height is already known). Atomic: the block is
+    /// applied to an overlay and committed only if every tx applied, so
+    /// an error leaves `self.utxos` exactly as it was.
     fn apply_block_at(&mut self, block: &Block, height: u32) -> Result<UndoData, ChainError> {
-        let mut undo = UndoData::default();
-        for (i, tx) in block.txs.iter().enumerate() {
-            let is_cb = i == 0;
-            if !is_cb {
-                self.check_maturity(tx, height)?;
-            }
-            let txid = tx.txid();
-            let u = self.utxos.apply_tx(tx, txid, height, is_cb)?;
-            undo.txs.push(u);
-        }
+        let mut overlay = UtxoOverlay::new(&self.utxos);
+        let undo = overlay.apply_block(block, height, self.params.coinbase_maturity)?;
+        let changes = overlay.into_changes();
+        self.utxos.commit(changes);
         Ok(undo)
     }
 
@@ -347,11 +503,8 @@ impl Chain {
             .clone();
         let undo = self.undos.remove(&tip_hash).ok_or(ChainError::NotTip)?;
         // Reverse txs in reverse order.
-        for (i, tx) in rec.block.txs.iter().enumerate().rev() {
-            let txid = tx.txid();
-            if let Some(u) = undo.txs.get(i) {
-                self.utxos.undo_tx(tx, txid, u);
-            }
+        for u in undo.txs.iter().rev() {
+            self.utxos.undo_tx(u);
         }
         // Parent becomes tip.
         let parent_hash = rec.block.header.prev_hash;

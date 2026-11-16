@@ -66,6 +66,11 @@ Hard rules:
 - **UTXO set** is derived state, rebuildable by replaying blocks
   (`--reindex`). Storage commits a block, its undo data and index updates in
   one redb transaction.
+- **Block apply is atomic.** Connect applies a block's transactions to a
+  `UtxoOverlay` (reads fall through to the UTXO set, writes stay in the
+  overlay) and commits only when every transaction applied; a block
+  rejected half-way leaves the set, tip and index untouched
+  (`tests/attacks/tests/block_apply.rs`).
 - **Block index** tracks every known header with height, cumulative work and
   status (valid / invalid / headers-only / assumevalid-none).
 - **Reorgs** disconnect blocks in reverse using undo data (restores spent
