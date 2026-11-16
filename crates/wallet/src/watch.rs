@@ -64,35 +64,44 @@ pub fn watch_json(wallet: &mut crate::Wallet, gap: u32) -> Result<Vec<u8>, Watch
 }
 
 /// Write watch-file bytes owner-only and atomically: a `0600` temp file in
-/// the same directory, flushed to disk, then renamed over `path`.
+/// the same directory, flushed to disk, then renamed over `path`. Each write
+/// gets its own temp name (file name + process id + a per-process counter),
+/// so the CLI and the wallet UI writing at the same moment never share a
+/// temp file; the last rename wins and the file is always one whole write.
 pub fn write_watch_bytes(path: &Path, bytes: &[u8]) -> Result<(), WatchError> {
-    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
     let io = |source| WatchError::Io {
         path: path.display().to_string(),
         source,
     };
-    let tmp = path.with_extension("json.tmp");
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "watch".into());
+    // Relaxed: the counter only needs to be unique, not ordered.
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_file_name(format!(".{name}.{}.{seq}.tmp", std::process::id()));
+    let result = write_new_file(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result.map_err(io)
+}
+
+/// Create `tmp` (0600, must not exist), write `bytes`, fsync.
+fn write_new_file(tmp: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
     let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    let mut f = opts.open(&tmp).map_err(io)?;
-    #[cfg(unix)]
-    {
-        // `mode` applies only when the file is created; a leftover temp
-        // file from an older run keeps its mode unless reset.
-        use std::os::unix::fs::PermissionsExt;
-        f.set_permissions(std::fs::Permissions::from_mode(0o600))
-            .map_err(io)?;
-    }
-    f.write_all(bytes).map_err(io)?;
-    f.sync_all().map_err(io)?;
-    drop(f);
-    std::fs::rename(&tmp, path).map_err(io)?;
-    Ok(())
+    let mut f = opts.open(tmp)?;
+    f.write_all(bytes)?;
+    f.sync_all()
 }
 
 /// [`watch_json`] + [`write_watch_bytes`].
@@ -159,6 +168,39 @@ mod tests {
         assert_eq!(set.fresh_change.len(), 3);
         let (all, _) = w.watch_scripts();
         assert!(all.iter().all(|s| set.scripts.contains(s)));
+    }
+
+    #[test]
+    fn concurrent_writers_never_mix_or_fail() {
+        // The CLI and the wallet UI can write the same watch file at once.
+        // With one shared temp path their writes interleaved or the rename
+        // found the temp file already moved.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("w.watch.json");
+        let workers: Vec<_> = (0..8u8)
+            .map(|t| {
+                let p = p.clone();
+                std::thread::spawn(move || {
+                    let body = format!(
+                        r#"{{"scripts":["{}"],"change_scripts":[]}}"#,
+                        format!("{t:02x}").repeat(4_000)
+                    );
+                    (0..50)
+                        .filter(|_| write_watch_bytes(&p, body.as_bytes()).is_err())
+                        .count()
+                })
+            })
+            .collect();
+        let failures: usize = workers.into_iter().map(|w| w.join().unwrap()).sum();
+        assert_eq!(failures, 0, "a concurrent write failed");
+        let set = read_watch_file(&p).expect("final file is one whole write");
+        assert_eq!(set.scripts.len(), 1);
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp files left behind");
     }
 
     #[test]

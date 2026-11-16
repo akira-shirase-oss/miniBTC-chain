@@ -41,6 +41,9 @@ pub const PROTOCOL_VERSION: i32 = 70_015;
 const USER_AGENT: &str = "/MiniBTC:0.1.0/";
 /// Max addr entries learned per `addr` message.
 const ADDR_LEARN_CAP: usize = 100;
+/// Penalty for an unsolicited headers message that adds nothing (ten of
+/// them reach the ban threshold).
+const SCORE_USELESS_HEADERS: i32 = -10;
 /// Max inv items processed per message.
 const INV_PROCESS_CAP: usize = 1_024;
 /// Accepted sockets allowed to be mid-handshake at once. Further inbound
@@ -361,7 +364,8 @@ async fn session(
         };
         if i64::from(start_height) > i64::from(our_h) {
             let locator = {
-                let inner = node.inner.lock().unwrap_or_else(|e| e.into_inner());
+                let mut inner = node.inner.lock().unwrap_or_else(|e| e.into_inner());
+                inner.sync.note_getheaders_sent(&addr);
                 sync_locator(&inner)
             };
             let _ = codec::write_message(
@@ -553,7 +557,16 @@ async fn handle_message(
             // linkage), so the batch's last header sits at
             // tip_height_at_receipt + len(headers).
             let base_h = inner.chain.height();
-            match inner.sync.on_headers(addr, &headers) {
+            let NodeInner { sync, chain, .. } = &mut *inner;
+            let lookup = |h: &Hash256| {
+                chain.blocks.get(h).map(|r| minibtc_p2p::sync::HeaderInfo {
+                    height: r.height,
+                    bits: r.block.header.bits,
+                    time: r.block.header.time,
+                    prev: r.block.header.prev_hash,
+                })
+            };
+            match sync.on_headers(addr, &headers, lookup) {
                 Ok(_) => {
                     let claimed_h = base_h.saturating_add(headers.len() as u32);
                     inner
@@ -568,7 +581,14 @@ async fn handle_message(
                 }
                 Err(e) => {
                     tracing::debug!(%addr, "bad headers: {e}");
-                    inner.peers.score(&addr, SCORE_BAD_MESSAGE);
+                    // Unsolicited nothing-new batches cost less than invalid
+                    // ones but still add up to a ban; every other error is
+                    // a protocol violation.
+                    let penalty = match e {
+                        minibtc_p2p::sync::SyncError::NothingNew => SCORE_USELESS_HEADERS,
+                        _ => SCORE_BAD_MESSAGE,
+                    };
+                    inner.peers.score(&addr, penalty);
                 }
             }
             true
@@ -718,6 +738,7 @@ async fn handle_block(node: &Node, addr: SocketAddr, block: Block, reply: &mpsc:
         // the new tip blocks, whose ancestors we never requested.
         if !parent_known {
             let locator = sync_locator(&inner);
+            inner.sync.note_getheaders_sent(&addr);
             let _ = reply.try_send(Message::GetHeaders {
                 locator,
                 stop: Hash256::ZERO,
@@ -770,7 +791,8 @@ async fn drain_pending(node: &Node, origin: SocketAddr, reply: &mpsc::Sender<Mes
     send_getdata(reply, want);
     if need_headers {
         let locator = {
-            let inner = node.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let mut inner = node.inner.lock().unwrap_or_else(|e| e.into_inner());
+            inner.sync.note_getheaders_sent(&origin);
             sync_locator(&inner)
         };
         let _ = reply.try_send(Message::GetHeaders {
@@ -1072,6 +1094,71 @@ mod tests {
             "txindex must not point at a block that left the active chain"
         );
         assert_eq!(crate::core::tx_confirmations(&inner, &txid), None);
+    }
+
+    #[tokio::test]
+    async fn a_peer_replaying_one_header_is_banned_and_stores_nothing() {
+        // The live 2026-11-16 flood: one header mined once (about two
+        // hashes at the devnet limit) sent over and over.
+        let net = TestNet::new(1);
+        let node = net.nodes[0].clone();
+        let attacker = SocketAddr::from(([10, 66, 6, 6], 18_445));
+        let (reply, mut rx) = mpsc::channel::<Message>(4_096);
+        let genesis = {
+            let mut inner = node.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let v = our_version_msg(&node.params, 0);
+            inner.peers.register(attacker, false, &v).unwrap();
+            inner.peers.mark_handshaken(&attacker);
+            inner.sync.add_peer(attacker);
+            inner.chain.blocks[&inner.chain.genesis].block.header
+        };
+        let target = minibtc_consensus::target_for_bits(genesis.bits).unwrap();
+        let mut h = minibtc_primitives::BlockHeader {
+            version: 1,
+            prev_hash: genesis.block_hash(),
+            merkle_root: Hash256([0x42; 32]),
+            time: genesis.time + 31,
+            bits: genesis.bits,
+            nonce: 0,
+        };
+        while !h.check_pow(&target) {
+            h.nonce += 1;
+        }
+        let flood = Message::Headers {
+            count: 2_000,
+            headers: vec![h; 2_000],
+        };
+        let single = Message::Headers {
+            count: 1,
+            headers: vec![h],
+        };
+        let mut sent = 0usize;
+        for i in 0..200 {
+            if node
+                .inner
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .peers
+                .is_banned(&attacker.ip())
+            {
+                break;
+            }
+            let msg = if i % 2 == 0 {
+                flood.clone()
+            } else {
+                single.clone()
+            };
+            handle_message(&node, attacker, msg, &reply).await;
+            sent += 1;
+            while rx.try_recv().is_ok() {}
+        }
+        let inner = node.inner.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            inner.peers.is_banned(&attacker.ip()),
+            "the replaying peer must be banned (sent {sent} messages)"
+        );
+        assert!(sent <= 20, "banned within a few messages, took {sent}");
+        assert!(inner.sync.known_header_count() <= 1, "nothing accumulates");
     }
 
     #[tokio::test]

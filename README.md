@@ -63,10 +63,14 @@ validated under (`RULES_VERSION` in `crates/storage`). The 2026-11-16
 hardening (BIP34 coinbase heights, BIP30, the enforced difficulty schedule
 and pow limit, `docs/DECISIONS.md` D-013/D-014) made blocks mined by older
 binaries invalid, so a node refuses to start on an older datadir instead of
-silently extending a chain no up-to-date node accepts. Either start the node
-with a fresh `--datadir`, or run it once with `--reindex`: that rebuilds the
-chain under the current rules and discards every stored block that is
-invalid under them (on an old devnet that is everything after genesis).
+silently extending a chain no up-to-date node accepts. A datadir with no
+recorded version is first replayed under the current rules: if the replay
+reproduces its recorded tip (datadirs written after the rules change but
+before versions were recorded), it is stamped with the current version and
+starts normally. Otherwise either start the node with a fresh `--datadir`,
+or run it once with `--reindex`: that rebuilds the chain under the current
+rules and discards every stored block that is invalid under them (on an
+old devnet that is everything after genesis).
 
 ## Documents
 

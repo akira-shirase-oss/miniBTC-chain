@@ -227,12 +227,20 @@ example exported in the same shell) can always run `minibtc-cli wallet
 send` itself; no MCP gate can stop that. Keep the passphrase out of any
 environment an agent can read. Every CLI passphrase prompt (and the
 mnemonic prompt of `wallet restore`) reads with terminal echo off,
-switched off before the prompt appears (`stty -echo`, restored on exit;
-the read fails closed if echo cannot be disabled). Existing wallets need
+switched off before the prompt appears (`stty -echo`; the read fails
+closed if echo cannot be disabled). Echo is restored when the read ends
+and also on Ctrl-C (a SIGINT handler registered at CLI startup turns it
+back on, then exits with 130). Existing wallets need
 one passphrase-unlocked command (e.g. `wallet balance`, or an unlock in the
 wallet UI) to write their watch-only file. The file holds public data but
 links every address to one wallet, so both the CLI and the wallet UI write
-it owner-only (0600) via a temp file and an atomic rename.
+it owner-only (0600) via a temp file unique to each write and an atomic
+rename. It is part of the trust base: the MCP gate counts an output as
+change only if it pays a script listed there, so anything that can edit
+files as the wallet's user can widen what counts as change and therefore
+the spend caps. Such a process can equally broadcast an approved
+`signed_hex` itself; the caps protect against the model, not against
+same-user code.
 
 ### D-016 — What a failed reorg leaves behind (2026-11-16)
 
@@ -252,6 +260,13 @@ UTXO overlay and commits only if the whole branch connects. When block
   a bounded invalid-hash cache and deleted from disk
   (`take_dropped` → `Store::delete_blocks`). The cache is forgotten on
   restart, which is safe because the blocks are gone from disk too.
+- a side block whose branch never gets more work than the tip is never
+  judged, so an invalid low-work side block stays in the index and on
+  disk, during normal operation and after `--reindex` alike. That is by
+  design (Bitcoin Core also stores side blocks it has not connected):
+  judging every side block on arrival would let any peer make the node
+  re-validate old forks for free. It is judged, and dropped if invalid,
+  if its branch ever gets enough work to trigger a reorg.
 - exception: a block that fails only "too far in the future"
   (`TimeTooNew`) is kept and nothing is marked invalid, because that
   verdict depends on the local clock (Core's `BLOCK_TIME_FUTURE` is

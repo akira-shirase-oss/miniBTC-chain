@@ -229,3 +229,33 @@ fn reindex_rejects_a_heavier_invalid_branch_and_writes_it_out() {
         );
     }
 }
+
+#[test]
+fn reindex_leaves_no_pending_reorg_report() {
+    // The store's recorded tip is main 105; a heavier valid side branch
+    // (to 106) was stored block by block. The replay follows main first
+    // and then reorgs onto the branch. That replay-internal reorg must not
+    // be handed to the node as if it had just happened.
+    let (mut chain, miner) = fresh_chain();
+    mine_empty(&mut chain, &miner, 105);
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    store.snapshot(&chain).unwrap();
+    let mut parent = active_at(&chain, 100);
+    for h in 101..=106u32 {
+        let b = child_of(&chain, parent, h, 7, vec![]);
+        parent = b.header.block_hash();
+        chain.consider_block(b).unwrap();
+        store.put_side_block(&chain, &parent).unwrap();
+    }
+    assert_eq!(chain.tip, parent, "the live chain reorged onto the branch");
+
+    let mut rebuilt = store
+        .reindex(chain.params.clone(), genesis_of(&chain))
+        .unwrap();
+    assert_eq!(rebuilt.tip, parent, "reindex ends on the heavier branch");
+    assert!(
+        rebuilt.take_reorg().is_none(),
+        "the replay's own reorg must not leak to the node"
+    );
+}

@@ -244,6 +244,8 @@ enum PeersCmd {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Before any prompt can switch echo off: Ctrl-C must turn it back on.
+    install_interrupt_restore()?;
     tracing_subscriber::fmt()
         .with_env_filter("warn")
         .with_target(false)
@@ -445,6 +447,12 @@ fn require_interactive() -> Result<()> {
 /// targets.
 struct EchoOff;
 
+/// Whether a secret prompt currently has terminal echo switched off (read
+/// by the interrupt handler). SeqCst: set after `stty -echo` succeeds and
+/// cleared by whoever restores echo first; ordering is not performance-
+/// relevant here.
+static ECHO_IS_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 impl EchoOff {
     fn new() -> Result<Self> {
         let status = std::process::Command::new("stty")
@@ -455,17 +463,45 @@ impl EchoOff {
         if !status.success() {
             anyhow::bail!("could not turn terminal echo off; refusing to read a secret visibly");
         }
+        ECHO_IS_OFF.store(true, std::sync::atomic::Ordering::SeqCst);
         Ok(Self)
     }
 }
 
 impl Drop for EchoOff {
     fn drop(&mut self) {
+        restore_echo_if_off();
+    }
+}
+
+/// Turn terminal echo back on if a secret prompt had turned it off.
+fn restore_echo_if_off() {
+    if ECHO_IS_OFF.swap(false, std::sync::atomic::Ordering::SeqCst) {
         let _ = std::process::Command::new("stty")
             .arg("echo")
             .stdin(std::process::Stdio::inherit())
             .status();
     }
+}
+
+/// A Ctrl-C (SIGINT) during a secret prompt kills the process before any
+/// destructor runs, which left the terminal with echo off. This handler,
+/// registered at startup, restores echo first and then exits with 130 (the
+/// usual status of an interrupted command). It lives for the whole run of
+/// this short-lived CLI, so the task is deliberately not joined.
+fn install_interrupt_restore() -> Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut sigint = signal(SignalKind::interrupt()).context("install SIGINT handler")?;
+        tokio::spawn(async move {
+            if sigint.recv().await.is_some() {
+                restore_echo_if_off();
+                std::process::exit(130);
+            }
+        });
+    }
+    Ok(())
 }
 
 /// Read a secret after `prompt` without showing it. On a terminal, echo is
