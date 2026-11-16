@@ -260,6 +260,13 @@ UTXO overlay and commits only if the whole branch connects. When block
   a bounded invalid-hash cache and deleted from disk
   (`take_dropped` → `Store::delete_blocks`). The cache is forgotten on
   restart, which is safe because the blocks are gone from disk too.
+- a side block whose branch never gets more work than the tip is never
+  judged, so an invalid low-work side block stays in the index and on
+  disk, during normal operation and after `--reindex` alike. That is by
+  design (Bitcoin Core also stores side blocks it has not connected):
+  judging every side block on arrival would let any peer make the node
+  re-validate old forks for free. It is judged, and dropped if invalid,
+  if its branch ever gets enough work to trigger a reorg.
 - exception: a block that fails only "too far in the future"
   (`TimeTooNew`) is kept and nothing is marked invalid, because that
   verdict depends on the local clock (Core's `BLOCK_TIME_FUTURE` is
