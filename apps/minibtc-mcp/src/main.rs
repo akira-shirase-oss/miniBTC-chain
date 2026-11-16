@@ -3,14 +3,19 @@
 //! Lets AI assistants inspect the chain and *draft* payments through the
 //! node's public JSON-RPC API. Hard rules from the blueprint:
 //!
-//! - Never holds seeds, private keys, or wallet files. Wallet signing
-//!   happens inside `minibtc-cli` subprocesses; this process only ever
-//!   sees the public RPC surface and signed-transaction hex in drafts.
-//! - Every spend needs explicit human approval *outside* the model:
-//!   `request_send` refuses until a human runs
-//!   `minibtc-mcp --confirm <draft-id>` in their own terminal, which
-//!   writes an approval token the tool then verifies.
-//! - Per-request and per-day spend caps, configurable.
+//! - Never holds seeds, private keys, wallet files or the wallet
+//!   passphrase. `draft_payment` runs `minibtc-cli wallet draft`, which
+//!   builds an UNSIGNED transaction from the wallet's public watch-only
+//!   scripts (the child gets no passphrase in its environment).
+//! - Every spend needs explicit human approval *outside* the model: the
+//!   wallet owner runs `minibtc-cli wallet approve-draft` at an
+//!   interactive terminal, reviews the outputs and fee decoded from the
+//!   draft's bytes, types the wallet passphrase and `sign`. The approval
+//!   *is* the signature: no file a process (or a model with a shell) can
+//!   write without the wallet's keys counts as approval.
+//! - `request_send` broadcasts only a signed transaction whose bytes are
+//!   exactly the draft plus signatures, and applies the per-request and
+//!   per-day caps to the spend computed from those bytes.
 //! - Every call — tool, resource, prompt — is appended to an audit log.
 //!
 //! Transport: stdio (the standard for local MCP clients).
@@ -19,10 +24,11 @@ mod mcp;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use minibtc_primitives::Transaction;
 use minibtc_rpc::client::RpcClient;
 use rmcp::ServiceExt;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -71,12 +77,6 @@ struct Args {
     #[arg(long, default_value = DEFAULT_MINER_ADDRESS)]
     miner_address: String,
 
-    /// One-shot: approve a pending payment draft, then exit.
-    /// This is the human-in-the-loop gate — run it yourself, outside
-    /// the AI conversation.
-    #[arg(long)]
-    confirm: Option<String>,
-
     /// One-shot: list pending payment drafts, then exit.
     #[arg(long)]
     list_drafts: bool,
@@ -117,23 +117,29 @@ fn audit(datadir: &Path, entry: &Value) -> Result<()> {
 
 // ---------- draft store ----------
 
-/// A signed-but-unbroadcast payment draft. `hex` is spend authority
-/// until expiry — stored owner-only, never logged, never returned by
-/// any tool except the gated send path.
+/// An UNSIGNED payment draft. Carries no spend authority: broadcasting
+/// needs the signed form, which only the wallet owner can produce
+/// (`minibtc-cli wallet approve-draft`). Summaries are always recomputed
+/// from `unsigned_hex`, never trusted from fields.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Draft {
     pub id: String,
     pub wallet: String,
-    pub to_address: String,
-    pub amount_sats: u64,
-    pub fee_sats: u64,
-    pub fee_rate: u64,
-    pub txid: String,
-    pub hex: String,
-    pub inputs: usize,
-    pub outputs: Vec<Value>,
+    /// The exact unsigned transaction the owner will review and sign.
+    pub unsigned_hex: String,
+    /// Which output returns to the wallet (from the drafter; the owner's
+    /// approval re-derives it from the wallet's own scripts).
+    pub change_index: Option<usize>,
     pub created_unix: u64,
     pub expires_unix: u64,
+}
+
+/// What `approve-draft` writes after the owner signed.
+#[derive(Clone, Debug, Deserialize)]
+pub struct SignedDraft {
+    pub signed_hex: String,
+    /// Outputs the wallet recognised as its own when signing.
+    pub change_outputs: Vec<usize>,
 }
 
 impl Draft {
@@ -141,8 +147,8 @@ impl Draft {
         dir.join(format!("{id}.json"))
     }
 
-    fn approved_path(dir: &Path, id: &str) -> PathBuf {
-        dir.join(format!("{id}.approved"))
+    fn signed_path(dir: &Path, id: &str) -> PathBuf {
+        dir.join(format!("{id}.signed.json"))
     }
 
     fn save(&self, dir: &Path) -> Result<()> {
@@ -172,7 +178,9 @@ impl Draft {
         };
         for e in rd.flatten() {
             let p = e.path();
-            if p.extension().and_then(|s| s.to_str()) != Some("json") {
+            let is_draft = p.extension().and_then(|s| s.to_str()) == Some("json")
+                && !p.to_string_lossy().ends_with(".signed.json");
+            if !is_draft {
                 continue;
             }
             if let Ok(bytes) = std::fs::read(&p)
@@ -185,55 +193,69 @@ impl Draft {
         out
     }
 
-    /// An approval token exists AND was minted for exactly this draft
-    /// content (sha256 of the canonical draft JSON).
-    fn is_approved(&self, dir: &Path) -> bool {
-        let Ok(bytes) = std::fs::read(Self::approved_path(dir, &self.id)) else {
-            return false;
-        };
-        let Ok(v) = serde_json::from_slice::<Value>(&bytes) else {
-            return false;
-        };
-        let Some(expected) = v["draft_sha256"].as_str() else {
-            return false;
-        };
-        expected == self.content_hash()
+    /// The owner's signed form, if `approve-draft` produced one.
+    fn signed(&self, dir: &Path) -> Option<SignedDraft> {
+        let bytes = std::fs::read(Self::signed_path(dir, &self.id)).ok()?;
+        serde_json::from_slice(&bytes).ok()
     }
 
-    /// sha256 over the fields that define the payment (excludes id and
-    /// timestamps, which are bookkeeping).
-    pub fn content_hash(&self) -> String {
-        let canon = json!({
-            "wallet": self.wallet,
-            "to_address": self.to_address,
-            "amount_sats": self.amount_sats,
-            "fee_sats": self.fee_sats,
-            "txid": self.txid,
-            "hex": self.hex,
-        });
-        minibtc_crypto::double_sha256(&serde_json::to_vec(&canon).unwrap_or_default()).to_hex()
-    }
-
-    fn approve(&self, dir: &Path) -> Result<()> {
-        let path = Self::approved_path(dir, &self.id);
-        let v = json!({
-            "draft_sha256": self.content_hash(),
-            "approved_unix": unix_now(),
-        });
-        std::fs::write(&path, serde_json::to_vec_pretty(&v)?)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-        }
-        Ok(())
+    /// The draft's transaction, decoded and checked to be unsigned.
+    fn unsigned_tx(&self) -> Result<Transaction> {
+        let tx = decode_tx_hex(&self.unsigned_hex)?;
+        minibtc_wallet::draft::ensure_unsigned(&tx)?;
+        Ok(tx)
     }
 
     fn revoke(&self, dir: &Path) -> Result<()> {
         let _ = std::fs::remove_file(Self::path(dir, &self.id));
-        let _ = std::fs::remove_file(Self::approved_path(dir, &self.id));
+        let _ = std::fs::remove_file(Self::signed_path(dir, &self.id));
         Ok(())
     }
+}
+
+/// Decode a hex-encoded transaction (strict: no trailing bytes).
+pub fn decode_tx_hex(hex: &str) -> Result<Transaction> {
+    let bytes = minibtc_crypto::hex_decode(hex).context("transaction hex")?;
+    Transaction::decode(&bytes).context("transaction bytes")
+}
+
+/// The gate `request_send` applies before broadcasting: there must be a
+/// signed form, it must be exactly the draft plus signatures, the wallet
+/// must agree with the drafter about which output is change, and the
+/// spend computed from the signed bytes (`input_values` from the node)
+/// must fit both caps. Returns the signed tx and its spend.
+pub fn check_send(
+    draft: &Draft,
+    signed: Option<&SignedDraft>,
+    input_values: &[minibtc_primitives::Sats],
+    max_spend_sats: u64,
+    spent_today_sats: u64,
+    max_daily_sats: u64,
+) -> Result<(Transaction, u64)> {
+    let unsigned = draft.unsigned_tx()?;
+    let Some(signed) = signed else {
+        anyhow::bail!(
+            "draft {} is not approved: the wallet owner must sign it with \
+             `minibtc-cli wallet approve-draft` in their own terminal. The model \
+             cannot approve its own spends.",
+            draft.id
+        );
+    };
+    let signed_tx = decode_tx_hex(&signed.signed_hex)?;
+    minibtc_wallet::draft::matches_draft(&unsigned, &signed_tx)?;
+    let drafted_change: Vec<usize> = draft.change_index.into_iter().collect();
+    if signed.change_outputs != drafted_change {
+        anyhow::bail!("change output disagrees between draft and approval");
+    }
+    let s = minibtc_wallet::draft::spend_summary(&signed_tx, input_values, &drafted_change)?;
+    let spend = s.spend.sats();
+    if spend > max_spend_sats {
+        anyhow::bail!("spend {spend} sats exceeds the per-request cap {max_spend_sats}");
+    }
+    if spent_today_sats.saturating_add(spend) > max_daily_sats {
+        anyhow::bail!("daily spend cap exceeded: {spent_today_sats} + {spend} > {max_daily_sats}");
+    }
+    Ok((signed_tx, spend))
 }
 
 // ---------- daily spend tracker ----------
@@ -313,37 +335,25 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let drafts_dir = args.datadir.join("mcp").join("drafts");
 
-    // ---- one-shot human-gate commands (outside any MCP session) ----
-    if let Some(id) = &args.confirm {
-        let d = Draft::load(&drafts_dir, id)?;
-        if d.expires_unix < unix_now() {
-            anyhow::bail!("draft {id} expired ({}s TTL)", DRAFT_TTL_SECS);
-        }
-        d.approve(&drafts_dir)?;
-        println!(
-            "approved draft {} — pay {} sats to {} (txid {}, fee {} sats). \
-             The model may now call request_send once; the spend caps still apply.",
-            d.id, d.amount_sats, d.to_address, d.txid, d.fee_sats
-        );
-        audit(
-            &args.datadir,
-            &json!({"ts": unix_now(), "kind": "gate", "name": "confirm",
-                    "ok": true, "detail": {"draft_id": id, "amount_sats": d.amount_sats}}),
-        )?;
-        return Ok(());
-    }
+    // ---- one-shot draft housekeeping (outside any MCP session) ----
+    // Approval is NOT here: the wallet owner signs with
+    // `minibtc-cli wallet approve-draft` (passphrase typed at a terminal).
     if args.list_drafts {
         for d in Draft::list(&drafts_dir) {
-            let state = if d.is_approved(&drafts_dir) {
-                "APPROVED"
+            let state = if d.signed(&drafts_dir).is_some() {
+                "SIGNED"
             } else if d.expires_unix < unix_now() {
                 "expired"
             } else {
                 "pending"
             };
+            let outputs = d
+                .unsigned_tx()
+                .map(|t| t.outputs.len().to_string())
+                .unwrap_or_else(|e| format!("undecodable ({e})"));
             println!(
-                "{} [{}] {} sats -> {} (fee {} sats, txid {})",
-                d.id, state, d.amount_sats, d.to_address, d.fee_sats, d.txid
+                "{} [{}] wallet {} — {} outputs; review with `minibtc-cli wallet approve-draft`",
+                d.id, state, d.wallet, outputs
             );
         }
         return Ok(());
@@ -382,4 +392,117 @@ async fn main() -> Result<()> {
     let service = handler.serve(transport).await?;
     service.waiting().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use minibtc_primitives::{OutPoint, Sats, TxInput, TxOutput};
+
+    fn tx(signed: bool, outputs: &[u64]) -> Transaction {
+        Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                prev: OutPoint {
+                    txid: minibtc_crypto::Hash256([3; 32]),
+                    vout: 1,
+                },
+                script_sig: if signed { vec![0x01, 0xaa] } else { vec![] },
+                sequence: 0xffff_fffe,
+            }],
+            outputs: outputs
+                .iter()
+                .map(|v| TxOutput {
+                    value: Sats(*v),
+                    script_pubkey: vec![0x51],
+                })
+                .collect(),
+            locktime: 0,
+        }
+    }
+
+    fn draft(outputs: &[u64], change: Option<usize>) -> Draft {
+        Draft {
+            id: "dtest".into(),
+            wallet: "w".into(),
+            unsigned_hex: minibtc_crypto::hex_encode(&tx(false, outputs).encode()),
+            change_index: change,
+            created_unix: 0,
+            expires_unix: u64::MAX,
+        }
+    }
+
+    fn signed(outputs: &[u64], change: &[usize]) -> SignedDraft {
+        SignedDraft {
+            signed_hex: minibtc_crypto::hex_encode(&tx(true, outputs).encode()),
+            change_outputs: change.to_vec(),
+        }
+    }
+
+    const CAP: u64 = 1_000_000;
+
+    #[test]
+    fn no_file_a_process_can_write_counts_as_approval() {
+        // The old gate accepted `<id>.approved` holding the draft hash —
+        // anything running as this user could mint it. Now only a signed
+        // transaction approves, and writing that needs the wallet keys.
+        let dir = std::env::temp_dir().join(format!("mcp-gate-{}", std::process::id()));
+        let d = draft(&[700, 200], Some(1));
+        d.save(&dir).unwrap();
+        std::fs::write(
+            dir.join("dtest.approved"),
+            serde_json::json!({"draft_sha256": "anything"}).to_string(),
+        )
+        .unwrap();
+        let rec = d.signed(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(rec.is_none());
+        let err = check_send(&d, rec.as_ref(), &[Sats(1_000)], CAP, 0, CAP).unwrap_err();
+        assert!(err.to_string().contains("not approved"), "{err}");
+    }
+
+    #[test]
+    fn the_signed_bytes_must_be_the_drafted_payment() {
+        let d = draft(&[700, 200], Some(1));
+        // Same draft, signed: accepted, spend = 700 + fee 100.
+        let (_, spend) = check_send(
+            &d,
+            Some(&signed(&[700, 200], &[1])),
+            &[Sats(1_000)],
+            CAP,
+            0,
+            CAP,
+        )
+        .unwrap();
+        assert_eq!(spend, 800);
+        // Different outputs behind the same draft id: refused.
+        assert!(check_send(&d, Some(&signed(&[900], &[])), &[Sats(1_000)], CAP, 0, CAP).is_err());
+        // An unsigned "signed" record: refused.
+        let unsigned = SignedDraft {
+            signed_hex: d.unsigned_hex.clone(),
+            change_outputs: vec![1],
+        };
+        assert!(check_send(&d, Some(&unsigned), &[Sats(1_000)], CAP, 0, CAP).is_err());
+    }
+
+    #[test]
+    fn caps_apply_to_the_spend_decoded_from_the_bytes() {
+        let d = draft(&[700, 200], Some(1));
+        let s = signed(&[700, 200], &[1]);
+        // Per-request cap below the decoded spend (800).
+        assert!(check_send(&d, Some(&s), &[Sats(1_000)], 799, 0, CAP).is_err());
+        // Daily cap: 300 already spent today, 1,000 allowed.
+        assert!(check_send(&d, Some(&s), &[Sats(1_000)], CAP, 300, 1_000).is_err());
+        assert!(check_send(&d, Some(&s), &[Sats(1_000)], CAP, 200, 1_000).is_ok());
+        // An approval that relabels the payment output as change is refused.
+        let relabelled = signed(&[700, 200], &[0]);
+        assert!(check_send(&d, Some(&relabelled), &[Sats(1_000)], CAP, 0, CAP).is_err());
+    }
+
+    #[test]
+    fn drafts_must_be_unsigned() {
+        let mut d = draft(&[700], None);
+        d.unsigned_hex = minibtc_crypto::hex_encode(&tx(true, &[700]).encode());
+        assert!(d.unsigned_tx().is_err(), "a pre-signed draft is refused");
+    }
 }

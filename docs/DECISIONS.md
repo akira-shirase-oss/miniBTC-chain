@@ -176,6 +176,40 @@ Consequence: blocks mined before this change carry the old `0x02 <u16>`
 height and fail BIP34, so older devnet datadirs cannot `--reindex`;
 start them fresh (same note as D-013).
 
+### D-015 — MCP spend gate: unsigned drafts, the signature is the approval (2026-11-16)
+
+The first MCP gate signed the payment at draft time (the blueprint asks
+for an unsigned draft), showed and capped the JSON fields stored next to
+the hex rather than the hex itself, and treated `<id>.approved` — a
+file any same-user process could write, minted by a command printed to
+the model — as human approval. Now:
+
+1. `draft_payment` runs `minibtc-cli wallet draft`, which builds an
+   **unsigned** transaction from `<wallet>.watch.json` (public scripts
+   only, refreshed whenever the owner uses the wallet with its
+   passphrase). The child process gets no keystore passphrase; the MCP
+   server never holds keys or the passphrase.
+2. **Approval is the owner's signature.** `minibtc-cli wallet
+   approve-draft` refuses to run unless stdin/stderr are a terminal,
+   decodes the draft's bytes, shows every output (address, amount,
+   change/payment) and the fee, reads the wallet passphrase from the
+   terminal (never from a flag or the environment), and signs only when
+   the owner types `sign`. The result, `<id>.signed.json`, cannot be
+   produced without the wallet's keys.
+3. `request_send` broadcasts only a signed transaction that is exactly
+   the draft plus signatures (`minibtc_wallet::draft::matches_draft`),
+   with input values fetched from the node, and applies the per-request
+   and per-day caps to the spend decoded from those bytes (outputs that
+   are not change, plus fee).
+
+Honest limit: an agent that has a shell *and* the wallet passphrase (for
+example exported in the same shell) can always run `minibtc-cli wallet
+send` itself; no MCP gate can stop that. Keep the passphrase out of any
+environment an agent can read. The passphrase prompt echoes (same as the
+CLI's other prompts; tracked with the CLI items). Existing wallets need
+one passphrase-unlocked command (e.g. `wallet balance`) to write their
+watch-only file.
+
 ## Open questions
 
 - None blocking. Post-v1 candidates if revisited: SegWit/Taproot sighash

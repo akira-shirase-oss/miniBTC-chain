@@ -380,35 +380,41 @@ impl Wallet {
         target: Sats,
         fee_estimate: Sats,
     ) -> Result<CoinSelection, WalletError> {
-        let need = target
-            .checked_add(fee_estimate)
-            .ok_or(WalletError::Overflow)?;
-        let mut candidates: Vec<&WalletUtxo> = self.spendable_utxos();
-        candidates.sort_by_key(|c| std::cmp::Reverse(c.output.value));
-        let mut selected: Vec<WalletUtxo> = Vec::new();
-        let mut total = Sats::ZERO;
-        for u in candidates {
-            if total >= need {
-                break;
-            }
-            selected.push(u.clone());
-            total = total
-                .checked_add(u.output.value)
-                .ok_or(WalletError::Overflow)?;
+        let candidates: Vec<WalletUtxo> = self.spendable_utxos().into_iter().cloned().collect();
+        select_coins_from(&candidates, target, fee_estimate)
+    }
+
+    /// Whether `script` pays one of this wallet's derived addresses.
+    pub fn owns_script(&self, script: &[u8]) -> bool {
+        self.addresses.contains_key(script)
+    }
+
+    /// Every derived script (receive + change, primed window) and the
+    /// change scripts not yet issued, in index order — public data for
+    /// the watch-only drafter (no keys, no seed).
+    pub fn watch_scripts(&self) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        let mut all: Vec<&AddressEntry> = self.addresses.values().collect();
+        all.sort_by_key(|e| (e.chain, e.index));
+        let fresh_change = all
+            .iter()
+            .filter(|e| e.chain == 1 && e.index >= self.next_change)
+            .map(|e| e.script.clone())
+            .collect();
+        (
+            all.into_iter().map(|e| e.script.clone()).collect(),
+            fresh_change,
+        )
+    }
+
+    /// Record that a change script has been used (a draft built from the
+    /// watch-only list consumed it), so it is never issued twice.
+    pub fn mark_change_used(&mut self, script: &[u8]) {
+        if let Some(e) = self.addresses.get(script)
+            && e.chain == 1
+            && e.index >= self.next_change
+        {
+            self.next_change = e.index.saturating_add(1);
         }
-        if total < need {
-            return Err(WalletError::InsufficientFunds {
-                need: need.sats(),
-                have: total.sats(),
-            });
-        }
-        Ok(CoinSelection {
-            inputs: selected,
-            total_in: total,
-            payment: target,
-            change: Sats::ZERO, // computed later
-            fee: fee_estimate,
-        })
     }
 
     /// Build + sign a payment transaction.
@@ -426,87 +432,54 @@ impl Wallet {
         fee_rate: u64,
         locktime: u32,
     ) -> Result<Transaction, WalletError> {
-        // Iteratively converge on fee: size depends on input count and
-        // whether change output exists.
-        let mut fee = Sats(estimate_fee(fee_rate, 1, 2)); // rough start
-        let mut selection: Option<CoinSelection> = None;
-        for _ in 0..FEE_ITERS {
-            let sel = self.select_coins(payment, fee)?;
-            // Would change be dust? Then no change output → smaller fee.
-            let change_val = sel
-                .total_in
-                .checked_sub(payment)
-                .and_then(|v| v.checked_sub(fee))
-                .ok_or(WalletError::Overflow)?;
-            let has_change = change_val.sats() >= DUST_LIMIT;
-            let est_size = estimate_tx_size(sel.inputs.len(), has_change);
-            let new_fee = fee_rate_to_fee(fee_rate, est_size);
-            if new_fee == fee {
-                selection = Some(sel);
-                break;
-            }
-            fee = new_fee;
-            selection = Some(sel);
-        }
-        let mut sel = selection.ok_or(WalletError::Overflow)?;
+        let unsigned = self.build_unsigned(payment_script, payment, fee_rate, locktime)?;
+        self.sign_payment(&unsigned.tx)
+    }
 
-        // Final change computation.
-        let mut outputs = vec![TxOutput {
-            value: payment,
-            script_pubkey: payment_script.to_vec(),
-        }];
-        let change_val = sel
-            .total_in
-            .checked_sub(payment)
-            .and_then(|v| v.checked_sub(sel.fee))
-            .ok_or(WalletError::Overflow)?;
-        if change_val.sats() >= DUST_LIMIT {
-            let change_addr = self.new_change_address()?;
-            let change_script = self
-                .addresses
-                .values()
-                .find(|e| e.address == change_addr)
-                .map(|e| e.script.clone())
-                .ok_or(WalletError::Overflow)?;
-            outputs.push(TxOutput {
-                value: change_val,
-                script_pubkey: change_script,
-            });
-            sel.change = change_val;
-        } else {
-            // No change → fold remainder into fee.
-            sel.fee = sel
-                .total_in
-                .checked_sub(payment)
-                .ok_or(WalletError::Overflow)?;
-        }
-
-        // Build inputs.
-        let mut inputs = Vec::with_capacity(sel.inputs.len());
-        for u in &sel.inputs {
-            let script = u.output.script_pubkey.clone();
-            inputs.push(TxInput {
-                prev: u.outpoint,
-                script_sig: vec![],    // filled after signing
-                sequence: 0xffff_fffe, // signal RBF
-            });
-            let _ = script;
-        }
-
-        let mut tx = Transaction {
-            version: 1,
-            inputs,
-            outputs,
+    /// Build a payment *without signing it*: coin selection, change to a
+    /// fresh change address, every scriptSig empty. These are the exact
+    /// bytes a human reviews before [`Self::sign_payment`].
+    pub fn build_unsigned(
+        &mut self,
+        payment_script: &[u8],
+        payment: Sats,
+        fee_rate: u64,
+        locktime: u32,
+    ) -> Result<UnsignedPayment, WalletError> {
+        let change_entry = self.derive_address(1, self.next_change)?;
+        let candidates: Vec<WalletUtxo> = self.spendable_utxos().into_iter().cloned().collect();
+        let unsigned = build_unsigned_payment(
+            &candidates,
+            &change_entry.script,
+            payment_script,
+            payment,
+            fee_rate,
             locktime,
-        };
+        )?;
+        if unsigned.change_index.is_some() {
+            // The change address is now issued.
+            self.addresses
+                .insert(change_entry.script.clone(), change_entry);
+            self.next_change = self.next_change.saturating_add(1);
+        }
+        Ok(unsigned)
+    }
 
-        // Sign each input with its owning key.
+    /// Sign every input of `tx` with this wallet's keys. Each input must
+    /// spend a spendable UTXO found by the last scan; anything else is
+    /// refused (`Unspendable`), so a reviewed draft cannot smuggle in a
+    /// coin the wallet does not own.
+    pub fn sign_payment(&self, tx: &Transaction) -> Result<Transaction, WalletError> {
+        let mut tx = tx.clone();
+        for input in &mut tx.inputs {
+            input.script_sig.clear();
+        }
         for i in 0..tx.inputs.len() {
             let op = tx.inputs[i].prev;
-            let utxo = sel
-                .inputs
+            let utxo = self
+                .utxos
                 .iter()
-                .find(|u| u.outpoint == op)
+                .find(|u| u.outpoint == op && u.spendable(self.maturity))
                 .ok_or(WalletError::Unspendable(op))?;
             let script = utxo.output.script_pubkey.clone();
             let entry = self
@@ -521,6 +494,136 @@ impl Wallet {
     }
 
     // Broadcast is the node's job — build_and_sign returns the tx.
+}
+
+/// An unsigned payment: the exact bytes a human approves, plus what
+/// review and signing need.
+#[derive(Clone, Debug)]
+pub struct UnsignedPayment {
+    /// The transaction with every scriptSig empty.
+    pub tx: Transaction,
+    /// The output each input spends, in input order.
+    pub prevouts: Vec<TxOutput>,
+    /// Index of the change output (pays back to the wallet), if any.
+    pub change_index: Option<usize>,
+    /// Fee = inputs − outputs.
+    pub fee: Sats,
+}
+
+/// Greedy largest-first coin selection over `candidates`.
+pub fn select_coins_from(
+    candidates: &[WalletUtxo],
+    target: Sats,
+    fee_estimate: Sats,
+) -> Result<CoinSelection, WalletError> {
+    let need = target
+        .checked_add(fee_estimate)
+        .ok_or(WalletError::Overflow)?;
+    let mut sorted: Vec<&WalletUtxo> = candidates.iter().collect();
+    sorted.sort_by_key(|c| std::cmp::Reverse(c.output.value));
+    let mut selected: Vec<WalletUtxo> = Vec::new();
+    let mut total = Sats::ZERO;
+    for u in sorted {
+        if total >= need {
+            break;
+        }
+        selected.push(u.clone());
+        total = total
+            .checked_add(u.output.value)
+            .ok_or(WalletError::Overflow)?;
+    }
+    if total < need {
+        return Err(WalletError::InsufficientFunds {
+            need: need.sats(),
+            have: total.sats(),
+        });
+    }
+    Ok(CoinSelection {
+        inputs: selected,
+        total_in: total,
+        payment: target,
+        change: Sats::ZERO, // computed later
+        fee: fee_estimate,
+    })
+}
+
+/// Assemble an unsigned payment from `spendable` coins: the fee converges
+/// on the estimated size, change (if not dust) pays `change_script`.
+/// Needs no keys — shared by the signing wallet and the watch-only
+/// drafter, so both produce the same bytes.
+pub fn build_unsigned_payment(
+    spendable: &[WalletUtxo],
+    change_script: &[u8],
+    payment_script: &[u8],
+    payment: Sats,
+    fee_rate: u64,
+    locktime: u32,
+) -> Result<UnsignedPayment, WalletError> {
+    // Iteratively converge on fee: size depends on input count and
+    // whether a change output exists.
+    let mut fee = Sats(estimate_fee(fee_rate, 1, 2)); // rough start
+    let mut selection: Option<CoinSelection> = None;
+    for _ in 0..FEE_ITERS {
+        let sel = select_coins_from(spendable, payment, fee)?;
+        let change_val = sel
+            .total_in
+            .checked_sub(payment)
+            .and_then(|v| v.checked_sub(fee))
+            .ok_or(WalletError::Overflow)?;
+        let has_change = change_val.sats() >= DUST_LIMIT;
+        let new_fee = fee_rate_to_fee(fee_rate, estimate_tx_size(sel.inputs.len(), has_change));
+        selection = Some(sel);
+        if new_fee == fee {
+            break;
+        }
+        fee = new_fee;
+    }
+    let sel = selection.ok_or(WalletError::Overflow)?;
+    let mut outputs = vec![TxOutput {
+        value: payment,
+        script_pubkey: payment_script.to_vec(),
+    }];
+    let change_val = sel
+        .total_in
+        .checked_sub(payment)
+        .and_then(|v| v.checked_sub(sel.fee))
+        .ok_or(WalletError::Overflow)?;
+    let mut change_index = None;
+    if change_val.sats() >= DUST_LIMIT {
+        outputs.push(TxOutput {
+            value: change_val,
+            script_pubkey: change_script.to_vec(),
+        });
+        change_index = Some(1);
+    }
+    let out_sum = outputs
+        .iter()
+        .try_fold(Sats::ZERO, |acc, o| acc.checked_add(o.value))
+        .ok_or(WalletError::Overflow)?;
+    let fee = sel
+        .total_in
+        .checked_sub(out_sum)
+        .ok_or(WalletError::Overflow)?;
+    let inputs = sel
+        .inputs
+        .iter()
+        .map(|u| TxInput {
+            prev: u.outpoint,
+            script_sig: vec![],    // filled by sign_payment after review
+            sequence: 0xffff_fffe, // signal RBF
+        })
+        .collect();
+    Ok(UnsignedPayment {
+        tx: Transaction {
+            version: 1,
+            inputs,
+            outputs,
+            locktime,
+        },
+        prevouts: sel.inputs.iter().map(|u| u.output.clone()).collect(),
+        change_index,
+        fee,
+    })
 }
 
 /// Dust limit (sats) — matches mempool policy default.
