@@ -1,0 +1,65 @@
+MiniBTC devnet demo — Mon 16 Nov 2026 21:55:52 EST
+commit: 9622ae1
+
+=== Phase 0: build binaries ===
+  PASS  cargo build --bins
+
+=== Phase 1: start 3 nodes + first convergence (120 blocks) ===
+  PASS  3 nodes started (p2p 38445/38447/38449, rpc 38446/38448/38450)
+  wallet A address: mwg8ztRyqVU96JEHoH5sAHX3qXGafXkMKT
+  PASS  mined 120 blocks on N1
+  PASS  N1 tip (height=120)
+  PASS  N2 converged to N1 (height=120)
+  PASS  N3 converged to N1 (height=120)
+  convergence time for 120 blocks + 2 followers: 4s
+  N1 peers: 2
+  N2 peers: 1
+  N3 peers: 1
+
+=== Phase 2: partition N3, extend N1 by 40 ===
+scripts/devnet-demo.sh: line 106: 62974 Terminated: 15          "$NODE" --datadir "$d" --listen "127.0.0.1:$p" --rpc "127.0.0.1:$r" --connect "$c" --log warn > "$d/node.log" 2>&1
+  PASS  N1 height after +40
+  PASS  N2 followed to 160 (height=160)
+
+=== Phase 3: reconnect N3 — catch-up over 40+ blocks ===
+  PASS  N3 caught up (height=160)
+  N3 catch-up time: 0s for 40 missed blocks
+  note: catch-up was 40 blocks
+
+=== Phase 4: competing fork — N1 mines 5, isolated N3 mines 55, most-work reorg ===
+scripts/devnet-demo.sh: line 106: 65551 Terminated: 15          "$NODE" --datadir "$d" --listen "127.0.0.1:$p" --rpc "127.0.0.1:$r" --connect "$c" --log warn > "$d/node.log" 2>&1
+  PASS  N1 branch height
+  PASS  N2 on N1's branch (height=165)
+  N1 branch tip: height=165 hash=f6cb8695bff0cc41c171f618d82275a20d642ffd039cc17291fe117d84910000
+  N3 branch tip: height=215 hash=52df00842f44acfccc275675dcbafa3566f3906a96350ab1a60eeb1683060000 (fork point 160)
+  PASS  N3 branch is ahead of the fork point
+  PASS  the two branches differ
+scripts/devnet-demo.sh: line 106: 68056 Terminated: 15          "$NODE" --datadir "$d" --listen "127.0.0.1:$p" --rpc "127.0.0.1:$r" --log warn > "$d/node.log" 2>&1
+  PASS  N1 reorged from its own branch to N3's (height=215)
+  PASS  N2 (relay-only) followed the reorg through N1 (height=215)
+  PASS  N3 stable on its chain (height=215)
+  PASS  3-node convergence after most-work fork resolution
+
+=== Phase 5: two-wallet send through the live network ===
+  wallet B address: mmyXa2aaDywt91RDQP7Abj1ruQYKEQaszT
+  alice balance before: 575000000000 sats
+  send result: {"hex":"0100000001113e96541eb0d65af31930c68639624f12c6a70f181aaf4f1dbd2148df243230000000006a47304402206b360c2f536d750a68b2fd4830610ee48c721a72309ac5aeac7eb5e2d58425170220317f4bbaa97ea880492bd17eeecd15097bee6a3023b8ecb2dfce3310858d75f00121030f8d7fbec7d0eb18a25ee883cd4ab197186f496742cc3ec31a32cd50dd23e226feffffff0200ca9a3b000000001976a91446d758bc7bca11c30378eeab6e4a81b8e1d7082188acff276bee000000001976a9142ec5c0148e9f26b2a51645bc6e48710a16ce39d188ac00000000","signed_txid":"62571fdd619d8a8e347a08df1ca961a161aff4a8f7c7548a9d9e00325f87f0b8","txid":"62571fdd619d8a8e347a08df1ca961a161aff4a8f7c7548a9d9e00325f87f0b8"} 
+  txid: 62571fdd619d8a8e347a08df1ca961a161aff4a8f7c7548a9d9e00325f87f0b8
+  PASS  N2 saw payment block (height=216)
+  PASS  N3 saw payment block (height=216)
+  bob balance after: 1000000000 sats (expected ≥ 1_000_000_000)
+  PASS  wallet B received 10 BTC
+
+=== Phase 6: deep catch-up — a fresh node 600 blocks behind ===
+scripts/devnet-demo.sh: line 106: 62848 Terminated: 15          "$NODE" --datadir "$d" --listen "127.0.0.1:$p" --rpc "127.0.0.1:$r" --log warn > "$d/node.log" 2>&1
+scripts/devnet-demo.sh: line 106: 62935 Terminated: 15          "$NODE" --datadir "$d" --listen "127.0.0.1:$p" --rpc "127.0.0.1:$r" --connect "$c" --log warn > "$d/node.log" 2>&1
+scripts/devnet-demo.sh: line 106: 73400 Terminated: 15          "$NODE" --datadir "$d" --listen "127.0.0.1:$p" --rpc "127.0.0.1:$r" --connect "$c" --log warn > "$d/node.log" 2>&1
+  PASS  N5 mined 600 blocks
+  PASS  N6 caught up all 600 blocks (4s)
+
+=== Summary ===
+  phases passed: 22   failed: 0
+  final height: 216   log: perf/results/devnet-demo-20261116-215552.log
+scripts/devnet-demo.sh: line 106: 74108 Terminated: 15          "$NODE" --datadir "$d" --listen "127.0.0.1:$p" --rpc "127.0.0.1:$r" --params "$DEEP_PARAMS" --log warn > "$d/node.log" 2>&1
+scripts/devnet-demo.sh: line 106: 74198 Terminated: 15          "$NODE" --datadir "$d" --listen "127.0.0.1:$p" --rpc "127.0.0.1:$r" --params "$DEEP_PARAMS" --connect "$c" --log warn > "$d/node.log" 2>&1
+datadir: /tmp/mbtc-demo.AuAFQv  log: perf/results/devnet-demo-20261116-215552.log

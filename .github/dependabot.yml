@@ -1,0 +1,27 @@
+# Weekly, grouped updates: one PR per ecosystem, each run through CI.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      cargo:
+        patterns: ["*"]
+    open-pull-requests-limit: 5
+  - package-ecosystem: cargo
+    directory: /tests/attacks/fuzz
+    schedule:
+      interval: weekly
+    groups:
+      fuzz-cargo:
+        patterns: ["*"]
+    open-pull-requests-limit: 2
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+    open-pull-requests-limit: 5

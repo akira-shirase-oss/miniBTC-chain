@@ -14,10 +14,16 @@ use proptest::prelude::*;
 
 proptest! {
     /// Any bytes fed to Transaction::decode either error cleanly or
-    /// re-encode to identical canonical bytes. No panics, ever.
+    /// re-encode to identical canonical bytes. No panics, ever. (The result
+    /// of `catch_unwind` used to be discarded, so a panic could never fail
+    /// this property.)
     #[test]
     fn prop_tx_decode_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..2048)) {
-        let _ = std::panic::catch_unwind(|| Transaction::decode(&bytes));
+        let r = std::panic::catch_unwind(|| Transaction::decode(&bytes));
+        prop_assert!(r.is_ok(), "Transaction::decode panicked");
+        if let Ok(Ok(tx)) = r {
+            prop_assert_eq!(tx.encode(), bytes);
+        }
     }
 
     /// encode → decode → encode is a fixed point for valid txs.
@@ -38,7 +44,8 @@ proptest! {
     /// Block decode is bounded and never panics.
     #[test]
     fn prop_block_decode_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..4096)) {
-        let _ = std::panic::catch_unwind(|| Block::decode(&bytes, 10_000, 4 * 1024 * 1024));
+        let r = std::panic::catch_unwind(|| Block::decode(&bytes, 10_000, 4 * 1024 * 1024));
+        prop_assert!(r.is_ok(), "Block::decode panicked");
     }
 
     /// Sats arithmetic is total: checked ops never panic and agree with

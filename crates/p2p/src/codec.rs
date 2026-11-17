@@ -625,6 +625,89 @@ mod tests {
         assert!(matches!(res, Err(WireError::BadMagic)));
     }
 
+    /// A frame header: magic, command, declared payload length, checksum.
+    fn frame_header(p: &ChainParams, command: &str, len: u32, checksum: [u8; 4]) -> Vec<u8> {
+        let mut h = Vec::with_capacity(24);
+        h.extend_from_slice(&p.p2p_magic);
+        let mut cmd = [0u8; 12];
+        cmd[..command.len()].copy_from_slice(command.as_bytes());
+        h.extend_from_slice(&cmd);
+        h.extend_from_slice(&len.to_le_bytes());
+        h.extend_from_slice(&checksum);
+        h
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_oversized_frame_is_refused_before_its_payload_is_read() {
+        // Only the 24-byte header is sent and the peer stays connected. A
+        // reader that allocated and read the declared payload first would
+        // wait for bytes that never come (Timeout); the cap must refuse it
+        // straight from the header.
+        let p = params();
+        for len in [MAX_MESSAGE_SIZE + 1, u32::MAX] {
+            let (mut peer, mut node) = tokio::io::duplex(64);
+            peer.write_all(&frame_header(&p, "block", len, [0; 4]))
+                .await
+                .unwrap();
+            let started = tokio::time::Instant::now();
+            let res = read_message(&mut node, &p).await;
+            assert!(
+                matches!(res, Err(WireError::TooLarge(n)) if n == len),
+                "declared {len}: {res:?}"
+            );
+            assert_eq!(started.elapsed(), Duration::ZERO, "refused without waiting");
+            drop(peer);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_frame_at_the_cap_is_accepted() {
+        let p = params();
+        let payload = vec![0u8; MAX_MESSAGE_SIZE as usize];
+        let sum = double_sha256(&payload);
+        let mut bytes = frame_header(&p, "block", MAX_MESSAGE_SIZE, [0; 4]);
+        bytes[20..24].copy_from_slice(&sum.as_bytes()[..4]);
+        bytes.extend_from_slice(&payload);
+        let (mut peer, mut node) = tokio::io::duplex(1 << 16);
+        let w = tokio::spawn(async move { peer.write_all(&bytes).await.unwrap() });
+        let (cmd, got) = read_message(&mut node, &p).await.unwrap();
+        w.await.unwrap();
+        assert_eq!(cmd, "block");
+        assert_eq!(got.len(), MAX_MESSAGE_SIZE as usize);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_header_or_payload_times_out() {
+        let p = params();
+        // Half a header, then silence.
+        let (mut peer, mut node) = tokio::io::duplex(64);
+        peer.write_all(&frame_header(&p, "ping", 8, [0; 4])[..10])
+            .await
+            .unwrap();
+        let started = tokio::time::Instant::now();
+        assert!(matches!(
+            read_message(&mut node, &p).await,
+            Err(WireError::Timeout)
+        ));
+        assert!(started.elapsed() >= IO_TIMEOUT);
+        drop(peer);
+
+        // A whole header declaring 100 bytes, then 10 of them.
+        let (mut peer, mut node) = tokio::io::duplex(256);
+        peer.write_all(&frame_header(&p, "ping", 100, [0; 4]))
+            .await
+            .unwrap();
+        peer.write_all(&[0u8; 10]).await.unwrap();
+        let started = tokio::time::Instant::now();
+        assert!(matches!(
+            read_message(&mut node, &p).await,
+            Err(WireError::Timeout)
+        ));
+        assert!(started.elapsed() >= IO_TIMEOUT);
+        assert!(started.elapsed() < IO_TIMEOUT * 2, "one deadline, not two");
+        drop(peer);
+    }
+
     #[test]
     fn oversized_inv_rejected() {
         let mut w = Writer::new();

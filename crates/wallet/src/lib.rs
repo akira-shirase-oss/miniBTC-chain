@@ -15,6 +15,7 @@ pub mod bip32;
 pub mod bip39;
 pub mod draft;
 pub mod keystore;
+pub mod owner_only;
 pub mod wallet;
 pub mod watch;
 

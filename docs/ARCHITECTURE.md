@@ -107,7 +107,17 @@ Hard rules:
   `reject`). An indexed header whose block is neither held, queued nor in
   flight is requested again — after each headers answer, when a peer's
   requests drain, and from the periodic sweep, where an expired request
-  (60 s) goes to another peer when there is one.
+  (60 s) goes to another peer when there is one. A peer that holds
+  requests and delivers none of them within its stall window (10 s,
+  halved per consecutive stall, at least 2 s; checked every 2 s) has
+  them withdrawn and asked of other peers, and is scored −25; until it
+  delivers again it may hold 128 requests and is asked only when no
+  peer without strikes is connected (D-018).
+- **Bans end sessions.** Each session registers a cancel token. A ban
+  (by score or the operator's `banpeer`) or a disconnect removes the
+  peer from the table and cancels its session, which closes the socket
+  at once; the reader also stops after any message that leaves its peer
+  unregistered (D-018).
 - **Mempool** is local policy: removed on connect; after a reorg the
   disconnected blocks' transactions are re-validated against the new chain
   and re-admitted (oldest block first; conflicts and already-confirmed ones

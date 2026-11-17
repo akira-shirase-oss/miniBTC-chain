@@ -22,5 +22,9 @@ tracing-subscriber.workspace = true
 tokio.workspace = true
 clap.workspace = true
 
+[dev-dependencies]
+# Stand-in node RPC for tool-level tests.
+axum.workspace = true
+
 [lints]
 workspace = true

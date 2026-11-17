@@ -36,6 +36,11 @@ struct Args {
     #[arg(long, default_value = "127.0.0.1:18446")]
     rpc: SocketAddr,
 
+    /// Allow a non-loopback `--rpc` address (refused otherwise). The RPC
+    /// credential is full-privilege: expose it only on a network you trust.
+    #[arg(long)]
+    allow_remote_rpc: bool,
+
     /// Mine blocks continuously, paying `address`.
     #[arg(long, requires = "mining_address")]
     mine: bool,
@@ -70,6 +75,10 @@ async fn main() -> Result<()> {
         .with_target(false)
         .init();
 
+    // Refuse to expose the RPC by accident, before touching the datadir.
+    minibtc_rpc::http::check_bind(args.rpc, args.allow_remote_rpc, "--allow-remote-rpc")
+        .map_err(anyhow::Error::msg)?;
+
     // Params: custom file or devnet preset.
     let params: ChainParams = match &args.params {
         Some(p) => {
@@ -94,17 +103,9 @@ async fn main() -> Result<()> {
         "node state loaded"
     );
 
-    // RPC auth cookie — written into datadir, never logged.
+    // RPC auth cookie — written into datadir owner-only, never logged.
     let auth = minibtc_rpc::server::CookieAuth::generate();
-    std::fs::write(args.datadir.join(".cookie"), auth.to_cookie_file()).context("write .cookie")?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(
-            args.datadir.join(".cookie"),
-            std::fs::Permissions::from_mode(0o600),
-        );
-    }
+    write_cookie(&args.datadir, &auth)?;
 
     // Shutdown wiring: SIGINT/SIGTERM → cancel flag → tasks exit.
     let cancel = node.cancel.clone();
@@ -167,6 +168,17 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Write the RPC `.cookie` owner-only: `0600` from creation, atomic, and
+/// never through a symlink planted at the path. It used to be written with
+/// the umask's mode and chmodded afterwards with the error ignored. A
+/// failure is fatal: the node must not serve RPC behind a credential other
+/// local users might read.
+fn write_cookie(datadir: &std::path::Path, auth: &minibtc_rpc::server::CookieAuth) -> Result<()> {
+    let path = datadir.join(".cookie");
+    minibtc_wallet::owner_only::write_owner_only(&path, auth.to_cookie_file().as_bytes())
+        .with_context(|| format!("write {} owner-only", path.display()))
+}
+
 /// Tip hash for startup logging.
 fn node_tip(node: &core::Node) -> String {
     node.inner
@@ -211,5 +223,45 @@ async fn mine_loop(node: core::Node, address: Option<String>) {
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+#[cfg(unix)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn the_rpc_cookie_is_owner_only_and_never_written_through_a_symlink() {
+        let dir = std::env::temp_dir().join(format!("mbtc-cookie-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let elsewhere = dir.join("elsewhere");
+        std::fs::write(&elsewhere, b"untouched").unwrap();
+        std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, dir.join(".cookie")).unwrap();
+
+        let auth = minibtc_rpc::server::CookieAuth::generate();
+        write_cookie(&dir, &auth).unwrap();
+        let meta = std::fs::symlink_metadata(dir.join(".cookie")).unwrap();
+        assert!(meta.is_file(), "the planted link is replaced by a file");
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            std::fs::read(&elsewhere).unwrap(),
+            b"untouched",
+            "the secret must not be written into the link's target"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join(".cookie")).unwrap(),
+            auth.to_cookie_file()
+        );
+
+        // A datadir the node cannot write is an error, not a warning.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let res = write_cookie(&dir, &auth);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(res.is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

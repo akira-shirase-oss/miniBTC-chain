@@ -70,6 +70,10 @@ struct Args {
     /// Listen address (localhost only unless you know why).
     #[arg(long, default_value = "127.0.0.1:18448")]
     listen: SocketAddr,
+    /// Allow a non-loopback `--listen` address (refused otherwise). This
+    /// UI holds unlocked keys: expose it only on a network you trust.
+    #[arg(long)]
+    allow_remote: bool,
     /// Session idle timeout, seconds.
     #[arg(long, default_value_t = 1800)]
     session_ttl_secs: u64,
@@ -207,11 +211,6 @@ fn persist_wallet(
     std::fs::create_dir_all(path.parent().context("wallet path has no parent")?)?;
     let ks = Keystore::encrypt(seed, passphrase).context("encrypt keystore")?;
     ks.save(&path).context("save keystore")?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-    }
     save_indices(datadir, name, indices)
 }
 
@@ -373,7 +372,8 @@ fn require_post_session(
     let token = session_token(app, headers)?;
     let sessions = app.sessions.lock().unwrap_or_else(|e| e.into_inner());
     let s = sessions.get(&token)?;
-    (form.get("csrf").map(String::as_str) == Some(s.csrf.as_str())).then_some(token)
+    let sent = form.get("csrf")?;
+    minibtc_rpc::server::constant_time_eq(sent.as_bytes(), s.csrf.as_bytes()).then_some(token)
 }
 
 /// Insert a new session; returns the cookie token.
@@ -1489,6 +1489,9 @@ async fn main() -> Result<()> {
         .with_target(false)
         .init();
     let args = Args::parse();
+    // Refuse to expose a key-holding UI by accident, before anything else.
+    minibtc_rpc::http::check_bind(args.listen, args.allow_remote, "--allow-remote")
+        .map_err(anyhow::Error::msg)?;
     let params = match &args.params {
         Some(p) => {
             let text = tokio::fs::read_to_string(p)
@@ -1510,7 +1513,19 @@ async fn main() -> Result<()> {
         pending_creates: Mutex::new(HashMap::new()),
         unlock_fails: Mutex::new(HashMap::new()),
     });
-    let router = Router::new()
+    let listener = tokio::net::TcpListener::bind(args.listen).await?;
+    tracing::info!("wallet-ui listening on http://{}", args.listen);
+    minibtc_rpc::http::serve_bounded(listener, router(app), minibtc_rpc::http::Limits::LOCAL).await;
+    Ok(())
+}
+
+/// Most time one request may take (its RPC calls have their own 30 s cap).
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// Every route, over the shared app state.
+fn router(app: Arc<App>) -> Router {
+    let guard_app = app.clone();
+    Router::new()
         .route("/", get(index))
         .route("/new", get(new_form).post(new_submit))
         .route("/restore", get(restore_form).post(restore_submit))
@@ -1529,11 +1544,71 @@ async fn main() -> Result<()> {
         .route("/wallet/address/new", post(new_address))
         .route("/wallet/lock", post(lock))
         .route("/healthz", get(healthz))
-        .with_state(app);
-    let listener = tokio::net::TcpListener::bind(args.listen).await?;
-    tracing::info!("wallet-ui listening on http://{}", args.listen);
-    axum::serve(listener, router).await?;
-    Ok(())
+        .with_state(app)
+        // Form bodies are small; a stuck request is answered 503.
+        .layer(tower_http::timeout::TimeoutLayer::with_status_code(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            REQUEST_TIMEOUT,
+        ))
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(64 * 1024))
+        // Outermost: every response, including errors from the layers
+        // above, carries the security headers.
+        .layer(axum::middleware::from_fn_with_state(guard_app, guard))
+}
+
+/// The response headers every wallet UI page carries: no scripts, no
+/// framing, no MIME sniffing, no referrer, and never cached (pages show
+/// balances, addresses and, once, a seed).
+const SECURITY_HEADERS: [(header::HeaderName, &str); 5] = [
+    (
+        header::CONTENT_SECURITY_POLICY,
+        "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; \
+         frame-ancestors 'none'; base-uri 'none'",
+    ),
+    (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+    (header::X_FRAME_OPTIONS, "DENY"),
+    (header::REFERRER_POLICY, "no-referrer"),
+    (header::CACHE_CONTROL, "no-store"),
+];
+
+/// Whether the request's Host names this server: the bound address or
+/// `localhost:<port>`. A page served under any other name (DNS
+/// rebinding: a hostile site's name pointed at 127.0.0.1) is refused
+/// before a handler runs. Bound to an unspecified address (opt-in remote
+/// use), any host on the right port is accepted.
+fn host_ok(headers: &HeaderMap, listen: SocketAddr) -> bool {
+    let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    if host == listen.to_string() || host == format!("localhost:{}", listen.port()) {
+        return true;
+    }
+    listen.ip().is_unspecified()
+        && host
+            .rsplit_once(':')
+            .is_some_and(|(_, port)| port == listen.port().to_string())
+}
+
+/// Host check on the way in, security headers on the way out.
+async fn guard(
+    State(app): State<Arc<App>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let mut res = if host_ok(req.headers(), app.listen) {
+        next.run(req).await
+    } else {
+        (
+            axum::http::StatusCode::MISDIRECTED_REQUEST,
+            "unexpected Host",
+        )
+            .into_response()
+    };
+    for (name, value) in SECURITY_HEADERS {
+        res.headers_mut()
+            .insert(name, header::HeaderValue::from_static(value));
+    }
+    res
 }
 
 #[cfg(test)]
@@ -1686,6 +1761,283 @@ mod tests {
                 .unwrap_or_else(|e| e.into_inner())
                 .is_empty()
         );
+    }
+
+    /// A stand-in node RPC on loopback that counts `sendrawtransaction`.
+    async fn counting_rpc() -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let sends = Arc::new(AtomicUsize::new(0));
+        let counter = sends.clone();
+        let app = Router::new().route(
+            "/",
+            post(move |axum::Json(req): axum::Json<Value>| {
+                let counter = counter.clone();
+                async move {
+                    if req["method"] == "sendrawtransaction" {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                    }
+                    axum::Json(
+                        json!({"jsonrpc": "2.0", "id": req["id"], "result": "ab".repeat(32)}),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (port, sends)
+    }
+
+    fn app_with_pending_send(rpc_port: u16) -> Arc<App> {
+        let auth = minibtc_rpc::server::CookieAuth {
+            user: "u".into(),
+            pass: "p".into(),
+        };
+        let wallet = Wallet::generate("", 0, 0, 0, 100)
+            .unwrap_or_else(|_| panic!())
+            .0;
+        let app = Arc::new(App {
+            rpc: RpcClient::new("127.0.0.1", rpc_port, auth).unwrap_or_else(|_| panic!()),
+            params: ChainParams::devnet(),
+            datadir: std::env::temp_dir().join(format!("mbtc-wui-{}", std::process::id())),
+            listen: "127.0.0.1:18448".parse().unwrap_or_else(|_| panic!()),
+            ttl: Duration::from_secs(600),
+            sessions: Mutex::new(HashMap::new()),
+            pending_creates: Mutex::new(HashMap::new()),
+            unlock_fails: Mutex::new(HashMap::new()),
+        });
+        app.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                "tok".into(),
+                Session {
+                    name: "w".into(),
+                    wallet,
+                    csrf: "c5rf".into(),
+                    touched: Instant::now(),
+                    pending: None,
+                },
+            );
+        app
+    }
+
+    fn arm_pending(app: &App) {
+        app.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut("tok")
+            .unwrap_or_else(|| panic!())
+            .pending = Some(PendingSend {
+            to: "addr".into(),
+            amount_sats: 1,
+            fee_rate: 1,
+            fee_sats: 1,
+            txid: "00".repeat(32),
+            tx_hex: "00".into(),
+            inputs: 1,
+        });
+    }
+
+    fn confirm_request(
+        cookie: Option<&str>,
+        origin: Option<&str>,
+        body: &str,
+    ) -> axum::http::Request<axum::body::Body> {
+        let mut b = axum::http::Request::post("/wallet/send/confirm")
+            .header(header::HOST, "127.0.0.1:18448")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+        if let Some(c) = cookie {
+            b = b.header(header::COOKIE, c);
+        }
+        if let Some(o) = origin {
+            b = b.header(header::ORIGIN, o);
+        }
+        b.body(axum::body::Body::from(body.to_string()))
+            .unwrap_or_else(|_| panic!())
+    }
+
+    #[tokio::test]
+    async fn send_confirm_without_a_valid_csrf_token_or_origin_never_broadcasts() {
+        use std::sync::atomic::Ordering;
+        use tower::ServiceExt;
+        let (port, sends) = counting_rpc().await;
+        let app = app_with_pending_send(port);
+        let ours = Some("http://127.0.0.1:18448");
+        let refused = [
+            ("no csrf field", Some("mb_wallet=tok"), ours, ""),
+            ("empty csrf", Some("mb_wallet=tok"), ours, "csrf="),
+            ("wrong csrf", Some("mb_wallet=tok"), ours, "csrf=c5rg"),
+            ("csrf prefix", Some("mb_wallet=tok"), ours, "csrf=c5r"),
+            (
+                "foreign origin",
+                Some("mb_wallet=tok"),
+                Some("http://evil.example"),
+                "csrf=c5rf",
+            ),
+            (
+                "look-alike origin",
+                Some("mb_wallet=tok"),
+                Some("http://127.0.0.1:18448.evil.example"),
+                "csrf=c5rf",
+            ),
+            (
+                "opaque origin",
+                Some("mb_wallet=tok"),
+                Some("null"),
+                "csrf=c5rf",
+            ),
+            ("no session cookie", None, ours, "csrf=c5rf"),
+            (
+                "unknown session",
+                Some("mb_wallet=other"),
+                ours,
+                "csrf=c5rf",
+            ),
+        ];
+        for (case, cookie, origin, body) in refused {
+            arm_pending(&app);
+            let res = router(app.clone())
+                .oneshot(confirm_request(cookie, origin, body))
+                .await
+                .unwrap_or_else(|_| panic!());
+            assert_eq!(
+                sends.load(Ordering::SeqCst),
+                0,
+                "{case}: sendrawtransaction must not be called (status {})",
+                res.status()
+            );
+            let still_pending = app
+                .sessions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get("tok")
+                .is_some_and(|s| s.pending.is_some());
+            assert!(still_pending, "{case}: the pending send is left untouched");
+        }
+
+        // Control: the right session, token and origin do broadcast, once.
+        arm_pending(&app);
+        router(app.clone())
+            .oneshot(confirm_request(Some("mb_wallet=tok"), ours, "csrf=c5rf"))
+            .await
+            .unwrap_or_else(|_| panic!());
+        assert_eq!(sends.load(Ordering::SeqCst), 1);
+        let _ = std::fs::remove_dir_all(&app.datadir);
+    }
+
+    #[tokio::test]
+    async fn every_response_carries_the_security_headers_and_a_foreign_host_is_refused() {
+        use std::sync::atomic::Ordering;
+        use tower::ServiceExt;
+        let (port, sends) = counting_rpc().await;
+        let app = app_with_pending_send(port);
+        let ours = "127.0.0.1:18448";
+        let get = |path: &str, host: Option<&str>| {
+            let mut b = axum::http::Request::get(path);
+            if let Some(h) = host {
+                b = b.header(header::HOST, h);
+            }
+            b.body(axum::body::Body::empty())
+                .unwrap_or_else(|_| panic!())
+        };
+        let requests = [
+            ("index", get("/", Some(ours))),
+            ("seed", get("/seed", Some(ours))),
+            ("wallet", get("/wallet", Some(ours))),
+            ("healthz", get("/healthz", Some("localhost:18448"))),
+            ("unknown route", get("/nope", Some(ours))),
+            ("foreign host", get("/", Some("evil.example:18448"))),
+            ("no host", get("/", None)),
+            (
+                "confirm",
+                confirm_request(
+                    Some("mb_wallet=tok"),
+                    Some("http://127.0.0.1:18448"),
+                    "csrf=bad",
+                ),
+            ),
+        ];
+        for (case, req) in requests {
+            let res = router(app.clone())
+                .oneshot(req)
+                .await
+                .unwrap_or_else(|_| panic!());
+            let h = res.headers();
+            let csp = h
+                .get(header::CONTENT_SECURITY_POLICY)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default();
+            assert!(csp.contains("default-src 'none'"), "{case}: CSP {csp:?}");
+            assert!(
+                csp.contains("frame-ancestors 'none'"),
+                "{case}: CSP {csp:?}"
+            );
+            assert_eq!(
+                h.get(header::X_CONTENT_TYPE_OPTIONS)
+                    .and_then(|v| v.to_str().ok()),
+                Some("nosniff"),
+                "{case}"
+            );
+            assert_eq!(
+                h.get(header::CACHE_CONTROL).and_then(|v| v.to_str().ok()),
+                Some("no-store"),
+                "{case}"
+            );
+            if case.ends_with("host") {
+                assert_eq!(
+                    res.status(),
+                    axum::http::StatusCode::MISDIRECTED_REQUEST,
+                    "{case}"
+                );
+            }
+        }
+
+        // A request that would broadcast, but names a foreign host (DNS
+        // rebinding), never reaches the handler.
+        arm_pending(&app);
+        let mut req = confirm_request(
+            Some("mb_wallet=tok"),
+            Some("http://127.0.0.1:18448"),
+            "csrf=c5rf",
+        );
+        req.headers_mut().insert(
+            header::HOST,
+            "rebind.evil.example:18448"
+                .parse()
+                .unwrap_or_else(|_| panic!()),
+        );
+        let res = router(app.clone())
+            .oneshot(req)
+            .await
+            .unwrap_or_else(|_| panic!());
+        assert_eq!(res.status(), axum::http::StatusCode::MISDIRECTED_REQUEST);
+        assert_eq!(sends.load(Ordering::SeqCst), 0);
+        let _ = std::fs::remove_dir_all(&app.datadir);
+    }
+
+    #[test]
+    fn host_check_accepts_only_this_server() {
+        let listen: SocketAddr = "127.0.0.1:18448".parse().unwrap_or_else(|_| panic!());
+        let with = |h: &str| {
+            let mut m = HeaderMap::new();
+            m.insert(header::HOST, h.parse().unwrap_or_else(|_| panic!()));
+            m
+        };
+        assert!(host_ok(&with("127.0.0.1:18448"), listen));
+        assert!(host_ok(&with("localhost:18448"), listen));
+        for bad in [
+            "127.0.0.1:18449",
+            "localhost",
+            "evil.example:18448",
+            "127.0.0.1:18448.evil.example",
+        ] {
+            assert!(!host_ok(&with(bad), listen), "{bad}");
+        }
+        assert!(!host_ok(&HeaderMap::new(), listen));
+        let any: SocketAddr = "0.0.0.0:18448".parse().unwrap_or_else(|_| panic!());
+        assert!(host_ok(&with("192.168.1.9:18448"), any));
+        assert!(!host_ok(&with("192.168.1.9:1"), any));
     }
 
     #[test]

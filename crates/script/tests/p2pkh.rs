@@ -268,3 +268,51 @@ fn sample_tx_for_ctx() -> Transaction {
         locktime: 0,
     }
 }
+
+#[test]
+fn an_op_nop_in_a_script_sig_still_verifies_but_is_not_push_only() {
+    // The malleability the push-only policy closes: OP_NOP added to a
+    // signed scriptSig changes the txid and the spend still verifies.
+    let kp = key();
+    let prev_script = Script::p2pkh(&kp.public_key().key_hash());
+    let honest = spend_tx(&prev_script, &kp, 10_000);
+    assert!(is_push_only(&honest.inputs[0].script_sig));
+    let mut malleated = honest.clone();
+    malleated.inputs[0].script_sig.push(OP_NOP);
+    assert_ne!(malleated.txid(), honest.txid());
+    assert!(sighash::verify_input_scripts(
+        &malleated,
+        0,
+        &malleated.inputs[0].script_sig,
+        prev_script.as_bytes()
+    ));
+    assert!(!is_push_only(&malleated.inputs[0].script_sig));
+}
+
+#[test]
+fn push_only_accepts_every_push_form_and_refuses_the_rest() {
+    let pushes: [&[u8]; 7] = [
+        &[],
+        &[OP_0],
+        &[0x02, 0xaa, 0xbb],
+        &[OP_PUSHDATA1, 0x01, 0xaa],
+        &[OP_PUSHDATA2, 0x01, 0x00, 0xaa],
+        &[OP_PUSHDATA4, 0x01, 0x00, 0x00, 0x00, 0xaa],
+        &[OP_1NEGATE, OP_1, OP_16],
+    ];
+    for p in pushes {
+        assert!(is_push_only(p), "{p:02x?}");
+    }
+    let not_push: [&[u8]; 7] = [
+        &[OP_NOP],
+        &[0x01, 0xaa, OP_DUP],
+        &[OP_CHECKSIG],
+        &[0x02, 0xaa],                     // truncated direct push
+        &[OP_PUSHDATA1],                   // missing length
+        &[OP_PUSHDATA2, 0x05, 0x00, 0x01], // truncated pushdata2
+        &[OP_PUSHDATA4, 0xff, 0xff, 0xff, 0xff],
+    ];
+    for p in not_push {
+        assert!(!is_push_only(p), "{p:02x?}");
+    }
+}

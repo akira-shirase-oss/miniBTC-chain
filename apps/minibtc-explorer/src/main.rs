@@ -15,6 +15,9 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 /// MiniBTC block explorer (read-only).
+/// Most time one page may take (its RPC calls have their own 30 s cap).
+const PAGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+
 #[derive(Parser, Debug)]
 #[command(name = "minibtc-explorer", version, about)]
 struct Args {
@@ -53,10 +56,15 @@ async fn main() -> Result<()> {
         .route("/mempool", get(mempool_page))
         .route("/search", get(search_page))
         .route("/healthz", get(|| async { "ok" }))
-        .with_state(App { rpc });
+        .with_state(App { rpc })
+        // A page never needs long; a stuck one is answered 503.
+        .layer(tower_http::timeout::TimeoutLayer::with_status_code(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            PAGE_TIMEOUT,
+        ));
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
     tracing::info!(%args.listen, "explorer listening (read-only)");
-    axum::serve(listener, app).await?;
+    minibtc_rpc::http::serve_bounded(listener, app, minibtc_rpc::http::Limits::LOCAL).await;
     Ok(())
 }
 

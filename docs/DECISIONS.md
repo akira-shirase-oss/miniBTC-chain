@@ -43,6 +43,10 @@ Matches Bitcoin Core's shape and gives the CLI/explorer/MCP one surface.
 Auth: per-datadir `.cookie`-style token file (random 128-bit, `HttpOnly`
 conceptually; sent as `Authorization: Bearer`). Binds `127.0.0.1` by default;
 `--rpc-bind` is explicit opt-in for multi-machine devnets and is logged.
+*Corrected 2026-11-16 (D-019):* the flag is `--rpc <addr>` and the
+credential is HTTP Basic from `.cookie`; until D-019 any address was bound
+silently. A non-loopback `--rpc` now needs `--allow-remote-rpc` and is
+logged.
 
 ### D-006 — Devnet chain parameters are first-class config
 
@@ -287,6 +291,113 @@ not refused by the ban (per-IP and per-subnet connection caps still
 apply). Local addresses belong to the operator; the threat the ban
 answers is a remote peer. The operator's `banpeer` RPC still bans a whole
 IP, local or not.
+
+### D-018 — Bans end the session; stalled block requests move on (2026-11-16)
+
+Review round 4 found two gaps in the P2P layer:
+
+1. **A ban did not close the connection** (F1). `PeerManager` removed the
+   peer from the table and refused reconnects, but the session's reader
+   kept decoding and handling everything the banned peer sent until it
+   went quiet. Each session now registers a cancel token in the node; a
+   ban by score, the operator's `banpeer` and the sweep's disconnects all
+   cancel it, and the reader also stops after any message that leaves its
+   peer unregistered. Live: the node now closes a header flooder's socket
+   3.5 ms into the flood; before, it handled 16,299 messages over 20 s.
+2. **A peer could withhold blocks for the whole request TTL** (F2). One
+   that served real headers and no blocks held up to 2,048 requests — the
+   lowest heights, so nothing connected — for 60 s with no penalty.
+   `BlockRequests` now tracks, per peer, since when it has delivered
+   nothing. Every 2 s the node withdraws the requests of peers past their
+   stall window and asks other peers, scores the staller −25 (four stalls
+   with no delivery in between reach the ban threshold), lets it hold
+   only 128 requests and asks it only when no peer without strikes is
+   connected. The window is 10 s, halved per consecutive stall, never
+   below 2 s; a delivered block clears the strikes. Live, 3,000 blocks
+   behind a withholder: first block at +9 s and done at +38 s (honest-only
+   30 s), against +87 s and +111 s before (honest-only 40 s).
+
+Tradeoff, accepted: an honest peer that cannot serve a requested block
+(MiniBTC has no `notfound`) is scored −25 once per stall window and
+bypassed; three good blocks (+10 each) more than cancel one stall.
+Bitcoin Core also disconnects a peer that stalls its download window
+after a short, adaptive timeout; MiniBTC's 10 s start is generous for
+devnet block sizes on loopback and LAN links.
+
+### D-019 — Local web surfaces: loopback unless opted in, bounded serving (2026-11-16)
+
+The node RPC (a full-privilege credential), the explorer and the wallet
+UI (unlocked keys) are local services. From this decision:
+
+- **Binds.** A non-loopback `--rpc` (node) or `--listen` (wallet UI) is
+  refused at startup, before the datadir is touched, unless
+  `--allow-remote-rpc` / `--allow-remote` is given; with the flag the bind
+  is logged as a warning. The explorer (read-only chain data) keeps its
+  address as given.
+- **Connections.** All three serve through `minibtc_rpc::http::serve_bounded`:
+  at most 64 open connections (more are closed on accept) and a 10 s
+  header-read deadline that also closes idle kept-alive sockets.
+  `axum::serve` sets no timer, so hyper's default header timeout never
+  applied and idle sockets were held forever.
+- **Bodies.** The RPC checks credentials from the headers before reading
+  any body byte (it used to buffer up to 8 MiB first), caps bodies at
+  8 MiB (413) and gives an authenticated body 30 s (408). RPC handlers
+  have no deadline: `generatetoaddress` may run for minutes (the client's
+  mining timeout is 300 s). Explorer and wallet UI requests are answered
+  503 after 45 s; wallet UI form bodies are capped at 64 KiB.
+- **Wallet UI responses** carry `Content-Security-Policy: default-src
+  'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors
+  'none'; base-uri 'none'`, `X-Content-Type-Options: nosniff`,
+  `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer` and
+  `Cache-Control: no-store`, and a request whose `Host` is neither the
+  bound address nor `localhost:<port>` gets 421 before any handler runs
+  (DNS rebinding). Bound to an unspecified address with `--allow-remote`,
+  any host on the right port is accepted. CSRF tokens are compared
+  without an early exit.
+
+The 64-connection cap is above the 50-connection `ab` runs recorded in
+`docs/UI.md`; a load test with more concurrent connections will see
+connections closed on accept, by design.
+
+### D-020 — Secret files, MCP read-only mode, hosted CI (2026-11-16)
+
+- **Owner-only from creation.** Keystores, `.cookie`, watch-only files,
+  approved drafts and MCP drafts are written by
+  `minibtc_wallet::owner_only::write_owner_only`: a fresh `O_EXCL` temp
+  file created `0600`, the mode set again on the open handle (an error is
+  fatal), fsync, rename over the target. A symlink planted at the target
+  is replaced, never followed. The keystore used to be written with the
+  umask's mode and chmodded afterwards by callers that ignored a failure;
+  the node wrote `.cookie` the same way.
+- **MCP `--read-only`** lists and runs only the read and explain tools;
+  `draft_payment`, `request_send` and `mine_blocks` are refused before
+  any argument is read or the node is called. `get_peers` returns each
+  peer's user agent as `subver_untrusted`, control characters replaced,
+  under a note that labels it untrusted.
+- **CI.** `.github/workflows/ci.yml` runs `scripts/check.sh` on
+  ubuntu-latest for every push and pull request with cargo-deny required
+  (`MINIBTC_REQUIRE_DENY=1`), and checks advisories for the workspace and
+  the fuzz lockfile daily. Actions are pinned to commit SHAs and kept
+  current by Dependabot (weekly, grouped; cargo and github-actions);
+  `scripts/check-workflows.sh` enforces pinning, a read-only token, no
+  `pull_request_target`, no expression inside `run:` and no persisted
+  checkout credentials. CI uses cargo-deny 0.20.2 (the newest release at
+  least two weeks old); the maintainer's machine ran 0.21.0.
+
+### D-021 — Push-only scriptSigs: mempool policy, not consensus (2026-11-16)
+
+A scriptSig is not covered by its own signature, so anyone relaying a
+payment can append a no-op (`OP_NOP`) to it: the spend still verifies
+and the txid changes (third-party malleability; a wallet tracking the
+original txid then sees it "disappear"). The mempool now refuses any
+transaction with a scriptSig that is not push-only
+(`minibtc_script::is_push_only`, Bitcoin Core's `IsPushOnly`) as
+non-standard: no admission, no relay, no peer penalty. Consensus is
+unchanged: such a transaction is still valid in a block, as in Bitcoin
+for non-P2SH spends, so no datadir needs a reindex and `RULES_VERSION`
+stays as it is. A miner that bypasses its own mempool could still
+include one; making the rule consensus would be a soft fork with a
+rules-version bump, left for a later decision.
 
 ## Open questions
 

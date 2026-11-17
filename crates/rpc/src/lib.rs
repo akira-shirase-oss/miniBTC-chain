@@ -10,9 +10,11 @@
 //! - [`render`] — chain objects → JSON payloads.
 //! - [`server`] — axum HTTP server + cookie auth.
 //! - [`client`] — typed async client used by CLI / MCP / tests.
+//! - [`http`] — listener rules shared by the RPC, explorer and wallet UI.
 
 pub mod backend;
 pub mod client;
+pub mod http;
 pub mod render;
 pub mod server;
 pub mod types;

@@ -1359,6 +1359,7 @@ name = "minibtc-mcp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "clap",
  "minibtc-consensus",
  "minibtc-crypto",
@@ -1381,6 +1382,7 @@ dependencies = [
  "minibtc-consensus",
  "minibtc-crypto",
  "minibtc-primitives",
+ "minibtc-script",
  "serde",
  "thiserror",
 ]
@@ -1421,6 +1423,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
 ]
@@ -1458,6 +1461,8 @@ dependencies = [
  "base64 0.23.1",
  "futures",
  "hex",
+ "hyper",
+ "hyper-util",
  "minibtc-chainstate",
  "minibtc-consensus",
  "minibtc-crypto",
@@ -1546,6 +1551,8 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tower",
+ "tower-http 0.7.1",
  "tracing",
  "tracing-subscriber",
  "zeroize",

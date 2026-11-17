@@ -121,11 +121,12 @@ impl Keystore {
         })
     }
 
-    /// Save to a file (atomic-ish: write tmp + rename).
+    /// Save to a file: owner-only (`0600`) from creation, atomic (temp +
+    /// rename), never through a symlink. It used to be written with the
+    /// umask's mode (usually world-readable) and left to callers to chmod,
+    /// which ignored a failure.
     pub fn save(&self, path: &Path) -> Result<(), KeystoreError> {
-        let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, self.encode())?;
-        std::fs::rename(&tmp, path)?;
+        crate::owner_only::write_owner_only(path, &self.encode())?;
         Ok(())
     }
 
@@ -233,6 +234,26 @@ mod tests {
         let mut bad = bytes.clone();
         bad[0] ^= 0xff;
         assert!(Keystore::decode(&bad).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_keystore_is_owner_only_and_never_written_through_a_symlink() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallet.ks");
+        encrypt_keystore(&[5u8; SEED_LEN], "pw", &path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "a keystore must be owner-only, got {mode:o}");
+
+        // A link planted where the keystore goes is replaced, not followed.
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::write(&elsewhere, b"untouched").unwrap();
+        let linked = dir.path().join("linked.ks");
+        std::os::unix::fs::symlink(&elsewhere, &linked).unwrap();
+        encrypt_keystore(&[5u8; SEED_LEN], "pw", &linked).unwrap();
+        assert_eq!(std::fs::read(&elsewhere).unwrap(), b"untouched");
+        assert!(decrypt_keystore(&linked, "pw").is_ok());
     }
 
     #[test]

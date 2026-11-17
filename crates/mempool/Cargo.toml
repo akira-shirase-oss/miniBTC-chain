@@ -11,6 +11,7 @@ description = "MiniBTC mempool: fee-rate ordering, policy limits, conflict handl
 minibtc-crypto = { path = "../crypto" }
 minibtc-primitives = { path = "../primitives" }
 minibtc-consensus = { path = "../consensus" }
+minibtc-script = { path = "../script" }
 thiserror.workspace = true
 serde.workspace = true
 indexmap = "2"

@@ -78,6 +78,11 @@ struct Args {
     #[arg(long, default_value = DEFAULT_MINER_ADDRESS)]
     miner_address: String,
 
+    /// Serve only the read and explain tools: draft_payment, request_send
+    /// and mine_blocks are neither listed nor callable.
+    #[arg(long)]
+    read_only: bool,
+
     /// One-shot: list pending payment drafts, then exit.
     #[arg(long)]
     list_drafts: bool,
@@ -101,16 +106,22 @@ fn audit(datadir: &Path, entry: &Value) -> Result<()> {
     let mut line = serde_json::to_string(entry)?;
     line.push('\n');
     use std::io::Write;
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .with_context(|| format!("open audit log {}", path.display()))?;
-    // Restrict audit log to owner-only like the cookie.
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).append(true);
     #[cfg(unix)]
     {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600); // owner-only from creation, like the cookie
+    }
+    let mut f = opts
+        .open(&path)
+        .with_context(|| format!("open audit log {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        // An older log may have been created with the umask's mode.
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("make audit log {} owner-only", path.display()))?;
     }
     f.write_all(line.as_bytes())?;
     Ok(())
@@ -156,12 +167,8 @@ impl Draft {
         std::fs::create_dir_all(dir)?;
         let path = Self::path(dir, &self.id);
         let bytes = serde_json::to_vec_pretty(self)?;
-        std::fs::write(&path, bytes)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-        }
+        minibtc_wallet::owner_only::write_owner_only(&path, &bytes)
+            .with_context(|| format!("write draft {} owner-only", path.display()))?;
         Ok(())
     }
 
@@ -335,6 +342,8 @@ pub struct Shared {
     pub max_spend_sats: u64,
     pub max_daily_sats: u64,
     pub miner_address: String,
+    /// `--read-only`: no write tool is listed or callable.
+    pub read_only: bool,
 }
 
 #[tokio::main]
@@ -397,6 +406,7 @@ async fn main() -> Result<()> {
         max_spend_sats: args.max_spend_sats,
         max_daily_sats: args.max_daily_sats,
         miner_address: args.miner_address.clone(),
+        read_only: args.read_only,
     });
     let handler = mcp::MiniBtcMcp::new(shared);
     let transport = rmcp::transport::io::stdio();

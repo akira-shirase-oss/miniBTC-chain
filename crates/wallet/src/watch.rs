@@ -69,39 +69,10 @@ pub fn watch_json(wallet: &mut crate::Wallet, gap: u32) -> Result<Vec<u8>, Watch
 /// so the CLI and the wallet UI writing at the same moment never share a
 /// temp file; the last rename wins and the file is always one whole write.
 pub fn write_watch_bytes(path: &Path, bytes: &[u8]) -> Result<(), WatchError> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let io = |source| WatchError::Io {
+    crate::owner_only::write_owner_only(path, bytes).map_err(|source| WatchError::Io {
         path: path.display().to_string(),
         source,
-    };
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "watch".into());
-    // Relaxed: the counter only needs to be unique, not ordered.
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp = path.with_file_name(format!(".{name}.{}.{seq}.tmp", std::process::id()));
-    let result = write_new_file(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    result.map_err(io)
-}
-
-/// Create `tmp` (0600, must not exist), write `bytes`, fsync.
-fn write_new_file(tmp: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut f = opts.open(tmp)?;
-    f.write_all(bytes)?;
-    f.sync_all()
+    })
 }
 
 /// [`watch_json`] + [`write_watch_bytes`].

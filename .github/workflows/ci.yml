@@ -1,0 +1,66 @@
+# Hosted CI: the same gate as a local commit (scripts/check.sh) on every
+# push and pull request, plus a daily advisory check so a new RustSec
+# entry fails CI without waiting for a commit. Actions are pinned to full
+# commit SHAs (Dependabot keeps them current); the token is read-only.
+name: CI
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # scripts/check.sh fails instead of skipping when cargo-deny is missing.
+  MINIBTC_REQUIRE_DENY: "1"
+
+jobs:
+  gate:
+    name: scripts/check.sh
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the toolchain pinned in rust-toolchain.toml
+        run: |
+          rustup toolchain install || rustup show
+          rustup show active-toolchain
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2.89.0
+        with:
+          tool: cargo-deny@0.20.2
+      - name: fmt, clippy -D warnings, tests, architecture, wallet secrets, workflows, cargo-deny
+        run: scripts/check.sh
+
+  advisories:
+    name: advisories (workspace and fuzz lockfiles)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the toolchain pinned in rust-toolchain.toml
+        run: |
+          rustup toolchain install || rustup show
+          rustup show active-toolchain
+      - uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2.89.0
+        with:
+          tool: cargo-deny@0.20.2
+      - name: Workspace Cargo.lock
+        run: cargo deny --locked check advisories
+      - name: Fuzz Cargo.lock (tests/attacks/fuzz, outside the workspace)
+        run: cargo deny --manifest-path tests/attacks/fuzz/Cargo.toml --locked --config deny.toml check advisories sources

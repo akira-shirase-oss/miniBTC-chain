@@ -1,0 +1,39 @@
+# Live loopback checks for review round 4 F1/F2 (defensive, local probe)
+# Machine: Apple M2 Pro, 12 cores, 32 GB; macOS 27.2.1
+# Busy machine: load averages are printed per run; timings are development observations.
+# Ports: F1 node 47341/47342; F2 honest 47311/47312, victim 47321/47322, baseline 47331/47332.
+# Probe: a scratch Rust client over minibtc-p2p's codec (outside the repo). flood = replay one real header in 2,000-header messages; withhold = serve 3,000 real headers, never a block.
+# Params: devnet with pow_target_timespan_blocks 1000000, max_future_time_secs 100000.
+
+== live check (before (d007ae5)) Mon 16 Nov 2026 21:14:06 EST machine: Apple M2 Pro load: 22.15 29.53 31.45
+  probe local addr 127.0.0.1:52711
+  flood: messages_sent=16299 write_error_at=None node_closed_at=None (ran 21.005160292s)
+  F1: probe sockets still ESTABLISHED after the run: 0; node 'bad headers' log lines: 0; 'peer banned; closing' lines: 0; node CPU 0:00.01 -> 0:05.68
+  honest node mined 3000 blocks
+  F2 baseline (honest peer only): height 3000 after 40s
+  withhold: t=104.927344s headers_served=3000 getdata_items=3000
+  withhold: t=109.936044916s headers_served=3000 getdata_items=3000
+  F2: victim height 3000/3000; first block connected at +87s; finished at +111s after the honest peer connected
+  victim stall rotations logged: 0
+
+== live check (after (ceab021)) Mon 16 Nov 2026 21:11:53 EST machine: Apple M2 Pro load: 46.23 34.91 33.38
+  probe local addr 127.0.0.1:61883
+  flood: messages_sent=13 write_error_at=Some(3.569584ms) node_closed_at=Some(3.521084ms) (ran 3.570875ms)
+  F1: probe sockets still ESTABLISHED after the run: 0; node 'bad headers' log lines: 0; 'peer banned; closing' lines: 1; node CPU 0:00.01 -> 0:00.01
+  honest node mined 3000 blocks
+  F2 baseline (honest peer only): height 3000 after 30s
+  withhold: t=31.613274625s headers_served=3000 getdata_items=3000
+  withhold: t=36.6287795s headers_served=3000 getdata_items=3000
+  F2: victim height 3000/3000; first block connected at +9s; finished at +38s after the honest peer connected
+  victim log: 2026-11-17T02:13:09.709432Z  INFO peer delivered none of its requested blocks; asking other peers peer=127.0.0.1:65471 blocks=2048 strikes=1
+  victim stall rotations logged: 1
+
+# Reading the results
+# - "probe sockets still ESTABLISHED" is sampled after the probe process exits, so it is 0 in both runs; the
+#   meaningful F1 numbers are node_closed_at and the node's CPU time.
+# - F1 before: the node handled all 16,299 replayed-header messages over 20 s after banning the peer and never
+#   closed the connection (node CPU +5.7 s). After: the node closed the connection 3.5 ms into the flood, once
+#   the ban landed (13 messages were written, most still in socket buffers), and its CPU time did not move.
+# - F2 before: behind a withholder the victim connected its first block at +87 s and finished 3,000 blocks at
+#   +111 s (honest-only baseline 40 s). After: first block at +9 s, all 3,000 at +38 s (baseline 30 s); one
+#   stall rotation logged (2,048 requests moved off the withholder, strike 1).
