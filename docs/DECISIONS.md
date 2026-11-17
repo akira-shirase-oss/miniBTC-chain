@@ -338,7 +338,14 @@ UI (unlocked keys) are local services. From this decision:
   at most 64 open connections (more are closed on accept) and a 10 s
   header-read deadline that also closes idle kept-alive sockets.
   `axum::serve` sets no timer, so hyper's default header timeout never
-  applied and idle sockets were held forever.
+  applied and idle sockets were held forever. *Added in review round 5:*
+  a 10 s write-stall deadline (a client that pipelines requests and
+  never reads loses the connection; hyper has no write timeout) and at
+  most 1,000 requests per connection (the last answer carries
+  `Connection: close`). Live, 64 such clients no longer lock out the RPC
+  (a fresh request served after 1 s) or the explorer (16 s), against
+  45 s and 60 s-plus before. A per-IP connection cap below the global
+  one would not help on loopback, where every client is 127.0.0.1.
 - **Bodies.** The RPC checks credentials from the headers before reading
   any body byte (it used to buffer up to 8 MiB first), caps bodies at
   8 MiB (413) and gives an authenticated body 30 s (408). RPC handlers
@@ -350,8 +357,9 @@ UI (unlocked keys) are local services. From this decision:
   'none'; base-uri 'none'`, `X-Content-Type-Options: nosniff`,
   `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer` and
   `Cache-Control: no-store`, and a request whose `Host` is neither the
-  bound address nor `localhost:<port>` gets 421 before any handler runs
-  (DNS rebinding). Bound to an unspecified address with `--allow-remote`,
+  bound address nor `localhost:<port>` (compared ignoring case) gets 421
+  before any handler runs (DNS rebinding), and one with no `Host` at all
+  (allowed in HTTP/1.0) gets 400. Bound to an unspecified address with `--allow-remote`,
   any host on the right port is accepted. CSRF tokens are compared
   without an early exit.
 
@@ -420,6 +428,9 @@ Now:
   answers `notfound`; the requester withdraws those requests without a
   strike, stops counting that peer as an announcer (a header nobody
   announces any more is dropped) and asks the next announcer at once.
+- **Score cap.** A peer's score is capped at +100, so ten bad messages
+  ban even a long-serving peer (it used to climb +10 per block without
+  limit). The delivered-block count behind protection is kept apart.
 - **Protection.** The peer that delivered the most connected blocks,
   an outbound peer before any inbound one, is never scored for stalls:
   its requests still move elsewhere, but a node cannot be talked into
@@ -433,6 +444,17 @@ has, so nothing the honest chain needs) and, for real blocks other peers
 also announced, one stall window per reconnect before they are fetched
 elsewhere; the fifth review measured that trickling evasion at 19 s
 against 17 s for a 2,000-block sync.
+
+Live after the fix (`perf/results/live-g1-g2-20261116.log`): an attacker
+announcing 50 phantom headers per connection and reconnecting from a
+new port every 25 s for 240 s, while the honest peer mined a block every
+15 s, was struck and disconnected every cycle; the honest peer was never
+struck and the victim stayed on the honest tip throughout.
+
+**Gate.** `scripts/check-deny.sh` fails, saying why, when cargo-deny
+cannot fetch the RustSec database; `MINIBTC_DENY_OFFLINE=1` checks
+against the cached database and reports it as offline. CI may set
+neither (`scripts/check-workflows.sh`).
 
 ## Open questions
 
