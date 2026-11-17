@@ -163,6 +163,21 @@ non-loopback `--listen` exits naming `--allow-remote`. Explorer adds
   (`perf/results/load-*.json`); these runs measure the thin HTML layer
   on top.
 
+### 2026-11-17 at `3844afd` — 1,000,000 requests each (release build)
+
+- Explorer `GET /mempool`, 50 conns: plain `ab -k` (the method above) **aborted at
+  50,024 requests** — every connection reached the 1,000-request cap (`f510ad8`) at
+  about the same time and ab stops at its first receive error. With `ab -r -k`:
+  **1,000,000 complete, 34,565 req/s, p99 2 ms; 1,030 flagged (67 receive, 963
+  length)**.
+- Wallet-ui `GET /wallet`, 10 conns, 101 UTXOs rescanned per request: **1,000,000
+  complete, 9,021 req/s, p99 2 ms; 994 flagged (3 receive, 991 length)**.
+- Both flag about one request per capped-connection close (0.10%). curl over one
+  keep-alive connection gets 1,002/1,002 complete answers with one reconnect at
+  1,001, so the cap closes cleanly for HTTP/1.1; the flags fit ab's HTTP/1.0
+  keep-alive handling, not proven server-side. No threshold is defined for the UI
+  load. Raw: `perf/results/ui-load-3844afd.txt`.
+
 ## Honest limits
 
 - Localhost devnet tool: single-user, no TLS (HTTP on loopback),

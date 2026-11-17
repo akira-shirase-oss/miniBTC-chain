@@ -1,0 +1,45 @@
+UI load — P13 explorer + wallet-ui, 1,000,000 requests each
+machine: Apple M2 Pro, 12 cores, 32 GB, macOS 27.2.1 (laptop — development observation, not capacity)
+commit: 3844afd3e87335d10609f672364891dc7dbb65e8 (release build)
+date: 2026-11-17T11:14Z-11:18Z
+tool: ApacheBench (ab) 2.3
+setup: fresh devnet datadir; node on 127.0.0.1:47345 (p2p) / 47346 (rpc); explorer --listen 127.0.0.1:47347; wallet-ui --listen 127.0.0.1:47348;
+       wallet created with minibtc-cli, 101 blocks mined to it (101 UTXOs, all scanned per /wallet request), session from POST /unlock.
+threshold: none defined for the UI load; failures are reported as measured.
+
+1) explorer GET /mempool, 1,000,000 req, 50 conns, ab -k (the 2026-11-10 method) — ABORTED, kept:
+   Benchmarking 127.0.0.1 (be patient)...apr_socket_recv: Connection reset by peer (54) Total of 50024 requests completed 
+   load before/after:  { 2.96 4.87 5.34 } / { 2.96 4.87 5.34 }
+   50 connections x ~1,000 requests: every connection hit the RPC layer's 1,000-request cap (crates/rpc/src/http.rs, since f510ad8)
+   at about the same time and plain ab exits on its first socket receive error.
+
+2) explorer GET /mempool, 1,000,000 req, 50 conns, ab -r -k (continue past receive errors):
+   Complete requests: 1000000
+   Failed requests: 1030
+    (Connect: 0, Receive: 67, Length: 963, Exceptions: 0)
+   Keep-Alive requests: 999039
+   Time taken for tests: 28.931 seconds
+   Requests per second: 34564.84 [#/sec] (mean)
+   Time per request: 1.447 [ms] (mean)
+   latency percentiles (ms): 50% 1  95% 2  99% 2  100% 17  
+   load before/after:  { 4.23 4.85 5.29 } / { 11.08 6.43 5.85 }
+
+3) wallet-ui GET /wallet (authed; scantxoutset + full wallet rescan per request), 1,000,000 req, 10 conns, ab -r -k:
+   Complete requests: 1000000
+   Failed requests: 994
+    (Connect: 0, Receive: 3, Length: 991, Exceptions: 0)
+   Keep-Alive requests: 999009
+   Time taken for tests: 110.847 seconds
+   Requests per second: 9021.41 [#/sec] (mean)
+   Time per request: 1.108 [ms] (mean)
+   latency percentiles (ms): 50% 1  95% 2  99% 2  100% 11  
+   load before/after:  { 6.77 5.85 5.66 } / { 6.21 5.98 5.73 }
+   load samples (UTC, 1/5/15 min): 11:16:40 { 6.77 5.85 5.66 };11:17:40 { 6.69 6.01 5.73 };
+   the 5-minute load reached 6.01 mid-run (this run plus other work on the machine); kept, not rerun.
+
+Reading the failures: both runs flag about one request per capped-connection close (1,000,000 / 1,000 = ~1,000 closes):
+explorer 1,030 (0.10%), wallet-ui 994 (0.10%), almost all 'Length' (a body of a different size than the first answer).
+The cap itself closes cleanly for an HTTP/1.1 client: curl sent 1,002 sequential keep-alive requests to /mempool on one
+connection — all 200, all 3,476 bytes, one reconnect exactly at request 1,001. So the flagged requests are consistent with
+ab's HTTP/1.0 keep-alive handling of a 'Connection: close' answer, but that is not proven from the server side (the
+explorer logs at info only). Earlier (6dc7c5a, before the cap): 100,000 explorer req 0 failures, 20,000 wallet req 0 failures.

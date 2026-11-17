@@ -3,7 +3,9 @@
 > **Status — complete + UI expansion (P13).** All phases P0–P12 per
 > `docs/ROADMAP.md` are built and verified: 15/15 blueprint attack scenarios + wallet-entropy hardening tests, ~26M fuzz
 > executions with zero crashes, 9/9 property invariants, 6M load ops all
-> passing, and a three-node devnet demo with a two-wallet payment. Until
+> passing (re-run 2026-11-17 at `3844afd`: 6/6, `perf/results/load-1794913986.json`;
+> the `chain` scenario rejects every transaction, `valid=0`, so it passes on the
+> rejection path's throughput), and a three-node devnet demo with a two-wallet payment. Until
 > 2026-11-16 the demo's "fork reorg" phase was not a competing fork (N1 mined
 > nothing while N3 extended), and a real one exposed that a reorg never
 > reached a node connected only through a relay. Both are fixed: the demo now

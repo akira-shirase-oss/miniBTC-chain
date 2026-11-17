@@ -1,0 +1,74 @@
+{
+  "all_pass": true,
+  "commit": "3844afd",
+  "generated_unix": 1794913986,
+  "machine": {
+    "chip": "Apple M2 Pro",
+    "memory_gb": 32,
+    "note": "laptop dev numbers — not production capacity",
+    "os": "27.2.1"
+  },
+  "ops_per_scenario": 1000000,
+  "scenarios": [
+    {
+      "detail": "acc=200203125",
+      "name": "codec",
+      "ops": 1000000,
+      "ops_per_sec": 4001670.040968218,
+      "pass": true,
+      "seconds": 0.249895666,
+      "threshold_ops_per_sec": 150000.0,
+      "unit": "ops"
+    },
+    {
+      "detail": "acc=27500000",
+      "name": "wire",
+      "ops": 1000000,
+      "ops_per_sec": 4491323.037861557,
+      "pass": true,
+      "seconds": 0.222651542,
+      "threshold_ops_per_sec": 200000.0,
+      "unit": "ops"
+    },
+    {
+      "detail": "all p2pkh verifies passed",
+      "name": "script",
+      "ops": 1000000,
+      "ops_per_sec": 22387.23878717483,
+      "pass": true,
+      "seconds": 44.668304542,
+      "threshold_ops_per_sec": 5000.0,
+      "unit": "verifies"
+    },
+    {
+      "detail": "admitted=999304 rejected=696 final_len=131",
+      "name": "mempool",
+      "ops": 1000000,
+      "ops_per_sec": 753173.7088758673,
+      "pass": true,
+      "seconds": 1.327714959,
+      "threshold_ops_per_sec": 50000.0,
+      "unit": "admits"
+    },
+    {
+      "detail": "valid=0",
+      "name": "chain",
+      "ops": 1000000,
+      "ops_per_sec": 2277096.0159896226,
+      "pass": true,
+      "seconds": 0.439155834,
+      "threshold_ops_per_sec": 20000.0,
+      "unit": "validations"
+    },
+    {
+      "detail": "ok=1000000/1000000 tip=e3783a754fd1",
+      "name": "rpc",
+      "ops": 1000000,
+      "ops_per_sec": 54654.729845940274,
+      "pass": true,
+      "seconds": 18.296678125,
+      "threshold_ops_per_sec": 200.0,
+      "unit": "requests"
+    }
+  ]
+}
