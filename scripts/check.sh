@@ -12,13 +12,6 @@ cargo test --workspace --locked
 scripts/check-architecture.sh
 scripts/check-wallet-secrets.sh
 scripts/check-workflows.sh
-# cargo-deny is part of the gate: a failing check fails the gate. A missing
-# binary is a warning locally and an error when MINIBTC_REQUIRE_DENY=1 (CI).
-if cargo deny --version >/dev/null 2>&1; then
-  cargo deny check
-elif [ "${MINIBTC_REQUIRE_DENY:-0}" = "1" ]; then
-  echo "error: cargo-deny is required (MINIBTC_REQUIRE_DENY=1) but not installed" >&2
-  exit 1
-else
-  echo "warn: cargo-deny not installed; skipping supply-chain check" >&2
-fi
+# cargo-deny is part of the gate: a failing check, or an advisory database
+# that cannot be fetched, fails it (scripts/check-deny.sh explains both).
+scripts/check-deny.sh
