@@ -21,6 +21,7 @@ inside every phase; the attack lab formalizes it in P12.
 | P12 | Hardening & attack lab | All 15 §8 attacks automated + passing; fuzz targets; invariants property-tested; ≥1M-op load evidence committed |
 | P13 | UI expansion (D-011) | Explorer: search/pagination/dashboard/richer pages, still read-only. Wallet UI: passphrase-gated in-memory sessions, CSRF, audit, build+sign+broadcast flow live-tested |
 | P13b | Wallet entropy hardening (D-012) | Coldcard-class weak-RNG attack test: simulated low-entropy seeds collide at birthday bound; real generator verified full-width |
+| P14 | Security verification (D-018–D-020, 2026-11-16) | Bans close live sessions and withheld blocks rotate away (in-process + live loopback evidence); every defence in the security checklist has a test shown failing first; hosted CI runs `scripts/check.sh` with cargo-deny required |
 
 ## Sequencing notes
 

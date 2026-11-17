@@ -46,12 +46,21 @@ files; create/restore are UI flows (see below).
   balances, txids, summaries.
 - Unlock is rate-limited per wallet name: 5 failures → 60 s lockout.
 
-### CSRF / origin
+### CSRF / origin / host
 
 - Every POST form carries a per-session `csrf` hidden field; handlers
-  reject mismatches (tested live: wrong token → no state change).
+  reject mismatches (tested live: wrong token → no state change), and
+  the token is compared without an early exit.
 - `Origin` header, when present, must match the listen socket
   (`127.0.0.1:port` or `localhost:port`).
+- `Host` must name this server (the bound address or `localhost:port`);
+  anything else gets 421 before a handler runs (DNS rebinding, D-019).
+- Every response carries a CSP with no script source and
+  `frame-ancestors 'none'`, `nosniff`, `X-Frame-Options: DENY`,
+  `Referrer-Policy: no-referrer` and `Cache-Control: no-store`.
+- `--listen` must be loopback unless `--allow-remote` is given. Serving
+  is bounded: 64 connections, a 10 s header deadline, 45 s per request,
+  64 KiB form bodies (D-019).
 
 ### Send flow (two-step, human-gated)
 
@@ -129,9 +138,15 @@ CLI and this UI alike (D-015).
 
 ## Tests
 
-`cargo test -p minibtc-wallet-ui` — 7 unit tests: amount parsing,
-fee-rate bounds, wallet-name validation, cookie parse/flags, Origin
-check, HTML escaping, session-expiry sweep. Explorer adds
+`cargo test -p minibtc-wallet-ui` — unit tests for amount parsing,
+fee-rate bounds, wallet-name validation, cookie parse/flags, Origin and
+Host checks, HTML escaping and the session-expiry sweep, plus handler
+tests through the real router: `POST /wallet/send/confirm` with a
+missing, empty, wrong or truncated CSRF token, a foreign, look-alike or
+`null` Origin, no or an unknown session, or a rebinding Host never calls
+`sendrawtransaction` (a loopback stand-in RPC counts the calls), and
+every response carries the security headers. `tests/bind.rs`: a
+non-loopback `--listen` exits naming `--allow-remote`. Explorer adds
 `classify_query_routes`.
 
 ## Load smoke (ab, this machine — laptop numbers, not capacity)

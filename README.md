@@ -15,6 +15,39 @@
 > two-step build→review→confirm→broadcast send flow. Evidence under
 > `perf/results/`.
 
+## Security verification (P14, 2026-11-16)
+
+A defensive pass over every surface, each fix with a test shown failing
+first (`docs/DECISIONS.md` D-018–D-020):
+
+- **P2P.** A ban now closes the banned peer's live connection (it used to
+  keep reading everything the peer sent), and a peer that withholds
+  requested blocks loses them to other peers after a 10 s stall window
+  (halving per stall) with a −25 score, instead of holding the download
+  for the 60 s request TTL. Live loopback evidence, before and after:
+  `perf/results/live-f1-f2-20261116-211809.log`. Frame-cap and read
+  deadline tests pin the 2 MiB limit and the 30 s timeout.
+- **Secrets at rest.** Keystores, `.cookie`, watch-only files and drafts
+  are created `0600` (never briefly world-readable, never written through
+  a planted symlink) and a failure to do so is fatal.
+- **Web surfaces.** The RPC checks credentials before reading a body; the
+  RPC, explorer and wallet UI cap connections and close idle sockets; a
+  non-loopback `--rpc` or wallet-UI `--listen` needs `--allow-remote-rpc`
+  / `--allow-remote`. The wallet UI sends a script-free CSP, `no-store`
+  and anti-framing headers, refuses foreign `Host` names, and a handler
+  test proves `send/confirm` never broadcasts without a valid CSRF token
+  and Origin.
+- **MCP.** `--read-only` serves only read and explain tools; peer user
+  agents reach the model labelled as untrusted.
+- **CI.** `.github/workflows/ci.yml` runs `scripts/check.sh` (fmt, clippy
+  `-D warnings`, tests, architecture, wallet secrets, workflow rules,
+  cargo-deny required) on every push and pull request, plus a daily
+  advisory check that also covers the fuzz lockfile; actions are pinned
+  by SHA and updated weekly by Dependabot.
+
+The devnet demo passes 22/22 on the final build
+(`perf/results/devnet-demo-20261116-215552.log`).
+
 A from-scratch Bitcoin-style blockchain in Rust: a full node that validates
 every transaction and block, a P2P network, a miner, an HD wallet, a CLI, a
 block explorer and an MCP server — all on its own private network with its own
