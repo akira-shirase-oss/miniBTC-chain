@@ -5,19 +5,24 @@ use crate::backend::SharedBackend;
 use crate::types::{JsonRpcRequest, JsonRpcResponse, RpcError, params_array};
 use axum::{
     Json, Router,
-    body::Bytes,
-    extract::State,
+    body::Body,
+    extract::{Request, State},
     http::{HeaderMap, StatusCode, header},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use base64::Engine;
 use serde_json::Value;
 use std::sync::Arc;
+use std::time::Duration;
 use tower_http::limit::RequestBodyLimitLayer;
 
 /// Max JSON-RPC request body — a full block hex fits comfortably.
 const MAX_BODY: usize = 8 * 1024 * 1024;
+/// An authenticated request's body must arrive within this. (The handler
+/// itself has no deadline: `generatetoaddress` may run for minutes.)
+pub const BODY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Cookie-file credentials (Bitcoin-style `user:password` in `.cookie`).
 #[derive(Clone, Debug)]
@@ -101,23 +106,37 @@ fn authorized(headers: &HeaderMap, auth: &CookieAuth) -> bool {
 struct ServerState {
     backend: SharedBackend,
     auth: Arc<CookieAuth>,
+    body_timeout: Duration,
 }
 
 /// Build the axum router. Binds are the caller's choice — always
 /// localhost in practice (`serve` binds 127.0.0.1).
 pub fn router(backend: SharedBackend, auth: CookieAuth) -> Router {
+    router_with(backend, auth, BODY_TIMEOUT)
+}
+
+/// [`router`] with an explicit body deadline (tests use a short one).
+///
+/// Credentials are checked from the headers alone, before any body byte is
+/// read: an unauthenticated client used to be able to make the server
+/// buffer up to 8 MiB (and wait for it indefinitely) before getting 401.
+pub fn router_with(backend: SharedBackend, auth: CookieAuth, body_timeout: Duration) -> Router {
     let state = ServerState {
         backend,
         auth: Arc::new(auth),
+        body_timeout,
     };
     Router::new()
         .route("/", post(rpc_handler).get(info_handler))
+        // Applies to the routes above only; /healthz stays open.
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_auth))
         .route("/healthz", get(healthz))
         .layer(RequestBodyLimitLayer::new(MAX_BODY))
         .with_state(state)
 }
 
-/// Serve on `addr` (expected `127.0.0.1:port`) until shutdown.
+/// Serve on `addr` (expected `127.0.0.1:port`) until shutdown, with the
+/// connection cap and header deadline of [`crate::http::Limits::LOCAL`].
 pub async fn serve(
     backend: SharedBackend,
     auth: CookieAuth,
@@ -125,17 +144,23 @@ pub async fn serve(
 ) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "rpc server listening");
-    axum::serve(listener, router(backend, auth)).await
+    crate::http::serve_bounded(listener, router(backend, auth), crate::http::Limits::LOCAL).await;
+    Ok(())
+}
+
+/// Refuse a request without valid credentials before its body is read.
+async fn require_auth(State(st): State<ServerState>, req: Request, next: Next) -> Response {
+    if !authorized(req.headers(), &st.auth) {
+        return unauthorized();
+    }
+    next.run(req).await
 }
 
 async fn healthz() -> &'static str {
     "ok"
 }
 
-async fn info_handler(State(st): State<ServerState>, headers: HeaderMap) -> Response {
-    if !authorized(&headers, &st.auth) {
-        return unauthorized();
-    }
+async fn info_handler(State(st): State<ServerState>) -> Response {
     Json(serde_json::json!({
         "service": "minibtc-rpc",
         "version": env!("CARGO_PKG_VERSION"),
@@ -153,10 +178,23 @@ fn unauthorized() -> Response {
         .into_response()
 }
 
-async fn rpc_handler(State(st): State<ServerState>, headers: HeaderMap, body: Bytes) -> Response {
-    if !authorized(&headers, &st.auth) {
-        return unauthorized();
-    }
+async fn rpc_handler(State(st): State<ServerState>, body: Body) -> Response {
+    // Authenticated by `require_auth`; the body read is bounded in size
+    // (MAX_BODY) and time.
+    let body =
+        match tokio::time::timeout(st.body_timeout, axum::body::to_bytes(body, MAX_BODY)).await {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(_)) => {
+                return (StatusCode::PAYLOAD_TOO_LARGE, "request body too large").into_response();
+            }
+            Err(_) => {
+                return (
+                    StatusCode::REQUEST_TIMEOUT,
+                    "request body not received in time",
+                )
+                    .into_response();
+            }
+        };
     // Parse envelope.
     let req: JsonRpcRequest = match serde_json::from_slice::<JsonRpcRequest>(&body) {
         Ok(r) if r.jsonrpc == "2.0" => r,

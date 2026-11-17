@@ -1515,9 +1515,12 @@ async fn main() -> Result<()> {
     });
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
     tracing::info!("wallet-ui listening on http://{}", args.listen);
-    axum::serve(listener, router(app)).await?;
+    minibtc_rpc::http::serve_bounded(listener, router(app), minibtc_rpc::http::Limits::LOCAL).await;
     Ok(())
 }
+
+/// Most time one request may take (its RPC calls have their own 30 s cap).
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// Every route, over the shared app state.
 fn router(app: Arc<App>) -> Router {
@@ -1541,6 +1544,12 @@ fn router(app: Arc<App>) -> Router {
         .route("/wallet/lock", post(lock))
         .route("/healthz", get(healthz))
         .with_state(app)
+        // Form bodies are small; a stuck request is answered 503.
+        .layer(tower_http::timeout::TimeoutLayer::with_status_code(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            REQUEST_TIMEOUT,
+        ))
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(64 * 1024))
 }
 
 #[cfg(test)]
