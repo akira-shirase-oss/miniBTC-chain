@@ -1359,6 +1359,7 @@ name = "minibtc-mcp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "clap",
  "minibtc-consensus",
  "minibtc-crypto",
