@@ -44,8 +44,9 @@ pub(crate) const REQUESTS_PER_PEER: usize = 2_048;
 /// `MAX_INBOUND × REQUESTS_PER_PEER`, attackers holding every inbound slot
 /// could fill it and the node's own outbound requests would be skipped.
 pub(crate) const REQUESTS_MAX: usize = REQUESTS_PER_PEER * minibtc_p2p::peer::MAX_PEERS;
-/// A block request not answered within this is forgotten.
-pub(crate) const REQUEST_TTL: Duration = Duration::from_secs(5 * 60);
+/// A block request not answered within this expires and is re-requested,
+/// from another peer when there is one (backoff + rotation).
+pub(crate) const REQUEST_TTL: Duration = Duration::from_secs(60);
 
 /// One queued block plus what the caps need.
 struct PendingEntry {
@@ -159,11 +160,12 @@ impl BlockRequests {
     /// can still arrive once its parent is known, and the next headers
     /// round asks again. Re-requesting from the same peer is a no-op; from
     /// another peer it moves the request there.
-    pub fn note(&mut self, hash: Hash256, peer: SocketAddr, now: Instant) {
+    /// Returns whether the request is now recorded for `peer`.
+    pub fn note(&mut self, hash: Hash256, peer: SocketAddr, now: Instant) -> bool {
         self.expire(now);
         if let Some((asked, _)) = self.by_hash.get(&hash) {
             if *asked == peer {
-                return;
+                return true;
             }
             let old = *asked;
             self.by_hash.remove(&hash);
@@ -171,7 +173,7 @@ impl BlockRequests {
         }
         let mine = self.per_peer.get(&peer).copied().unwrap_or(0);
         if mine >= REQUESTS_PER_PEER || self.by_hash.len() >= REQUESTS_MAX {
-            return;
+            return false;
         }
         self.by_hash.insert(hash, (peer, now));
         *self.per_peer.entry(peer).or_insert(0) += 1;
@@ -182,6 +184,17 @@ impl BlockRequests {
             self.order
                 .retain(|(t, h)| by_hash.get(h).is_some_and(|(_, at)| at == t));
         }
+        true
+    }
+
+    /// Whether `hash` is requested from anyone (and not expired).
+    pub fn is_requested(&self, hash: &Hash256) -> bool {
+        self.by_hash.contains_key(hash)
+    }
+
+    /// Requests outstanding to `peer`.
+    pub fn in_flight(&self, peer: &SocketAddr) -> usize {
+        self.per_peer.get(peer).copied().unwrap_or(0)
     }
 
     /// Whether `hash` was requested from `peer` (and not expired);
@@ -199,8 +212,10 @@ impl BlockRequests {
     }
 
     /// Forget requests older than `REQUEST_TTL` — pops from the front of
-    /// the time-ordered queue only.
-    pub fn expire(&mut self, now: Instant) {
+    /// the time-ordered queue only. Returns what expired (hash, peer asked)
+    /// so the caller can ask someone else.
+    pub fn expire(&mut self, now: Instant) -> Vec<(Hash256, SocketAddr)> {
+        let mut expired = Vec::new();
         while let Some(&(at, hash)) = self.order.front() {
             if now.saturating_duration_since(at) <= REQUEST_TTL {
                 break;
@@ -211,8 +226,10 @@ impl BlockRequests {
             {
                 self.by_hash.remove(&hash);
                 self.dec(peer);
+                expired.push((hash, peer));
             }
         }
+        expired
     }
 
     /// Drop every request to `peer` (on disconnect). O(n), once per

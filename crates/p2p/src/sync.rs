@@ -87,6 +87,9 @@ pub struct PeerDownload {
     /// `getheaders` sent to this peer and not yet answered: an answer
     /// that brings nothing new is expected then, not a fault.
     pub headers_requested: u32,
+    /// The last header of the last valid headers message from this peer —
+    /// where the next `getheaders` to it continues from.
+    pub best_header: Option<Hash256>,
 }
 
 /// The sync coordinator — one per node.
@@ -236,6 +239,9 @@ impl Sync {
         if to_fetch.is_empty() && !headers.is_empty() && !solicited {
             return Err(SyncError::NothingNew);
         }
+        if let (Some(pd), Some(last)) = (self.peers.get_mut(&peer), hashes.last()) {
+            pd.best_header = Some(*last);
+        }
         // Record in the peer's wanted queue (bounded by the window).
         if let Some(pd) = self.peers.get_mut(&peer) {
             for h in &to_fetch {
@@ -291,6 +297,25 @@ impl Sync {
         }
         if !self.header_time_ok(h) {
             return Err(SyncError::BadHeader(format!("time too far ahead {hash}")));
+        }
+        // Median-time-past over the parent and its ancestors (indexed
+        // headers and blocks), the same rule block validation applies.
+        let mut times = Vec::with_capacity(self.params.median_time_span);
+        let mut cur = Some(*parent);
+        while let Some(info) = cur {
+            times.push(info.time);
+            if times.len() >= self.params.median_time_span || info.height == 0 {
+                break;
+            }
+            cur = self.lookup(&info.prev, chain);
+        }
+        if let Some(mtp) = minibtc_consensus::median_time_past(&times, self.params.median_time_span)
+            && h.time <= mtp
+        {
+            return Err(SyncError::BadHeader(format!(
+                "time {} not after median-time-past {mtp}",
+                h.time
+            )));
         }
         Ok(HeaderInfo {
             height,
@@ -397,6 +422,37 @@ impl Sync {
     /// Indexed headers whose blocks have not connected yet.
     pub fn known_header_count(&self) -> usize {
         self.headers.len()
+    }
+
+    /// Up to `limit` indexed headers whose blocks we do not hold, lowest
+    /// height first, with the peer that sent each. The node re-requests the
+    /// ones that are neither queued nor in flight — a header being indexed
+    /// must never stop its block from being fetched.
+    pub fn missing_blocks(&self, limit: usize) -> Vec<(Hash256, SocketAddr)> {
+        let mut v: Vec<(u32, Hash256, SocketAddr)> = self
+            .headers
+            .iter()
+            .filter(|(h, _)| !self.have.contains(*h))
+            .map(|(h, (info, from))| (info.height, *h, *from))
+            .collect();
+        v.sort_unstable_by_key(|(height, h, _)| (*height, *h));
+        v.into_iter().take(limit).map(|(_, h, p)| (h, p)).collect()
+    }
+
+    /// The indexed entry for a header whose block has not connected.
+    pub fn header_info(&self, hash: &Hash256) -> Option<HeaderInfo> {
+        self.headers.get(hash).map(|(i, _)| *i)
+    }
+
+    /// Where header sync with `peer` continues from (see
+    /// [`PeerDownload::best_header`]).
+    pub fn best_header(&self, peer: &SocketAddr) -> Option<Hash256> {
+        self.peers.get(peer).and_then(|pd| pd.best_header)
+    }
+
+    /// Peers registered for sync.
+    pub fn peer_addrs(&self) -> Vec<SocketAddr> {
+        self.peers.keys().copied().collect()
     }
 
     /// Validate a header's timestamp is sane vs params (MTP needs chain
@@ -617,6 +673,38 @@ mod tests {
             sync.on_headers(a, &[future], genesis_only(g)),
             Err(SyncError::BadHeader(_))
         ));
+    }
+
+    #[test]
+    fn a_header_not_after_median_time_past_is_refused() {
+        // Eleven headers 32 s apart: the median of the last eleven is the
+        // sixth from the top. A header at or before it is invalid (block
+        // validation would refuse its block; the header must not be
+        // indexed either).
+        let p = params();
+        let g = Hash256([0x01; 32]);
+        let mut sync = Sync::new(p.clone(), g);
+        let a = peer(1);
+        sync.add_peer(a);
+        let hs = header_chain(g, 11);
+        sync.on_headers(a, &hs, genesis_only(g)).unwrap();
+        let tip = hs.last().unwrap();
+        let mut times: Vec<u32> = hs.iter().map(|h| h.time).collect();
+        times.sort_unstable();
+        let mtp = times[times.len() / 2];
+        let old = header_at(tip.block_hash(), mtp, p.pow_limit_bits, 0);
+        assert!(
+            matches!(
+                sync.on_headers(a, &[old], genesis_only(g)),
+                Err(SyncError::BadHeader(_))
+            ),
+            "a header at median-time-past must be refused"
+        );
+        let fine = header_at(tip.block_hash(), mtp + 1, p.pow_limit_bits, 0);
+        assert_eq!(
+            sync.on_headers(a, &[fine], genesis_only(g)).unwrap().len(),
+            1
+        );
     }
 
     #[test]

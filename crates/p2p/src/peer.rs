@@ -103,8 +103,12 @@ pub struct PeerState {
 pub struct PeerManager {
     /// Live peers by socket addr.
     peers: HashMap<SocketAddr, PeerState>,
-    /// Banned IPs → ban expiry (unix secs).
+    /// Banned IPs → ban expiry (unix secs): public misbehaving peers and
+    /// operator bans (`banpeer`).
     bans: HashMap<IpAddr, u64>,
+    /// Banned addresses (IP + port) → expiry: misbehaving peers on
+    /// loopback or private addresses, where one IP is many nodes.
+    addr_bans: HashMap<SocketAddr, u64>,
     /// Our own handshake nonce — for self-connection detection.
     our_nonce: u64,
     /// Connection limits.
@@ -122,6 +126,7 @@ impl PeerManager {
         Self {
             peers: HashMap::new(),
             bans: HashMap::new(),
+            addr_bans: HashMap::new(),
             our_nonce: rand_nonce(),
             max_peers: MAX_PEERS,
             max_inbound: MAX_INBOUND,
@@ -156,24 +161,41 @@ impl PeerManager {
         self.peers.keys().copied().collect()
     }
 
-    /// Is this IP banned right now?
-    pub fn is_banned(&self, ip: &IpAddr) -> bool {
-        match self.bans.get(ip) {
-            Some(&until) => until > (self.now)(),
-            None => false,
-        }
+    /// Is a connection with `addr` banned right now (its IP, or for a
+    /// local address the exact address)?
+    pub fn is_banned(&self, addr: &SocketAddr) -> bool {
+        let now = (self.now)();
+        self.bans.get(&addr.ip()).is_some_and(|&until| until > now)
+            || self.addr_bans.get(addr).is_some_and(|&until| until > now)
     }
 
-    /// Ban an IP for `BAN_SECS` from now.
+    /// Ban an IP for `BAN_SECS` from now and drop its live connections
+    /// (the operator's `banpeer`: the whole IP, local or not).
     pub fn ban(&mut self, ip: IpAddr) {
         self.bans.insert(ip, (self.now)().saturating_add(BAN_SECS));
-        // Drop live connections from it.
         self.peers.retain(|a, _| a.ip() != ip);
     }
 
-    /// Unban an IP.
+    /// Ban a misbehaving peer. A public address is banned by IP, as
+    /// before. A loopback or private address is banned by IP *and port*:
+    /// on a local devnet every node shares 127.0.0.1 (or one LAN prefix),
+    /// so a per-IP ban for one bad process cut off every local peer for
+    /// an hour. Tradeoff: a local process reconnecting from a new port is
+    /// not refused — local addresses are the operator's own machines.
+    pub fn ban_peer(&mut self, addr: SocketAddr) {
+        if is_local(&addr.ip()) {
+            self.addr_bans
+                .insert(addr, (self.now)().saturating_add(BAN_SECS));
+            self.peers.remove(&addr);
+        } else {
+            self.ban(addr.ip());
+        }
+    }
+
+    /// Lift every ban on `ip` (whole-IP and per-address).
     pub fn unban(&mut self, ip: &IpAddr) {
         self.bans.remove(ip);
+        self.addr_bans.retain(|a, _| a.ip() != *ip);
     }
 
     /// Admit a new connection from `addr` if it is not banned and under
@@ -210,7 +232,7 @@ impl PeerManager {
 
     /// Whether a connection from `addr` would fit under every cap.
     fn check_caps(&self, addr: SocketAddr, outbound: bool) -> Result<(), PeerError> {
-        if self.is_banned(&addr.ip()) {
+        if self.is_banned(&addr) {
             return Err(PeerError::Banned);
         }
         if self.peers.len() >= self.max_peers {
@@ -304,8 +326,7 @@ impl PeerManager {
             false
         };
         if ban_ip {
-            let ip = addr.ip();
-            self.ban(ip);
+            self.ban_peer(*addr);
         }
     }
 
@@ -480,6 +501,19 @@ where
     }
 }
 
+/// Loopback, private (RFC 1918 / unique local) or link-local: addresses
+/// where one IP is commonly many nodes of one operator.
+fn is_local(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || (v6.segments()[0] & 0xfe00) == 0xfc00 // unique local fc00::/7
+                || (v6.segments()[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -559,11 +593,11 @@ mod tests {
         let a = addr(1);
         pm.register(a, true, &version_msg()).unwrap();
         pm.ban(a.ip());
-        assert!(pm.is_banned(&a.ip()));
+        assert!(pm.is_banned(&a));
         assert!(matches!(pm.admit(a, true), Err(PeerError::Banned)));
         assert!(pm.get(&a).is_none(), "ban drops live conns");
         pm.unban(&a.ip());
-        assert!(!pm.is_banned(&a.ip()));
+        assert!(!pm.is_banned(&a));
     }
 
     #[test]
@@ -574,7 +608,7 @@ mod tests {
         for _ in 0..6 {
             pm.score(&a, SCORE_BAD_MESSAGE); // -20 × 6 = -120 ≤ -100
         }
-        assert!(pm.is_banned(&a.ip()));
+        assert!(pm.is_banned(&a));
     }
 
     #[test]
