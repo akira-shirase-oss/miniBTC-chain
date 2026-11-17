@@ -298,6 +298,25 @@ impl Sync {
         if !self.header_time_ok(h) {
             return Err(SyncError::BadHeader(format!("time too far ahead {hash}")));
         }
+        // Median-time-past over the parent and its ancestors (indexed
+        // headers and blocks), the same rule block validation applies.
+        let mut times = Vec::with_capacity(self.params.median_time_span);
+        let mut cur = Some(*parent);
+        while let Some(info) = cur {
+            times.push(info.time);
+            if times.len() >= self.params.median_time_span || info.height == 0 {
+                break;
+            }
+            cur = self.lookup(&info.prev, chain);
+        }
+        if let Some(mtp) = minibtc_consensus::median_time_past(&times, self.params.median_time_span)
+            && h.time <= mtp
+        {
+            return Err(SyncError::BadHeader(format!(
+                "time {} not after median-time-past {mtp}",
+                h.time
+            )));
+        }
         Ok(HeaderInfo {
             height,
             bits: h.bits,
@@ -654,6 +673,38 @@ mod tests {
             sync.on_headers(a, &[future], genesis_only(g)),
             Err(SyncError::BadHeader(_))
         ));
+    }
+
+    #[test]
+    fn a_header_not_after_median_time_past_is_refused() {
+        // Eleven headers 32 s apart: the median of the last eleven is the
+        // sixth from the top. A header at or before it is invalid (block
+        // validation would refuse its block; the header must not be
+        // indexed either).
+        let p = params();
+        let g = Hash256([0x01; 32]);
+        let mut sync = Sync::new(p.clone(), g);
+        let a = peer(1);
+        sync.add_peer(a);
+        let hs = header_chain(g, 11);
+        sync.on_headers(a, &hs, genesis_only(g)).unwrap();
+        let tip = hs.last().unwrap();
+        let mut times: Vec<u32> = hs.iter().map(|h| h.time).collect();
+        times.sort_unstable();
+        let mtp = times[times.len() / 2];
+        let old = header_at(tip.block_hash(), mtp, p.pow_limit_bits, 0);
+        assert!(
+            matches!(
+                sync.on_headers(a, &[old], genesis_only(g)),
+                Err(SyncError::BadHeader(_))
+            ),
+            "a header at median-time-past must be refused"
+        );
+        let fine = header_at(tip.block_hash(), mtp + 1, p.pow_limit_bits, 0);
+        assert_eq!(
+            sync.on_headers(a, &[fine], genesis_only(g)).unwrap().len(),
+            1
+        );
     }
 
     #[test]
