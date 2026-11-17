@@ -19,6 +19,19 @@ if ! cargo deny --version >/dev/null 2>&1; then
   exit 0
 fi
 
+# Advisory exceptions in deny.toml are dated: one whose "review by" date
+# has passed fails the gate until it is re-justified or removed.
+today="$(date -u +%Y-%m-%d)"
+expired="$(grep -oE 'review by [0-9]{4}-[0-9]{2}-[0-9]{2}' deny.toml | awk -v t="$today" '$3 < t {print $3}' || true)"
+if [ -n "$expired" ]; then
+  echo "error: deny.toml has advisory exceptions past their review date ($(echo $expired | tr '\n' ' ')); re-check and update or remove them" >&2
+  exit 1
+fi
+if grep -qE '^\s*\{ *id *= *"RUSTSEC-' deny.toml && grep -E '^\s*\{ *id *= *"RUSTSEC-' deny.toml | grep -vqE 'review by [0-9]{4}-[0-9]{2}-[0-9]{2}'; then
+  echo "error: every deny.toml advisory exception needs a 'review by YYYY-MM-DD' in its reason" >&2
+  exit 1
+fi
+
 if [ "${MINIBTC_DENY_OFFLINE:-0}" = "1" ]; then
   db="$(ls -dt "${CARGO_HOME:-$HOME/.cargo}"/advisory-dbs/*/ 2>/dev/null | head -1)"
   when="$( [ -n "$db" ] && git -C "$db" log -1 --format=%cI 2>/dev/null || echo unknown)"
