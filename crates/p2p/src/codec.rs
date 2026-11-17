@@ -131,6 +131,9 @@ pub enum Message {
     Inv(Vec<InvItem>),
     /// `getdata` — request inventory.
     GetData(Vec<InvItem>),
+    /// `notfound` — the answer to the `getdata` items the sender does not
+    /// have, so the requester asks someone else instead of waiting.
+    NotFound(Vec<InvItem>),
     /// `tx` — a transaction.
     Tx(Transaction),
     /// `block` — a full block.
@@ -240,7 +243,7 @@ pub fn encode_payload(msg: &Message, params: &ChainParams) -> Vec<u8> {
             w.u8(if *relay { 1 } else { 0 });
         }
         Message::Verack => {}
-        Message::Inv(items) | Message::GetData(items) => {
+        Message::Inv(items) | Message::GetData(items) | Message::NotFound(items) => {
             w.compact_size(items.len() as u64);
             for it in items {
                 w.u32(it.kind as u32);
@@ -314,6 +317,7 @@ pub fn decode_payload(command: &str, payload: &[u8]) -> Result<Message, WireErro
         "verack" => Message::Verack,
         "inv" => Message::Inv(decode_inv(&mut r)?),
         "getdata" => Message::GetData(decode_inv(&mut r)?),
+        "notfound" => Message::NotFound(decode_inv(&mut r)?),
         "tx" => {
             // tx/block payloads are self-delimiting and consume the whole
             // remainder — decode from `rest()`, then advance the cursor so
@@ -435,6 +439,7 @@ pub fn command_name(msg: &Message) -> &'static str {
         Message::Verack => "verack",
         Message::Inv(_) => "inv",
         Message::GetData(_) => "getdata",
+        Message::NotFound(_) => "notfound",
         Message::Tx(_) => "tx",
         Message::Block(_) => "block",
         Message::Headers { .. } => "headers",
@@ -548,6 +553,10 @@ mod tests {
                 kind: InvType::Block,
                 hash: Hash256([0xBB; 32]),
             }]),
+            Message::NotFound(vec![InvItem {
+                kind: InvType::Block,
+                hash: Hash256([0xCC; 32]),
+            }]),
             Message::Addr(vec![(
                 NetAddress {
                     services: 0,
@@ -576,6 +585,7 @@ mod tests {
                 (Message::Verack, Message::Verack) => {}
                 (Message::Inv(a), Message::Inv(b)) => assert_eq!(a, b),
                 (Message::GetData(a), Message::GetData(b)) => assert_eq!(a, b),
+                (Message::NotFound(a), Message::NotFound(b)) => assert_eq!(a, b),
                 (Message::Addr(a), Message::Addr(b)) => assert_eq!(a.len(), b.len()),
                 (Message::Reject { .. }, Message::Reject { .. }) => {}
                 _ => panic!("mismatch"),

@@ -399,6 +399,41 @@ stays as it is. A miner that bypasses its own mempool could still
 include one; making the rule consensus would be a soft fork with a
 rules-version bump, left for a later decision.
 
+### D-022 — Ask only announcers; `notfound`; never ban the best peer (2026-11-16)
+
+D-018's stall scoring could be turned against honest peers. An attacker
+announced headers with valid (cheap, devnet) proof of work and no blocks
+behind them, and withheld; the victim then asked its honest peers for
+those blocks, they stayed silent (there was no `notfound`), and each
+silence was scored as withholding. Reconnecting from a new port reset the
+attacker's own strikes (D-017 bans local peers by address), and the
+honest peer was banned within minutes, leaving the victim with no peers.
+Now:
+
+- **Announcers.** The header index remembers every peer that announced
+  an indexed header (sent it in `headers`, or named the block in an
+  `inv`), up to 8 besides its source; a header passes to its next
+  announcer when its source leaves. A missing block is asked only of
+  peers that announced it, and a stall counts against a peer only for
+  blocks it announced.
+- **`notfound`.** A peer asked for blocks or transactions it lacks
+  answers `notfound`; the requester withdraws those requests without a
+  strike, stops counting that peer as an announcer (a header nobody
+  announces any more is dropped) and asks the next announcer at once.
+- **Protection.** The peer that delivered the most connected blocks,
+  an outbound peer before any inbound one, is never scored for stalls:
+  its requests still move elsewhere, but a node cannot be talked into
+  banning the peer that actually serves it the chain. Invalid data still
+  bans it.
+
+D-017's trade-off with this attack, accepted: a local attacker still
+sheds its score and strikes by reconnecting from a new port. That now
+buys it only delays on blocks it alone announced (phantoms nobody else
+has, so nothing the honest chain needs) and, for real blocks other peers
+also announced, one stall window per reconnect before they are fetched
+elsewhere; the fifth review measured that trickling evasion at 19 s
+against 17 s for a 2,000-block sync.
+
 ## Open questions
 
 - None blocking. Post-v1 candidates if revisited: SegWit/Taproot sighash

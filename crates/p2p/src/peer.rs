@@ -96,6 +96,8 @@ pub struct PeerState {
     pub handshaken: bool,
     /// Banned-until timestamp (unix secs), 0 = not banned.
     pub banned_until: u64,
+    /// Blocks this peer delivered that connected (its good history).
+    pub blocks_delivered: u64,
 }
 
 /// The peer table + ban list.
@@ -225,6 +227,7 @@ impl PeerManager {
                 last_msg: now,
                 handshaken: false,
                 banned_until: 0,
+                blocks_delivered: 0,
             },
         );
         Ok(())
@@ -328,6 +331,27 @@ impl PeerManager {
         if ban_ip {
             self.ban_peer(*addr);
         }
+    }
+
+    /// A block from `addr` connected: count it and credit the score.
+    pub fn credit_block(&mut self, addr: &SocketAddr) {
+        if let Some(p) = self.peers.get_mut(addr) {
+            p.blocks_delivered = p.blocks_delivered.saturating_add(1);
+        }
+        self.score(addr, SCORE_GOOD_BLOCK);
+    }
+
+    /// The peer whose good history protects it from stall penalties: the
+    /// one that delivered the most connected blocks, an outbound peer (one
+    /// we chose) before any inbound one. Stalls still move its requests
+    /// elsewhere; they just never ban it, so a node cannot be talked into
+    /// banning the last peer that actually serves it the chain.
+    pub fn protected_peer(&self) -> Option<SocketAddr> {
+        self.peers
+            .values()
+            .filter(|p| p.handshaken && p.blocks_delivered > 0)
+            .max_by_key(|p| (p.outbound, p.blocks_delivered))
+            .map(|p| p.addr)
     }
 
     /// Current score of a peer.
