@@ -10,7 +10,7 @@ use minibtc_crypto::Hash256;
 use minibtc_p2p::codec::{self, Message};
 use minibtc_p2p::peer::{SCORE_BAD_BLOCK, SCORE_BAD_MESSAGE, SCORE_GOOD_BLOCK, SCORE_TIMEOUT};
 use minibtc_primitives::Block;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -23,8 +23,12 @@ use tokio::time::timeout;
 const PEER_QUEUE: usize = 256;
 /// getdata batch per request.
 const GETDATA_BATCH: usize = 64;
-/// getdata serve cap per message (peer-request bound).
+/// getdata serve cap per message (peer-request bound). The requester asks
+/// in chunks of at most this, and the server answers anything beyond it
+/// with a `reject` instead of dropping it silently.
 const SERVE_BATCH: usize = 128;
+/// Most missing blocks one refill pass re-requests.
+const REFILL_LIMIT: usize = 4_096;
 /// Stall timeout: no message for this long → disconnect.
 const STALL_TIMEOUT: Duration = Duration::from_secs(120);
 /// Maintenance sweep interval.
@@ -160,7 +164,13 @@ async fn sweep(node: &Node) {
         let mut inner = node.inner.lock().unwrap_or_else(|e| e.into_inner());
         let now = std::time::Instant::now();
         inner.pending.expire(now);
-        inner.requests.expire(now);
+        // Expired requests are asked again, from another peer if possible.
+        let expired: HashMap<Hash256, SocketAddr> =
+            inner.requests.expire(now).into_iter().collect();
+        let asks = refill_requests(&mut inner, None, &expired);
+        drop(inner);
+        send_refill(node, None, asks);
+        let inner = node.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner
             .peers
             .snapshot()
@@ -574,10 +584,14 @@ async fn handle_message(
                         .entry(addr)
                         .and_modify(|c| *c = (*c).max(claimed_h))
                         .or_insert(claimed_h);
-                    // Drain the whole wanted queue — chunked getdata.
+                    // Drain the whole wanted queue — chunked getdata — then
+                    // ask for indexed headers whose blocks went missing
+                    // (for example served past a peer's per-getdata limit).
                     let want = drain_wanted(&mut inner, addr);
+                    let asks = refill_requests(&mut inner, Some(addr), &HashMap::new());
                     drop(inner);
                     send_getdata(reply, want);
+                    send_refill(node, Some((addr, reply)), asks);
                 }
                 Err(e) => {
                     tracing::debug!(%addr, "bad headers: {e}");
@@ -666,6 +680,10 @@ async fn handle_inv(
 }
 
 /// Serve a `getdata`: txs from mempool/index, blocks from the block index.
+/// At most `SERVE_BATCH` items per message; the rest is answered with a
+/// `reject` so the requester knows (it also re-requests missing blocks on
+/// its own). Replies wait for room in the peer's queue (bounded, with a
+/// deadline) instead of being dropped when it is momentarily full.
 async fn handle_getdata(
     node: &Node,
     _addr: SocketAddr,
@@ -692,9 +710,87 @@ async fn handle_getdata(
             }
         }
     }
+    if items.len() > SERVE_BATCH {
+        out.push(Message::Reject {
+            message: "getdata".to_string(),
+            code: 0x41, // Bitcoin's REJECT_NONSTANDARD: valid, but over our limit
+            reason: format!(
+                "served the first {SERVE_BATCH} of {} items; ask again for the rest",
+                items.len()
+            ),
+        });
+    }
     for m in out {
-        if reply.try_send(m).is_err() {
+        match timeout(codec::IO_TIMEOUT, reply.send(m)).await {
+            Ok(Ok(())) => {}
+            _ => break, // peer gone or not reading: the session ends
+        }
+    }
+}
+
+/// Request blocks for indexed headers that are neither held, queued nor in
+/// flight. Each goes to `prefer` (the peer just heard from), else the peer
+/// that sent the header, else any other sync peer — but not to the peer in
+/// `avoid` that let an earlier request for it expire, unless no one else
+/// is connected. Returns the hashes to ask each peer for.
+fn refill_requests(
+    inner: &mut NodeInner,
+    prefer: Option<SocketAddr>,
+    avoid: &HashMap<Hash256, SocketAddr>,
+) -> HashMap<SocketAddr, Vec<Hash256>> {
+    let now = std::time::Instant::now();
+    let peers = inner.sync.peer_addrs();
+    let mut asks: HashMap<SocketAddr, Vec<Hash256>> = HashMap::new();
+    for (hash, source) in inner.sync.missing_blocks(REFILL_LIMIT) {
+        if inner.pending.contains(&hash) || inner.requests.is_requested(&hash) {
+            continue;
+        }
+        let failed = avoid.get(&hash);
+        let candidates = prefer
+            .into_iter()
+            .chain(std::iter::once(source))
+            .chain(peers.iter().copied())
+            .filter(|p| peers.contains(p));
+        let mut fallback = None;
+        let mut pick = None;
+        for p in candidates {
+            if Some(&p) == failed {
+                fallback.get_or_insert(p);
+                continue;
+            }
+            pick = Some(p);
             break;
+        }
+        let Some(peer) = pick.or(fallback) else {
+            continue;
+        };
+        if inner.requests.note(hash, peer, now) {
+            asks.entry(peer).or_default().push(hash);
+        }
+    }
+    asks
+}
+
+/// Send refill requests: through `reply` for `current`, through the peer
+/// queues for everyone else.
+fn send_refill(
+    node: &Node,
+    current: Option<(SocketAddr, &mpsc::Sender<Message>)>,
+    asks: HashMap<SocketAddr, Vec<Hash256>>,
+) {
+    if asks.is_empty() {
+        return;
+    }
+    let senders: HashMap<SocketAddr, mpsc::Sender<Message>> =
+        node.peer_tx.lock().map(|m| m.clone()).unwrap_or_default();
+    for (peer, hashes) in asks {
+        match current {
+            Some((addr, reply)) if addr == peer => send_getdata(reply, hashes),
+            _ => {
+                if let Some(tx) = senders.get(&peer) {
+                    send_getdata(tx, hashes);
+                }
+            }
         }
     }
 }
@@ -781,14 +877,22 @@ async fn drain_pending(node: &Node, origin: SocketAddr, reply: &mpsc::Sender<Mes
     }
     // Pending drained — pull the next wanted batch, and if the peer
     // claims more height than we have, ask for the next headers batch.
-    let (want, need_headers) = {
+    let (want, asks, need_headers) = {
         let mut inner = node.inner.lock().unwrap_or_else(|e| e.into_inner());
         let want = drain_wanted(&mut inner, origin);
+        // Nothing left in flight to this peer: re-request indexed headers
+        // whose blocks never arrived.
+        let asks = if inner.requests.in_flight(&origin) == 0 {
+            refill_requests(&mut inner, Some(origin), &HashMap::new())
+        } else {
+            HashMap::new()
+        };
         let our_h = inner.chain.height();
         let claimed = inner.claimed.get(&origin).copied().unwrap_or(0);
-        (want, claimed > our_h)
+        (want, asks, claimed > our_h)
     };
     send_getdata(reply, want);
+    send_refill(node, Some((origin, reply)), asks);
     if need_headers {
         let locator = {
             let mut inner = node.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -823,9 +927,10 @@ fn drain_wanted(inner: &mut NodeInner, peer: SocketAddr) -> Vec<Hash256> {
     out
 }
 
-/// Send wanted hashes as GetData messages (500 per message — bounded).
+/// Send wanted hashes as GetData messages of at most `SERVE_BATCH` items —
+/// the most a peer serves per message.
 fn send_getdata(reply: &mpsc::Sender<Message>, want: Vec<Hash256>) {
-    for chunk in want.chunks(500) {
+    for chunk in want.chunks(SERVE_BATCH) {
         let items: Vec<minibtc_p2p::codec::InvItem> = chunk
             .iter()
             .map(|h| minibtc_p2p::codec::InvItem {
@@ -932,7 +1037,19 @@ mod tests {
 
     impl TestNet {
         fn new(n: usize) -> Self {
-            let params = ChainParams::devnet();
+            Self::with_params(n, ChainParams::devnet())
+        }
+
+        /// Devnet with a retarget window too long to reach: burst-mined
+        /// blocks keep the easiest bits, so thousands can be mined quickly.
+        fn no_retarget(n: usize) -> Self {
+            let mut p = ChainParams::devnet();
+            p.name = "minibtc-no-retarget-test".to_string();
+            p.pow_target_timespan_blocks = 1_000_000;
+            Self::with_params(n, p)
+        }
+
+        fn with_params(n: usize, params: ChainParams) -> Self {
             Self {
                 nodes: (0..n).map(|_| in_memory(params.clone())).collect(),
                 addrs: (0..n)
@@ -971,6 +1088,25 @@ mod tests {
             }
         }
 
+        /// Node `a` asks `b` for headers, as a session does after the
+        /// handshake when `b` claims a higher start height.
+        fn ask_headers(&self, a: usize, b: usize) {
+            let locator = {
+                let mut inner = self.nodes[a]
+                    .inner
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                inner.sync.note_getheaders_sent(&self.addrs[b]);
+                sync_locator(&inner)
+            };
+            self.senders[&(a, b)]
+                .try_send(Message::GetHeaders {
+                    locator,
+                    stop: Hash256::ZERO,
+                })
+                .unwrap_or_else(|e| panic!("queue getheaders: {e}"));
+        }
+
         fn hold(&mut self, a: usize, b: usize) {
             self.held.insert((a, b));
             self.held.insert((b, a));
@@ -979,6 +1115,49 @@ mod tests {
         fn release(&mut self, a: usize, b: usize) {
             self.held.remove(&(a, b));
             self.held.remove(&(b, a));
+        }
+
+        /// Deliver messages until quiet, dropping those `drop_msg` selects
+        /// (a lossy link).
+        async fn pump_dropping<F>(&mut self, mut drop_msg: F)
+        where
+            F: FnMut(usize, usize, &Message) -> bool,
+        {
+            for _ in 0..10_000 {
+                let mut delivered = false;
+                for i in 0..self.links.len() {
+                    let (from, to) = self.links[i].0;
+                    if self.held.contains(&(from, to)) {
+                        continue;
+                    }
+                    while let Ok(msg) = self.links[i].1.try_recv() {
+                        delivered = true;
+                        if drop_msg(from, to, &msg) {
+                            continue;
+                        }
+                        let reply = self.senders[&(to, from)].clone();
+                        let node = self.nodes[to].clone();
+                        handle_message(&node, self.addrs[from], msg, &reply).await;
+                    }
+                }
+                if !delivered {
+                    return;
+                }
+            }
+            panic!("network never went quiet");
+        }
+
+        /// Run node `i`'s periodic sweep as if `REQUEST_TTL` had passed:
+        /// expired block requests are asked again.
+        fn sweep_after_ttl(&self, i: usize) {
+            let node = &self.nodes[i];
+            let mut inner = node.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let later = std::time::Instant::now() + crate::core::REQUEST_TTL * 2;
+            let expired: HashMap<Hash256, SocketAddr> =
+                inner.requests.expire(later).into_iter().collect();
+            let asks = refill_requests(&mut inner, None, &expired);
+            drop(inner);
+            send_refill(node, None, asks);
         }
 
         /// Deliver messages until no link carries any (bounded rounds).
@@ -1159,6 +1338,82 @@ mod tests {
         );
         assert!(sent <= 20, "banned within a few messages, took {sent}");
         assert!(inner.sync.known_header_count() <= 1, "nothing accumulates");
+    }
+
+    #[tokio::test]
+    async fn a_node_1000_blocks_behind_catches_up() {
+        // The serving side answers at most SERVE_BATCH blocks per getdata.
+        // A node far behind must still get every block: more than 128 used
+        // to leave it stuck at height 128 for good.
+        let mut net = TestNet::no_retarget(2);
+        net.mine(0, 1_000);
+        assert_eq!(net.tip(0).1, 1_000);
+        net.connect(0, 1);
+        net.ask_headers(1, 0);
+        net.pump().await;
+        assert_eq!(
+            net.tip(1),
+            net.tip(0),
+            "the node must catch up all 1,000 blocks"
+        );
+    }
+
+    #[tokio::test]
+    async fn blocks_lost_in_transit_are_requested_again() {
+        // 300 blocks behind; the link drops the first 40 blocks it carries.
+        // The headers stay indexed, so only a re-request after the request
+        // expires can recover them.
+        let mut net = TestNet::no_retarget(2);
+        net.mine(0, 300);
+        net.connect(0, 1);
+        net.ask_headers(1, 0);
+        let mut dropped = 0;
+        net.pump_dropping(|from, _to, msg| {
+            if from == 0 && matches!(msg, Message::Block(_)) && dropped < 40 {
+                dropped += 1;
+                return true;
+            }
+            false
+        })
+        .await;
+        assert!(net.tip(1).1 < 300, "the lossy link must have stalled sync");
+        net.sweep_after_ttl(1);
+        net.pump().await;
+        assert_eq!(
+            net.tip(1),
+            net.tip(0),
+            "lost blocks must be requested again"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_oversized_getdata_is_served_up_to_the_limit_and_rejected_past_it() {
+        let net = TestNet::no_retarget(1);
+        net.mine(0, 200);
+        let node = net.nodes[0].clone();
+        let items: Vec<minibtc_p2p::codec::InvItem> = {
+            let inner = node.inner.lock().unwrap_or_else(|e| e.into_inner());
+            (1..=200u32)
+                .map(|h| minibtc_p2p::codec::InvItem {
+                    kind: minibtc_p2p::codec::InvType::Block,
+                    hash: crate::core::block_at_height(&inner, h).unwrap(),
+                })
+                .collect()
+        };
+        let (reply, mut rx) = mpsc::channel::<Message>(1_024);
+        let asker = SocketAddr::from(([10, 1, 2, 3], 1));
+        handle_getdata(&node, asker, &items, &reply).await;
+        let mut blocks = 0;
+        let mut rejects = 0;
+        while let Ok(m) = rx.try_recv() {
+            match m {
+                Message::Block(_) => blocks += 1,
+                Message::Reject { .. } => rejects += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(blocks, SERVE_BATCH);
+        assert_eq!(rejects, 1, "the unserved rest is not dropped silently");
     }
 
     #[tokio::test]

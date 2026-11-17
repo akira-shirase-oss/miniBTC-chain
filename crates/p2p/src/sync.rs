@@ -399,6 +399,26 @@ impl Sync {
         self.headers.len()
     }
 
+    /// Up to `limit` indexed headers whose blocks we do not hold, lowest
+    /// height first, with the peer that sent each. The node re-requests the
+    /// ones that are neither queued nor in flight — a header being indexed
+    /// must never stop its block from being fetched.
+    pub fn missing_blocks(&self, limit: usize) -> Vec<(Hash256, SocketAddr)> {
+        let mut v: Vec<(u32, Hash256, SocketAddr)> = self
+            .headers
+            .iter()
+            .filter(|(h, _)| !self.have.contains(*h))
+            .map(|(h, (info, from))| (info.height, *h, *from))
+            .collect();
+        v.sort_unstable_by_key(|(height, h, _)| (*height, *h));
+        v.into_iter().take(limit).map(|(_, h, p)| (h, p)).collect()
+    }
+
+    /// Peers registered for sync.
+    pub fn peer_addrs(&self) -> Vec<SocketAddr> {
+        self.peers.keys().copied().collect()
+    }
+
     /// Validate a header's timestamp is sane vs params (MTP needs chain
     /// context — node does full validation; here we check the cheap
     /// future-time bound only).

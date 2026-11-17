@@ -11,6 +11,11 @@
 #            relay-only node — must follow the reorg through N1.
 #   Phase 5  Two wallets: A sends 10 BTC to B through the live network;
 #            one block confirms; B's balance reflects it.
+#   Phase 6  Deep catch-up: a separate 2-node network on params with a
+#            retarget window too long to reach (burst mining stays at the
+#            easiest bits). N5 mines 600 blocks; a fresh N6 connects and
+#            must sync all of them — far more than one getdata answer
+#            (128 blocks) carries.
 #
 # Evidence: every phase prints PASS/FAIL; full transcript is teed to
 # perf/results/devnet-demo-<timestamp>.log.
@@ -30,7 +35,9 @@ exec > >(tee "$LOG") 2>&1
 P1=38445; R1=38446
 P2=38447; R2=38448
 P3=38449; R3=38450
-D1="$ROOT/n1"; D2="$ROOT/n2"; D3="$ROOT/n3"
+P5=38451; R5=38452
+P6=38453; R6=38454
+D1="$ROOT/n1"; D2="$ROOT/n2"; D3="$ROOT/n3"; D5="$ROOT/n5"; D6="$ROOT/n6"
 PASS=0; FAIL=0
 
 log()  { printf '\n=== %s ===\n' "$*"; }
@@ -104,7 +111,7 @@ stop_node() { # datadir
 }
 
 cleanup() {
-  stop_node "$D1"; stop_node "$D2"; stop_node "$D3"
+  stop_node "$D1"; stop_node "$D2"; stop_node "$D3"; stop_node "$D5"; stop_node "$D6"
   echo "datadir: $ROOT  log: $LOG"
 }
 trap cleanup EXIT
@@ -223,6 +230,64 @@ BAL_B=$(cli "$D1" $R1 wallet balance --name bob --passphrase "$WALLET_PASS" \
   | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("balance_sats") or d.get("total_sats") or 0)' 2>/dev/null || echo 0)
 echo "  bob balance after: $BAL_B sats (expected ≥ 1_000_000_000)"
 [ "${BAL_B:-0}" -ge 1000000000 ] && ok "wallet B received 10 BTC" || bad "wallet B balance $BAL_B"
+
+log "Phase 6: deep catch-up — a fresh node 600 blocks behind"
+stop_node "$D1"; stop_node "$D2"; stop_node "$D3"
+DEEP_PARAMS="$ROOT/deep-params.json"
+python3 - "$DEEP_PARAMS" <<'PY'
+import json, sys
+p = {
+    "name": "minibtc-demo-deep", "devnet": True,
+    "pow_limit_bits": 0x207fffff, "pow_target_spacing": 30,
+    "pow_target_timespan_blocks": 1000000, "pow_clamp_factor": 4,
+    "subsidy_start": 5000000000, "subsidy_halving_interval": 150,
+    "max_money": 2100000000000000, "coinbase_maturity": 100,
+    "max_future_time_secs": 7200, "median_time_span": 11,
+    "max_block_size": 1000000, "max_block_txs": 10000,
+    "max_block_sigops": 80000, "max_tx_io": 100000,
+    "address_version": 0x6f, "p2p_magic": [77, 66, 84, 67],
+    "p2p_port": 18445, "rpc_port": 18446, "grind_genesis_nonce": True,
+}
+json.dump(p, open(sys.argv[1], "w"))
+PY
+start_deep() { # datadir p2p rpc [connect]
+  local d=$1 p=$2 r=$3 c=${4:-}
+  mkdir -p "$d"
+  if [ -n "$c" ]; then
+    "$NODE" --datadir "$d" --listen "127.0.0.1:$p" --rpc "127.0.0.1:$r" \
+      --params "$DEEP_PARAMS" --connect "$c" --log warn >"$d/node.log" 2>&1 &
+  else
+    "$NODE" --datadir "$d" --listen "127.0.0.1:$p" --rpc "127.0.0.1:$r" \
+      --params "$DEEP_PARAMS" --log warn >"$d/node.log" 2>&1 &
+  fi
+  echo $! > "$d/pid"
+  local deadline=$(( $(date +%s) + 30 ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    cli "$d" "$r" --params "$DEEP_PARAMS" chain info >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  bad "deep node RPC never came up"; return 1
+}
+start_deep "$D5" $P5 $R5
+cli "$D5" $R5 --params "$DEEP_PARAMS" mine generate 600 --address "$ADDR_A" >/dev/null
+DEEP_TIP=$(cli "$D5" $R5 --params "$DEEP_PARAMS" chain info \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["blocks"], d["bestblockhash"])')
+DH=${DEEP_TIP%% *}; DHASH=${DEEP_TIP##* }
+check "N5 mined 600 blocks" "$DH" "600"
+T4=$(date +%s)
+start_deep "$D6" $P6 $R6 "127.0.0.1:$P5"
+deadline=$(( $(date +%s) + 300 )); got=""
+while [ "$(date +%s)" -lt "$deadline" ]; do
+  got=$(cli "$D6" $R6 --params "$DEEP_PARAMS" chain info 2>/dev/null \
+    | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["blocks"], d["bestblockhash"])' 2>/dev/null || true)
+  [ "$got" = "$DH $DHASH" ] && break
+  sleep 2
+done
+if [ "$got" = "$DH $DHASH" ]; then
+  ok "N6 caught up all 600 blocks ($(( $(date +%s) - T4 ))s)"
+else
+  bad "N6 deep catch-up stalled — last tip: ${got:-none} (wanted $DH)"
+fi
 
 log "Summary"
 echo "  phases passed: $PASS   failed: $FAIL"

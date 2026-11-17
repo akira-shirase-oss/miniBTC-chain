@@ -97,6 +97,12 @@ Hard rules:
   the peer disconnects. A message may carry at most 2,000 headers and no
   repeats; an unsolicited message that adds nothing is penalised, so a
   replayed cheap header leads to a ban.
+- **Block download** asks in `getdata` messages of at most 128 items (the
+  most a peer serves per message; a larger request gets 128 blocks and a
+  `reject`). An indexed header whose block is neither held, queued nor in
+  flight is requested again — after each headers answer, when a peer's
+  requests drain, and from the periodic sweep, where an expired request
+  (60 s) goes to another peer when there is one.
 - **Mempool** is local policy: removed on connect; after a reorg the
   disconnected blocks' transactions are re-validated against the new chain
   and re-admitted (oldest block first; conflicts and already-confirmed ones
