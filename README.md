@@ -18,7 +18,7 @@
 ## Security verification (P14, 2026-11-16)
 
 A defensive pass over every surface, each fix with a test shown failing
-first (`docs/DECISIONS.md` D-018–D-020):
+first (`docs/DECISIONS.md` D-018–D-021):
 
 - **P2P.** A ban now closes the banned peer's live connection (it used to
   keep reading everything the peer sent), and a peer that withholds
@@ -39,6 +39,9 @@ first (`docs/DECISIONS.md` D-018–D-020):
   and Origin.
 - **MCP.** `--read-only` serves only read and explain tools; peer user
   agents reach the model labelled as untrusted.
+- **Mempool.** A scriptSig that is not push-only (anyone could add an
+  `OP_NOP` to a signed payment and change its txid) is refused as
+  non-standard; consensus is unchanged (D-021).
 - **CI.** `.github/workflows/ci.yml` runs `scripts/check.sh` (fmt, clippy
   `-D warnings`, tests, architecture, wallet secrets, workflow rules,
   cargo-deny required) on every push and pull request, plus a daily
@@ -46,7 +49,7 @@ first (`docs/DECISIONS.md` D-018–D-020):
   by SHA and updated weekly by Dependabot.
 
 The devnet demo passes 22/22 on the final build
-(`perf/results/devnet-demo-20261116-215552.log`).
+(`perf/results/devnet-demo-20261116-220512.log`).
 
 A from-scratch Bitcoin-style blockchain in Rust: a full node that validates
 every transaction and block, a P2P network, a miner, an HD wallet, a CLI, a
