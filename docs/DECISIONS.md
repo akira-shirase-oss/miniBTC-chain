@@ -384,6 +384,21 @@ connections closed on accept, by design.
   checkout credentials. CI uses cargo-deny 0.20.2 (the newest release at
   least two weeks old); the maintainer's machine ran 0.21.0.
 
+### D-021 — Push-only scriptSigs: mempool policy, not consensus (2026-11-16)
+
+A scriptSig is not covered by its own signature, so anyone relaying a
+payment can append a no-op (`OP_NOP`) to it: the spend still verifies
+and the txid changes (third-party malleability; a wallet tracking the
+original txid then sees it "disappear"). The mempool now refuses any
+transaction with a scriptSig that is not push-only
+(`minibtc_script::is_push_only`, Bitcoin Core's `IsPushOnly`) as
+non-standard: no admission, no relay, no peer penalty. Consensus is
+unchanged: such a transaction is still valid in a block, as in Bitcoin
+for non-P2SH spends, so no datadir needs a reindex and `RULES_VERSION`
+stays as it is. A miner that bypasses its own mempool could still
+include one; making the rule consensus would be a soft fork with a
+rules-version bump, left for a later decision.
+
 ## Open questions
 
 - None blocking. Post-v1 candidates if revisited: SegWit/Taproot sighash

@@ -1382,6 +1382,7 @@ dependencies = [
  "minibtc-consensus",
  "minibtc-crypto",
  "minibtc-primitives",
+ "minibtc-script",
  "serde",
  "thiserror",
 ]

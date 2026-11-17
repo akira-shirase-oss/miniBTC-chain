@@ -367,6 +367,40 @@ impl<'a> Vm<'a> {
     }
 }
 
+/// Whether `script` contains only data pushes (`OP_0`, direct pushes,
+/// `OP_PUSHDATA1/2/4`, `OP_1NEGATE`, `OP_1..=OP_16`), every push complete.
+/// Bitcoin Core's `IsPushOnly`: any opcode above `OP_16` makes a script
+/// not push-only, and so does a truncated push.
+///
+/// A scriptSig is not covered by its own signature, so anyone relaying a
+/// transaction could add a no-op such as `OP_NOP` to it: the spend stays
+/// valid, its txid changes (third-party malleability). Mempool policy
+/// requires push-only scriptSigs; consensus does not (see D-021).
+pub fn is_push_only(script: &[u8]) -> bool {
+    let mut pc = 0usize;
+    while pc < script.len() {
+        let op = script[pc];
+        pc += 1;
+        let len = match op {
+            0x01..=0x4b => usize::from(op),
+            OP_PUSHDATA1 | OP_PUSHDATA2 | OP_PUSHDATA4 => match read_push_len(script, pc, op) {
+                Ok((n, header)) => {
+                    pc += header;
+                    n
+                }
+                Err(_) => return false,
+            },
+            _ if op > OP_16 => return false,
+            _ => 0,
+        };
+        match pc.checked_add(len) {
+            Some(end) if end <= script.len() => pc = end,
+            _ => return false,
+        }
+    }
+    true
+}
+
 /// Decode a PUSHDATA length at `pc`; returns (length, header_bytes).
 fn read_push_len(script: &[u8], pc: usize, op: u8) -> Result<(usize, usize), ScriptError> {
     match op {

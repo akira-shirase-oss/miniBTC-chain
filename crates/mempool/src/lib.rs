@@ -98,6 +98,9 @@ pub enum MempoolError {
     /// Tx spends an outpoint we don't know and can't orphan-track.
     #[error("missing inputs (orphan candidate)")]
     OrphanCandidate,
+    /// Valid by consensus but not relayed (standardness policy).
+    #[error("non-standard: {0}")]
+    NonStandard(&'static str),
 }
 
 /// A mempool entry: the tx plus its computed fee.
@@ -228,6 +231,15 @@ impl Mempool {
                 rate: fee.sats(),
                 min: self.policy.min_relay_fee_rate,
             });
+        }
+        // A scriptSig that is not push-only can be malleated by anyone who
+        // relays it (D-021); such a transaction is valid but not admitted.
+        if tx
+            .inputs
+            .iter()
+            .any(|i| !minibtc_script::is_push_only(&i.script_sig))
+        {
+            return Err(MempoolError::NonStandard("scriptSig is not push-only"));
         }
         for out in &tx.outputs {
             if out.value.sats() < self.policy.dust_limit {
@@ -546,6 +558,22 @@ mod tests {
             txid: Hash256([seed; 32]),
             vout: 0,
         }
+    }
+
+    #[test]
+    fn a_script_sig_that_is_not_push_only_is_refused() {
+        let mut mp = Mempool::new(MempoolPolicy::default());
+        let view = view_with(&[(op(1), 10_000)]);
+        let p = ChainParams::devnet();
+        let mut tx = tx_spending(op(1), 9_000);
+        tx.inputs[0].script_sig = vec![0x01, 0xaa, 0x61]; // <push> OP_NOP
+        assert!(matches!(
+            mp.admit(tx.clone(), Sats(1_000), &view, &p, None),
+            Err(MempoolError::NonStandard(_))
+        ));
+        assert!(mp.is_empty());
+        tx.inputs[0].script_sig = vec![0x01, 0xaa];
+        assert!(mp.admit(tx, Sats(1_000), &view, &p, None).is_ok());
     }
 
     #[test]

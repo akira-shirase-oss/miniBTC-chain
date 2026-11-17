@@ -1441,6 +1441,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_malleated_script_sig_is_refused_and_the_signed_original_admitted() {
+        // Third-party malleability: anyone relaying a payment can append
+        // OP_NOP to its scriptSig; the signature still verifies and the
+        // txid changes. The mempool refuses it; the original still goes in.
+        let net = TestNet::new(1);
+        net.mine(0, 101);
+        let honest = spend_coinbase(&net, 0, 1);
+        let mut malleated = honest.clone();
+        malleated.inputs[0].script_sig.push(minibtc_script::OP_NOP);
+        assert_ne!(malleated.txid(), honest.txid());
+        match net.nodes[0].accept_tx(malleated, None, None) {
+            Err(crate::core::AcceptError::Policy(e)) => {
+                assert!(e.contains("push-only"), "{e}");
+            }
+            Err(crate::core::AcceptError::Invalid(e)) => {
+                panic!("valid by consensus, refused only by policy: {e}")
+            }
+            Ok(_) => panic!("a malleated scriptSig must not enter the mempool"),
+        }
+        let txid = net.nodes[0]
+            .accept_tx(honest.clone(), None, None)
+            .unwrap_or_else(|e| panic!("the signed original: {e:?}"));
+        assert_eq!(txid, honest.txid());
+    }
+
+    #[tokio::test]
     async fn a_peer_replaying_one_header_is_banned_and_stores_nothing() {
         // The live 2026-11-16 flood: one header mined once (about two
         // hashes at the devnet limit) sent over and over.
