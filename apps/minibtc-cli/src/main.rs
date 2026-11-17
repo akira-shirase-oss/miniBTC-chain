@@ -389,11 +389,6 @@ fn save_wallet(
     std::fs::create_dir_all(path.parent().context("wallet path has no parent")?)?;
     let ks = Keystore::encrypt(seed, passphrase).context("encrypt keystore")?;
     ks.save(&path).context("save keystore")?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-    }
     let state = json!({ "next_receive": indices.0, "next_change": indices.1 });
     std::fs::write(
         wallet_path(datadir, name)?.with_extension("state.json"),
@@ -741,12 +736,8 @@ async fn approve_draft(
         "change_outputs": change,
         "approved_unix": now,
     });
-    std::fs::write(&path, serde_json::to_vec_pretty(&rec)?)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-    }
+    minibtc_wallet::owner_only::write_owner_only(&path, &serde_json::to_vec_pretty(&rec)?)
+        .with_context(|| format!("write {} owner-only", path.display()))?;
     eprintln!(
         "signed. The assistant may now call request_send for {draft_id}; spend caps still apply."
     );

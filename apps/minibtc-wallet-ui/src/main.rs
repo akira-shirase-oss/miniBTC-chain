@@ -207,11 +207,6 @@ fn persist_wallet(
     std::fs::create_dir_all(path.parent().context("wallet path has no parent")?)?;
     let ks = Keystore::encrypt(seed, passphrase).context("encrypt keystore")?;
     ks.save(&path).context("save keystore")?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-    }
     save_indices(datadir, name, indices)
 }
 
