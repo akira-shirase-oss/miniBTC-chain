@@ -70,6 +70,10 @@ struct Args {
     /// Listen address (localhost only unless you know why).
     #[arg(long, default_value = "127.0.0.1:18448")]
     listen: SocketAddr,
+    /// Allow a non-loopback `--listen` address (refused otherwise). This
+    /// UI holds unlocked keys: expose it only on a network you trust.
+    #[arg(long)]
+    allow_remote: bool,
     /// Session idle timeout, seconds.
     #[arg(long, default_value_t = 1800)]
     session_ttl_secs: u64,
@@ -1485,6 +1489,9 @@ async fn main() -> Result<()> {
         .with_target(false)
         .init();
     let args = Args::parse();
+    // Refuse to expose a key-holding UI by accident, before anything else.
+    minibtc_rpc::http::check_bind(args.listen, args.allow_remote, "--allow-remote")
+        .map_err(anyhow::Error::msg)?;
     let params = match &args.params {
         Some(p) => {
             let text = tokio::fs::read_to_string(p)

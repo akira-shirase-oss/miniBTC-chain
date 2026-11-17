@@ -36,6 +36,11 @@ struct Args {
     #[arg(long, default_value = "127.0.0.1:18446")]
     rpc: SocketAddr,
 
+    /// Allow a non-loopback `--rpc` address (refused otherwise). The RPC
+    /// credential is full-privilege: expose it only on a network you trust.
+    #[arg(long)]
+    allow_remote_rpc: bool,
+
     /// Mine blocks continuously, paying `address`.
     #[arg(long, requires = "mining_address")]
     mine: bool,
@@ -69,6 +74,10 @@ async fn main() -> Result<()> {
         )
         .with_target(false)
         .init();
+
+    // Refuse to expose the RPC by accident, before touching the datadir.
+    minibtc_rpc::http::check_bind(args.rpc, args.allow_remote_rpc, "--allow-remote-rpc")
+        .map_err(anyhow::Error::msg)?;
 
     // Params: custom file or devnet preset.
     let params: ChainParams = match &args.params {
