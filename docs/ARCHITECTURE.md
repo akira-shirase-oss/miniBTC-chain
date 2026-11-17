@@ -107,12 +107,17 @@ Hard rules:
   `reject`). An indexed header whose block is neither held, queued nor in
   flight is requested again — after each headers answer, when a peer's
   requests drain, and from the periodic sweep, where an expired request
-  (60 s) goes to another peer when there is one. A peer that holds
+  (60 s) goes to another peer when there is one. Blocks are only ever
+  asked of peers that announced them (sent the header or an `inv`); a
+  peer that lacks a requested item answers `notfound` and the request
+  moves to the next announcer at once (D-022). A peer that holds
   requests and delivers none of them within its stall window (10 s,
   halved per consecutive stall, at least 2 s; checked every 2 s) has
   them withdrawn and asked of other peers, and is scored −25; until it
   delivers again it may hold 128 requests and is asked only when no
-  peer without strikes is connected (D-018).
+  peer without strikes is connected (D-018). Stalls are scored only for
+  blocks the peer announced, and never for the peer with the best
+  delivery history (D-022).
 - **Bans end sessions.** Each session registers a cancel token. A ban
   (by score or the operator's `banpeer`) or a disconnect removes the
   peer from the table and cancels its session, which closes the socket

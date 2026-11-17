@@ -265,9 +265,10 @@ impl BlockRequests {
             .collect()
     }
 
-    /// Withdraw every request outstanding to a stalling `peer` and count a
-    /// strike against it. Returns the hashes, for asking other peers.
-    pub fn take_stalled(&mut self, peer: &SocketAddr) -> Vec<Hash256> {
+    /// Withdraw every request outstanding to `peer` (a stall), returning
+    /// the hashes for asking other peers. Striking it is a separate call:
+    /// a peer is accountable only for blocks it announced.
+    pub fn withdraw_peer(&mut self, peer: &SocketAddr) -> Vec<Hash256> {
         let hashes: Vec<Hash256> = self
             .by_hash
             .iter()
@@ -279,8 +280,31 @@ impl BlockRequests {
         }
         self.per_peer.remove(peer);
         self.waiting_since.remove(peer);
-        *self.strikes.entry(*peer).or_insert(0) += 1;
         hashes
+    }
+
+    /// Count a stall against `peer`.
+    pub fn strike(&mut self, peer: &SocketAddr) {
+        *self.strikes.entry(*peer).or_insert(0) += 1;
+    }
+
+    /// `peer` answered `notfound` for `hash`: drop that request if it was
+    /// asked of `peer`. An answer is progress (its stall clock restarts)
+    /// but not a delivery (its strikes stay). Returns whether a request
+    /// was withdrawn.
+    pub fn withdraw(&mut self, hash: &Hash256, peer: SocketAddr, now: Instant) -> bool {
+        self.expire(now);
+        match self.by_hash.get(hash) {
+            Some((asked, _)) if *asked == peer => {
+                self.by_hash.remove(hash);
+                self.dec(peer);
+                if self.per_peer.contains_key(&peer) {
+                    self.waiting_since.insert(peer, now);
+                }
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Forget requests older than `REQUEST_TTL` — pops from the front of
@@ -1096,7 +1120,8 @@ mod tests {
         assert_eq!(r.stalled(late), vec![a]);
 
         // Withdrawn: 9 left, a strike, a shorter window and a smaller cap.
-        assert_eq!(r.take_stalled(&a).len(), 9);
+        assert_eq!(r.withdraw_peer(&a).len(), 9);
+        r.strike(&a);
         assert_eq!(r.in_flight(&a), 0);
         assert_eq!(r.strikes(&a), 1);
         assert_eq!(r.stall_window(&a), BLOCK_STALL_TIMEOUT / 2);
@@ -1104,9 +1129,10 @@ mod tests {
         assert_eq!(recorded, STALLED_PEER_REQUESTS);
         let soon = late + BLOCK_STALL_TIMEOUT / 2 + Duration::from_millis(1);
         assert_eq!(r.stalled(soon), vec![a]);
-        r.take_stalled(&a);
-        r.take_stalled(&a);
-        r.take_stalled(&a);
+        for _ in 0..3 {
+            r.withdraw_peer(&a);
+            r.strike(&a);
+        }
         assert_eq!(r.stall_window(&a), BLOCK_STALL_MIN);
 
         // Delivering again clears the strikes.

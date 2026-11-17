@@ -1576,11 +1576,14 @@ const SECURITY_HEADERS: [(header::HeaderName, &str); 5] = [
 /// rebinding: a hostile site's name pointed at 127.0.0.1) is refused
 /// before a handler runs. Bound to an unspecified address (opt-in remote
 /// use), any host on the right port is accepted.
+/// Host names are case-insensitive, so the comparison is too.
 fn host_ok(headers: &HeaderMap, listen: SocketAddr) -> bool {
     let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) else {
         return false;
     };
-    if host == listen.to_string() || host == format!("localhost:{}", listen.port()) {
+    if host.eq_ignore_ascii_case(&listen.to_string())
+        || host.eq_ignore_ascii_case(&format!("localhost:{}", listen.port()))
+    {
         return true;
     }
     listen.ip().is_unspecified()
@@ -1595,7 +1598,10 @@ async fn guard(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    let mut res = if host_ok(req.headers(), app.listen) {
+    let mut res = if !req.headers().contains_key(header::HOST) {
+        // HTTP/1.0 allows leaving Host out; this server requires it.
+        (axum::http::StatusCode::BAD_REQUEST, "missing Host header").into_response()
+    } else if host_ok(req.headers(), app.listen) {
         next.run(req).await
     } else {
         (
@@ -1984,12 +1990,15 @@ mod tests {
                 Some("no-store"),
                 "{case}"
             );
-            if case.ends_with("host") {
+            if case == "foreign host" {
                 assert_eq!(
                     res.status(),
                     axum::http::StatusCode::MISDIRECTED_REQUEST,
                     "{case}"
                 );
+            }
+            if case == "no host" {
+                assert_eq!(res.status(), axum::http::StatusCode::BAD_REQUEST, "{case}");
             }
         }
 
@@ -2016,6 +2025,74 @@ mod tests {
         let _ = std::fs::remove_dir_all(&app.datadir);
     }
 
+    /// The wallet UI served for real on a loopback port (the app's
+    /// `listen` is the bound address); returns the address.
+    async fn served_on_loopback() -> SocketAddr {
+        let (port, _) = counting_rpc().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|_| panic!());
+        let at = listener.local_addr().unwrap_or_else(|_| panic!());
+        let template = app_with_pending_send(port);
+        let app = Arc::new(App {
+            rpc: template.rpc.clone(),
+            params: ChainParams::devnet(),
+            datadir: template.datadir.clone(),
+            listen: at,
+            ttl: Duration::from_secs(600),
+            sessions: Mutex::new(HashMap::new()),
+            pending_creates: Mutex::new(HashMap::new()),
+            unlock_fails: Mutex::new(HashMap::new()),
+        });
+        tokio::spawn(minibtc_rpc::http::serve_bounded(
+            listener,
+            router(app),
+            minibtc_rpc::http::Limits::LOCAL,
+        ));
+        at
+    }
+
+    /// Send raw `request`; the status line of the answer, if any arrives.
+    async fn raw_status(at: SocketAddr, request: &str) -> Option<String> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut s = tokio::net::TcpStream::connect(at).await.ok()?;
+        s.write_all(request.as_bytes()).await.ok()?;
+        let mut buf = vec![0u8; 1_024];
+        let n = tokio::time::timeout(Duration::from_secs(3), s.read(&mut buf))
+            .await
+            .ok()?
+            .ok()?;
+        String::from_utf8_lossy(&buf[..n])
+            .lines()
+            .next()
+            .map(str::to_string)
+    }
+
+    #[tokio::test]
+    async fn host_is_matched_case_insensitively_and_a_missing_host_gets_400() {
+        let at = served_on_loopback().await;
+        let port = at.port();
+        let status = |s: Option<String>| s.unwrap_or_else(|| "no answer".into());
+        let no_host = status(raw_status(at, "GET / HTTP/1.0\r\n\r\n").await);
+        assert!(
+            no_host.contains(" 400 "),
+            "HTTP/1.0 without Host: {no_host}"
+        );
+        for host in [format!("LOCALHOST:{port}"), format!("LocalHost:{port}")] {
+            let got =
+                status(raw_status(at, &format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n")).await);
+            assert!(got.contains(" 200 "), "{host}: {got}");
+        }
+        let foreign = status(
+            raw_status(
+                at,
+                &format!("GET / HTTP/1.1\r\nHost: EVIL.example:{port}\r\n\r\n"),
+            )
+            .await,
+        );
+        assert!(foreign.contains(" 421 "), "{foreign}");
+    }
+
     #[test]
     fn host_check_accepts_only_this_server() {
         let listen: SocketAddr = "127.0.0.1:18448".parse().unwrap_or_else(|_| panic!());
@@ -2026,6 +2103,7 @@ mod tests {
         };
         assert!(host_ok(&with("127.0.0.1:18448"), listen));
         assert!(host_ok(&with("localhost:18448"), listen));
+        assert!(host_ok(&with("LOCALHOST:18448"), listen));
         for bad in [
             "127.0.0.1:18449",
             "localhost",

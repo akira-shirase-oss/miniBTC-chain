@@ -8,7 +8,7 @@ use crate::core::{ADDRBOOK_CAP, Node, NodeInner};
 use minibtc_consensus::ChainParams;
 use minibtc_crypto::Hash256;
 use minibtc_p2p::codec::{self, Message};
-use minibtc_p2p::peer::{SCORE_BAD_BLOCK, SCORE_BAD_MESSAGE, SCORE_GOOD_BLOCK, SCORE_TIMEOUT};
+use minibtc_p2p::peer::{SCORE_BAD_BLOCK, SCORE_BAD_MESSAGE, SCORE_TIMEOUT};
 use minibtc_primitives::Block;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -257,16 +257,32 @@ fn rotate_stalled_requests(node: &Node, now: std::time::Instant) {
         if stalled.is_empty() {
             return;
         }
+        let protected = inner.peers.protected_peer();
         let mut avoid: HashMap<Hash256, SocketAddr> = HashMap::new();
         for peer in stalled {
-            let hashes = inner.requests.take_stalled(&peer);
+            let hashes = inner.requests.withdraw_peer(&peer);
+            // A peer is only accountable for blocks it announced; it is
+            // never asked for others, but a request made before a header
+            // was handed over must not count against it either.
+            let announced = hashes
+                .iter()
+                .filter(|h| inner.sync.has_announced(h, &peer))
+                .count();
+            if announced > 0 {
+                inner.requests.strike(&peer);
+                if Some(peer) == protected {
+                    tracing::info!(%peer, blocks = hashes.len(), "protected peer stalled; asking others, no penalty");
+                } else {
+                    inner.peers.score(&peer, SCORE_WITHHELD_BLOCKS);
+                }
+            }
             tracing::info!(
                 %peer,
                 blocks = hashes.len(),
+                announced,
                 strikes = inner.requests.strikes(&peer),
                 "peer delivered none of its requested blocks; asking other peers"
             );
-            inner.peers.score(&peer, SCORE_WITHHELD_BLOCKS);
             avoid.extend(hashes.into_iter().map(|h| (h, peer)));
         }
         refill_requests(&mut inner, None, &avoid)
@@ -686,6 +702,11 @@ async fn handle_message(
             true
         }
 
+        Message::NotFound(items) => {
+            handle_notfound(node, addr, &items, reply);
+            true
+        }
+
         Message::Tx(tx) => {
             let txid = tx.txid();
             match node.accept_tx(tx, None, Some(addr)) {
@@ -817,6 +838,8 @@ async fn handle_inv(
                     if !inner.chain.blocks.contains_key(&item.hash)
                         && !inner.pending.contains(&item.hash) =>
                 {
+                    // The peer has this block: it may be asked for it.
+                    inner.sync.note_announced(item.hash, addr);
                     want.push(*item);
                 }
                 InvType::Block => {}
@@ -851,23 +874,27 @@ async fn handle_getdata(
 ) {
     use minibtc_p2p::codec::InvType;
     let mut out: Vec<Message> = Vec::new();
+    let mut missing: Vec<minibtc_p2p::codec::InvItem> = Vec::new();
     {
         let inner = node.inner.lock().unwrap_or_else(|e| e.into_inner());
         for item in items.iter().take(SERVE_BATCH) {
             match item.kind {
-                InvType::Tx => {
-                    if let Some(tx) = crate::core::find_tx(node, &inner, &item.hash) {
-                        out.push(Message::Tx(tx));
-                    }
-                }
-                InvType::Block => {
-                    if let Some(rec) = inner.chain.blocks.get(&item.hash) {
-                        out.push(Message::Block(rec.block.clone()));
-                    }
-                }
-                _ => {}
+                InvType::Tx => match crate::core::find_tx(node, &inner, &item.hash) {
+                    Some(tx) => out.push(Message::Tx(tx)),
+                    None => missing.push(*item),
+                },
+                InvType::Block => match inner.chain.blocks.get(&item.hash) {
+                    Some(rec) => out.push(Message::Block(rec.block.clone())),
+                    None => missing.push(*item),
+                },
+                _ => missing.push(*item),
             }
         }
+    }
+    // Say what we don't have, so the requester asks someone else at once
+    // instead of waiting out a stall window (and maybe blaming us).
+    if !missing.is_empty() {
+        out.push(Message::NotFound(missing));
     }
     if items.len() > SERVE_BATCH {
         out.push(Message::Reject {
@@ -887,12 +914,44 @@ async fn handle_getdata(
     }
 }
 
+/// A `notfound`: the peer does not have these blocks. Each request we made
+/// of it is withdrawn without a strike, it stops counting as an announcer
+/// of that block, and the block is asked of another announcer.
+fn handle_notfound(
+    node: &Node,
+    addr: SocketAddr,
+    items: &[minibtc_p2p::codec::InvItem],
+    reply: &mpsc::Sender<Message>,
+) {
+    use minibtc_p2p::codec::InvType;
+    let asks = {
+        let mut inner = node.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let now = std::time::Instant::now();
+        let mut avoid: HashMap<Hash256, SocketAddr> = HashMap::new();
+        for item in items.iter().take(INV_PROCESS_CAP) {
+            if item.kind == InvType::Block && inner.requests.withdraw(&item.hash, addr, now) {
+                inner.sync.forget_announcer(&item.hash, &addr);
+                avoid.insert(item.hash, addr);
+            }
+        }
+        if avoid.is_empty() {
+            return;
+        }
+        refill_requests(&mut inner, None, &avoid)
+    };
+    send_refill(node, Some((addr, reply)), asks);
+}
+
 /// Request blocks for indexed headers that are neither held, queued nor in
-/// flight. Each goes to `prefer` (the peer just heard from), else the peer
-/// that sent the header, else any other sync peer — but not to the peer in
-/// `avoid` that let an earlier request for it expire, nor to a peer whose
-/// requests stalled since its last delivery, unless no one else is
-/// connected. Returns the hashes to ask each peer for.
+/// flight, only ever from a peer that announced the block (sent its header
+/// or an `inv` for it). Each goes to `prefer` (the peer just heard from)
+/// when it announced the block, else to its other announcers in order —
+/// but not to the peer in `avoid` that let an earlier request for it
+/// expire, nor to a peer whose requests stalled since its last delivery,
+/// unless no other announcer is connected. Asking a peer that never
+/// announced a block, and then reading its silence as withholding, let an
+/// attacker's phantom headers get honest peers banned (review round 5).
+/// Returns the hashes to ask each peer for.
 fn refill_requests(
     inner: &mut NodeInner,
     prefer: Option<SocketAddr>,
@@ -901,16 +960,18 @@ fn refill_requests(
     let now = std::time::Instant::now();
     let peers = inner.sync.peer_addrs();
     let mut asks: HashMap<SocketAddr, Vec<Hash256>> = HashMap::new();
-    for (hash, source) in inner.sync.missing_blocks(REFILL_LIMIT) {
+    for (hash, _source) in inner.sync.missing_blocks(REFILL_LIMIT) {
         if inner.pending.contains(&hash) || inner.requests.is_requested(&hash) {
             continue;
         }
         let failed = avoid.get(&hash);
-        let candidates = prefer
+        let announcers = inner.sync.announcers(&hash);
+        let candidates: Vec<SocketAddr> = prefer
+            .filter(|p| announcers.contains(p))
             .into_iter()
-            .chain(std::iter::once(source))
-            .chain(peers.iter().copied())
-            .filter(|p| peers.contains(p));
+            .chain(announcers.iter().copied())
+            .filter(|p| peers.contains(p))
+            .collect();
         let mut fallback = None;
         let mut pick = None;
         for p in candidates {
@@ -1020,11 +1081,11 @@ async fn drain_pending(node: &Node, origin: SocketAddr, reply: &mpsc::Sender<Mes
             Ok(crate::core::ConnectOutcome::Connected) => {
                 node.relay_block(hash);
                 let mut inner = node.inner.lock().unwrap_or_else(|e| e.into_inner());
-                inner.peers.score(&origin, SCORE_GOOD_BLOCK);
+                inner.peers.credit_block(&origin);
             }
             Ok(crate::core::ConnectOutcome::SideBranch) => {
                 let mut inner = node.inner.lock().unwrap_or_else(|e| e.into_inner());
-                inner.peers.score(&origin, SCORE_GOOD_BLOCK);
+                inner.peers.credit_block(&origin);
             }
             Ok(crate::core::ConnectOutcome::AlreadyHave) => {}
             Err(e) => {
@@ -1318,6 +1379,50 @@ mod tests {
             let asks = refill_requests(&mut inner, None, &expired);
             drop(inner);
             send_refill(node, None, asks);
+        }
+
+        /// A peer that is only a queue: registered at node `i` under `addr`
+        /// as a finished inbound handshake; what node `i` sends it lands in
+        /// the returned receiver, and the sender is its `reply` handle.
+        fn attach_fake_peer(
+            &self,
+            i: usize,
+            addr: SocketAddr,
+        ) -> (mpsc::Sender<Message>, mpsc::Receiver<Message>) {
+            let (tx, rx) = mpsc::channel::<Message>(65_536);
+            self.nodes[i]
+                .peer_tx
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(addr, tx.clone());
+            let mut inner = self.nodes[i]
+                .inner
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let v = our_version_msg(&self.nodes[i].params, 0);
+            inner
+                .peers
+                .register(addr, false, &v)
+                .unwrap_or_else(|e| panic!("register: {e:?}"));
+            inner.peers.mark_handshaken(&addr);
+            inner.sync.add_peer(addr);
+            (tx, rx)
+        }
+
+        /// The fake peer's session ends (as `cleanup` does).
+        fn detach_fake_peer(&self, i: usize, addr: SocketAddr) {
+            self.nodes[i]
+                .peer_tx
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&addr);
+            let mut inner = self.nodes[i]
+                .inner
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            inner.peers.remove(&addr);
+            inner.sync.remove_peer(&addr);
+            inner.requests.forget_peer(&addr);
         }
 
         /// Run node `i`'s stall check as if `after` had passed.
@@ -1758,11 +1863,16 @@ mod tests {
         assert_eq!(net.tip(withholder), net.tip(honest));
 
         net.connect(victim, withholder);
-        net.connect(victim, honest);
         net.ask_headers(victim, withholder);
         let withheld = move |from: usize, to: usize, msg: &Message| {
             from == withholder && to == victim && matches!(msg, Message::Block(_))
         };
+        net.pump_dropping(withheld).await;
+        // The honest peer connects later and announces the same headers, as
+        // a session does after the handshake; the blocks stay requested
+        // from the withholder.
+        net.connect(victim, honest);
+        net.ask_headers(victim, honest);
         net.pump_dropping(withheld).await;
         assert_eq!(
             net.tip(victim).1,
@@ -1788,6 +1898,223 @@ mod tests {
         assert!(score(withholder) < 0, "the withholder is penalised");
         assert!(score(honest) > 0, "the honest peer is credited");
         assert!(inner.requests.strikes(&net.addrs[withholder]) > 0);
+    }
+
+    /// `n` headers on node `i`'s tip with valid proof of work and no blocks
+    /// anywhere behind them (cheap at the devnet pow limit).
+    fn phantom_headers(node: &Node, n: usize, salt: u8) -> Vec<minibtc_primitives::BlockHeader> {
+        let tip = {
+            let inner = node.inner.lock().unwrap_or_else(|e| e.into_inner());
+            inner.chain.blocks[&inner.chain.tip].block.header
+        };
+        let target = minibtc_consensus::target_for_bits(tip.bits).unwrap();
+        let mut prev = tip;
+        (0..n)
+            .map(|i| {
+                let mut root = [salt; 32];
+                root[0] = i as u8;
+                let mut h = minibtc_primitives::BlockHeader {
+                    version: 1,
+                    prev_hash: prev.block_hash(),
+                    merkle_root: Hash256(root),
+                    time: prev.time + 1,
+                    bits: prev.bits,
+                    nonce: 0,
+                };
+                while !h.check_pow(&target) {
+                    h.nonce += 1;
+                }
+                prev = h;
+                h
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn phantom_headers_cannot_get_an_honest_peer_penalised_or_banned() {
+        // Review round 5, G1: an attacker announced headers with no blocks
+        // behind them and withheld; the victim re-asked its honest peer,
+        // which had never announced them and stayed silent, and struck it
+        // for that until it was banned. The attacker reconnected from a new
+        // port to shed its own strikes.
+        let mut net = TestNet::no_retarget(2);
+        let (victim, honest) = (0, 1);
+        net.mine(honest, 5);
+        net.connect(victim, honest);
+        net.ask_headers(victim, honest);
+        net.pump().await;
+        assert_eq!(net.tip(victim), net.tip(honest));
+        let honest_addr = net.addrs[honest];
+        let score = |net: &TestNet| {
+            let inner = net.nodes[victim]
+                .inner
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            inner.peers.score_of(&honest_addr)
+        };
+        let start = score(&net).unwrap_or(i32::MIN);
+        let mut attacker: Option<(SocketAddr, mpsc::Sender<Message>, mpsc::Receiver<Message>)> =
+            None;
+        for round in 0..24u16 {
+            if round % 3 == 0 {
+                // Reconnect from a new port with a fresh batch of phantoms.
+                if let Some((a, _, _)) = attacker.take() {
+                    net.detach_fake_peer(victim, a);
+                }
+                let a = SocketAddr::from(([127, 0, 0, 1], 40_000 + round));
+                let (tx, rx) = net.attach_fake_peer(victim, a);
+                let headers = phantom_headers(&net.nodes[victim], 50, round as u8 + 1);
+                let msg = Message::Headers { count: 50, headers };
+                handle_message(&net.nodes[victim], a, msg, &tx).await;
+                attacker = Some((a, tx, rx));
+            }
+            net.mine(honest, 1);
+            net.pump().await;
+            net.stall_check_after(
+                victim,
+                crate::core::BLOCK_STALL_TIMEOUT + Duration::from_secs(1),
+            );
+            net.pump().await;
+            if let Some((_, _, rx)) = attacker.as_mut() {
+                while rx.try_recv().is_ok() {} // the attacker never answers
+            }
+            let now = score(&net);
+            assert!(
+                now.is_some_and(|s| s >= start),
+                "round {round}: the honest peer must stay connected and unpenalised (score {now:?}, started {start})"
+            );
+        }
+        assert_eq!(
+            net.tip(victim),
+            net.tip(honest),
+            "the victim keeps following the honest chain"
+        );
+    }
+
+    #[tokio::test]
+    async fn stalls_never_ban_the_peer_with_the_best_history() {
+        // The victim's only good peer stalls again and again (its blocks
+        // are lost in transit). It is bypassed each time but never
+        // penalised: a node must not ban the last peer that serves it.
+        let mut net = TestNet::no_retarget(2);
+        let (victim, honest) = (0, 1);
+        net.mine(honest, 5);
+        net.connect(victim, honest);
+        net.ask_headers(victim, honest);
+        net.pump().await;
+        let honest_addr = net.addrs[honest];
+        let score = |net: &TestNet| {
+            let inner = net.nodes[victim]
+                .inner
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            assert_eq!(inner.peers.protected_peer(), Some(honest_addr));
+            inner.peers.score_of(&honest_addr)
+        };
+        let start = score(&net).unwrap_or(i32::MIN);
+        net.mine(honest, 30);
+        let lost = move |from: usize, to: usize, msg: &Message| {
+            from == honest && to == victim && matches!(msg, Message::Block(_))
+        };
+        net.ask_headers(victim, honest);
+        net.pump_dropping(lost).await;
+        for round in 0..12 {
+            net.stall_check_after(victim, crate::core::BLOCK_STALL_TIMEOUT * 2);
+            net.pump_dropping(lost).await;
+            assert_eq!(score(&net), Some(start), "round {round}: no stall penalty");
+        }
+        let inner = net.nodes[victim]
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert!(
+            inner.requests.strikes(&honest_addr) > 0,
+            "but it was bypassed"
+        );
+    }
+
+    #[tokio::test]
+    async fn notfound_moves_a_request_to_another_announcer_without_a_strike() {
+        let mut net = TestNet::no_retarget(2);
+        let (victim, source) = (0, 1);
+        net.mine(source, 1);
+        let header = {
+            let inner = net.nodes[source]
+                .inner
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            inner.chain.blocks[&inner.chain.tip].block.header
+        };
+        let hash = header.block_hash();
+        let a = SocketAddr::from(([10, 9, 0, 1], 1));
+        let b = SocketAddr::from(([10, 9, 0, 2], 1));
+        let (ta, mut ra) = net.attach_fake_peer(victim, a);
+        let (tb, mut rb) = net.attach_fake_peer(victim, b);
+        let node = net.nodes[victim].clone();
+        let headers = |n: &Node, from: SocketAddr, reply: &mpsc::Sender<Message>| {
+            let n = n.clone();
+            let reply = reply.clone();
+            async move {
+                n.inner
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .sync
+                    .note_getheaders_sent(&from);
+                let msg = Message::Headers {
+                    count: 1,
+                    headers: vec![header],
+                };
+                handle_message(&n, from, msg, &reply).await;
+            }
+        };
+        headers(&node, a, &ta).await;
+        headers(&node, b, &tb).await;
+        let asked = |rx: &mut mpsc::Receiver<Message>| {
+            let mut got = false;
+            while let Ok(m) = rx.try_recv() {
+                if let Message::GetData(items) = m {
+                    got |= items.iter().any(|i| i.hash == hash);
+                }
+            }
+            got
+        };
+        assert!(asked(&mut ra), "the first announcer is asked");
+        assert!(!asked(&mut rb));
+        let item = minibtc_p2p::codec::InvItem {
+            kind: minibtc_p2p::codec::InvType::Block,
+            hash,
+        };
+        handle_message(&node, a, Message::NotFound(vec![item]), &ta).await;
+        assert!(asked(&mut rb), "the other announcer is asked next, at once");
+        {
+            let inner = node.inner.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(inner.requests.strikes(&a), 0, "an answer is not a stall");
+            assert_eq!(inner.peers.score_of(&a), Some(0));
+            assert!(!inner.sync.has_announced(&hash, &a));
+        }
+        net.pump().await;
+    }
+
+    #[tokio::test]
+    async fn getdata_for_blocks_we_lack_is_answered_with_notfound() {
+        let net = TestNet::no_retarget(1);
+        let node = net.nodes[0].clone();
+        let unknown = minibtc_p2p::codec::InvItem {
+            kind: minibtc_p2p::codec::InvType::Block,
+            hash: Hash256([0x5a; 32]),
+        };
+        let (reply, mut rx) = mpsc::channel::<Message>(16);
+        handle_getdata(
+            &node,
+            SocketAddr::from(([10, 1, 2, 3], 1)),
+            &[unknown],
+            &reply,
+        )
+        .await;
+        match rx.try_recv() {
+            Ok(Message::NotFound(items)) => assert_eq!(items, vec![unknown]),
+            other => panic!("expected notfound, got {other:?}"),
+        }
     }
 
     #[tokio::test]

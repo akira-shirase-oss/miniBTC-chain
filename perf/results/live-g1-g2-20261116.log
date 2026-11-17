@@ -1,0 +1,77 @@
+# Live loopback checks for review round 5 G1 (phantom headers) and G2 (non-reading HTTP clients); defensive, local only
+# Machine: Apple M2 Pro, 12 cores, 32 GB; macOS 27.2.1. Busy machine (load printed per run); development observations.
+# Ports: G1 N1 47311/47312, victim 47321/47322; G2 node 47351/47352, explorer 47353.
+# G1 probe: a scratch Rust client over minibtc-p2p's codec (source outside the repo, built in target/probe): each cycle connects from a new port, announces 50 headers with valid PoW on the victim's tip and no blocks behind them, never delivers, reconnects after 25 s. N1 mines a block every 15 s; the victim dialed N1 (outbound). No-retarget devnet params.
+# G2: 64 Python clients pipeline requests and never read; one fresh GET /healthz per second until served.
+
+## G1 on 3cb10b5 (the G1 commit)
+== G1 live check Mon 16 Nov 2026 23:09:11 EST commit  load: 26.64 29.24 37.29
+  synced: victim 60, N1 60; victim peers ['127.0.0.1:47311']
+  t=+30s victim 61 N1 62 victim peers ['127.0.0.1:47311', '127.0.0.1:64612']
+  t=+60s victim 64 N1 64 victim peers ['127.0.0.1:47311', '127.0.0.1:49519']
+  t=+90s victim 65 N1 65 victim peers ['127.0.0.1:47311', '127.0.0.1:51186']
+  t=+120s victim 67 N1 67 victim peers ['127.0.0.1:47311', '127.0.0.1:52041']
+  t=+150s victim 69 N1 70 victim peers ['127.0.0.1:47311', '127.0.0.1:52682']
+  t=+180s victim 72 N1 72 victim peers ['127.0.0.1:47311', '127.0.0.1:52811']
+  t=+210s victim 74 N1 74 victim peers ['127.0.0.1:47311', '127.0.0.1:53393']
+  t=+241s victim 76 N1 76 victim peers ['127.0.0.1:47311', '127.0.0.1:55690']
+  probe: t=  23s cycle 1 from 127.0.0.1:63482: 50 phantoms on tip height+1.., getdata items 200, closed by victim: true
+  probe: t=  47s cycle 2 from 127.0.0.1:64612: 50 phantoms on tip height+1.., getdata items 200, closed by victim: true
+  probe: t=  69s cycle 3 from 127.0.0.1:49519: 50 phantoms on tip height+1.., getdata items 200, closed by victim: true
+  probe: t=  94s cycle 4 from 127.0.0.1:51186: 50 phantoms on tip height+1.., getdata items 200, closed by victim: false
+  probe: t= 117s cycle 5 from 127.0.0.1:51523: 50 phantoms on tip height+1.., getdata items 200, closed by victim: true
+  probe: t= 142s cycle 6 from 127.0.0.1:52041: 50 phantoms on tip height+1.., getdata items 200, closed by victim: false
+  probe: t= 167s cycle 7 from 127.0.0.1:52682: 50 phantoms on tip height+1.., getdata items 200, closed by victim: true
+  probe: t= 191s cycle 8 from 127.0.0.1:52811: 50 phantoms on tip height+1.., getdata items 200, closed by victim: true
+  probe: t= 215s cycle 9 from 127.0.0.1:53393: 50 phantoms on tip height+1.., getdata items 200, closed by victim: true
+  probe: t= 239s cycle 10 from 127.0.0.1:54769: 50 phantoms on tip height+1.., getdata items 200, closed by victim: true
+  probe: t= 263s cycle 11 from 127.0.0.1:55690: 50 phantoms on tip height+1.., getdata items 200, closed by victim: true
+  end: victim 76, N1 76, victim peers ['127.0.0.1:47311']
+  victim stall lines naming N1 (127.0.0.1:47311): 0
+  victim stall lines (any peer): 42
+  victim 'peer banned; closing' lines: 0
+  victim log: 2026-11-17T04:13:24.729383Z  INFO peer delivered none of its requested blocks; asking other peers peer=127.0.0.1:55690 blocks=50 announced=50 strikes=1
+  victim log: 2026-11-17T04:13:30.727621Z  INFO peer delivered none of its requested blocks; asking other peers peer=127.0.0.1:55690 blocks=50 announced=50 strikes=2
+  victim log: 2026-11-17T04:13:34.728877Z  INFO peer delivered none of its requested blocks; asking other peers peer=127.0.0.1:55690 blocks=50 announced=50 strikes=3
+  victim log: 2026-11-17T04:13:36.729776Z  INFO peer delivered none of its requested blocks; asking other peers peer=127.0.0.1:55690 blocks=50 announced=50 strikes=4
+  RESULT: victim kept syncing (height 76 = N1 76)
+
+## G1 on ebc1422 (final code of the round)
+== G1 live check Mon 16 Nov 2026 23:22:34 EST commit  load: 43.97 36.87 32.60
+  synced: victim 60, N1 60; victim peers ['127.0.0.1:47311']
+  t=+30s victim 61 N1 62 victim peers ['127.0.0.1:47311', '127.0.0.1:61208']
+  t=+60s victim 63 N1 64 victim peers ['127.0.0.1:47311', '127.0.0.1:62568']
+  t=+90s victim 66 N1 66 victim peers ['127.0.0.1:47311', '127.0.0.1:64974']
+  t=+120s victim 68 N1 68 victim peers ['127.0.0.1:47311', '127.0.0.1:49196']
+  t=+150s victim 70 N1 70 victim peers ['127.0.0.1:47311', '127.0.0.1:49365']
+  t=+180s victim 72 N1 72 victim peers ['127.0.0.1:47311', '127.0.0.1:49506']
+  t=+210s victim 74 N1 74 victim peers ['127.0.0.1:47311', '127.0.0.1:49550']
+  t=+240s victim 76 N1 76 victim peers ['127.0.0.1:47311', '127.0.0.1:50445']
+  probe: t=  23s cycle 1 from 127.0.0.1:60114: 50 phantoms on tip height+1.., getdata items 200, closed by victim: true
+  probe: t=  48s cycle 2 from 127.0.0.1:61208: 50 phantoms on tip height+1.., getdata items 200, closed by victim: false
+  probe: t=  71s cycle 3 from 127.0.0.1:62568: 50 phantoms on tip height+1.., getdata items 200, closed by victim: true
+  probe: t=  95s cycle 4 from 127.0.0.1:64974: 50 phantoms on tip height+1.., getdata items 200, closed by victim: true
+  probe: t= 119s cycle 5 from 127.0.0.1:65410: 50 phantoms on tip height+1.., getdata items 250, closed by victim: true
+  probe: t= 143s cycle 6 from 127.0.0.1:49196: 50 phantoms on tip height+1.., getdata items 200, closed by victim: true
+  probe: t= 168s cycle 7 from 127.0.0.1:49365: 50 phantoms on tip height+1.., getdata items 200, closed by victim: false
+  probe: t= 191s cycle 8 from 127.0.0.1:49506: 50 phantoms on tip height+1.., getdata items 200, closed by victim: true
+  probe: t= 216s cycle 9 from 127.0.0.1:49550: 50 phantoms on tip height+1.., getdata items 200, closed by victim: false
+  probe: t= 239s cycle 10 from 127.0.0.1:50115: 50 phantoms on tip height+1.., getdata items 200, closed by victim: true
+  probe: t= 263s cycle 11 from 127.0.0.1:50445: 50 phantoms on tip height+1.., getdata items 200, closed by victim: true
+  end: victim 76, N1 76, victim peers ['127.0.0.1:47311']
+  victim stall lines naming N1 (127.0.0.1:47311): 0
+  victim stall lines (any peer): 41
+  victim 'peer banned; closing' lines: 0
+  victim log: 2026-11-17T04:26:47.459678Z  INFO peer delivered none of its requested blocks; asking other peers peer=127.0.0.1:50445 blocks=50 announced=50 strikes=1
+  victim log: 2026-11-17T04:26:53.461400Z  INFO peer delivered none of its requested blocks; asking other peers peer=127.0.0.1:50445 blocks=50 announced=50 strikes=2
+  victim log: 2026-11-17T04:26:57.460808Z  INFO peer delivered none of its requested blocks; asking other peers peer=127.0.0.1:50445 blocks=50 announced=50 strikes=3
+  victim log: 2026-11-17T04:26:59.461774Z  INFO peer delivered none of its requested blocks; asking other peers peer=127.0.0.1:50445 blocks=50 announced=50 strikes=4
+  RESULT: victim kept syncing (height 76 = N1 76)
+
+## G2 on ebc1422
+== G2 live check Mon 16 Nov 2026 23:22:51 EST load: 35.56 35.35 32.13
+  RPC (127.0.0.1:47352): 64 non-reading clients x 20000 pipelined /healthz: fresh /healthz first served at 1.0 s; fresh attempts refused before that: 0; flood sockets that saw an error: 0
+  explorer (127.0.0.1:47353): 64 non-reading clients x 400 pipelined /: fresh /healthz first served at 16.1 s; fresh attempts refused before that: 15; flood sockets that saw an error: 0
+
+# Reading: G1 - N1 is never struck (0 stall lines name it) and the victim tracks N1's tip (76 = 76) in both runs; each attacker connection is struck as it stalls (announced=50), and was banned and closed before it reconnected in 9 of 11 cycles (first run) and 8 of 11 (final run). The review measured, before the fix, an honest session struck 8 times and banned at ~180 s with the victim stuck at 60 of 73.
+# G2 - RPC: the 1,000-request cap frees a slot within 1 s; explorer: the 10 s write-stall deadline frees slots by 16 s. The review measured lockouts of 45 s (RPC) and 60 s+ (explorer) before, lasting while the clients stayed connected.

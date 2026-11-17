@@ -36,6 +36,10 @@ pub const MAX_PER_SUBNET: usize = 4;
 pub const BAN_SECS: u64 = 60 * 60; // 1 hour
 /// Score at which a peer is banned.
 pub const BAN_SCORE: i32 = -100;
+/// Highest score good behaviour can earn. Uncapped, a peer that once
+/// served many blocks (+10 each) could misbehave for a long time before a
+/// ban; at most +100 it is banned after ten bad messages at worst.
+pub const MAX_SCORE: i32 = 100;
 /// Misbehavior deductions.
 pub const SCORE_BAD_MESSAGE: i32 = -20;
 pub const SCORE_BAD_BLOCK: i32 = -50;
@@ -96,6 +100,8 @@ pub struct PeerState {
     pub handshaken: bool,
     /// Banned-until timestamp (unix secs), 0 = not banned.
     pub banned_until: u64,
+    /// Blocks this peer delivered that connected (its good history).
+    pub blocks_delivered: u64,
 }
 
 /// The peer table + ban list.
@@ -225,6 +231,7 @@ impl PeerManager {
                 last_msg: now,
                 handshaken: false,
                 banned_until: 0,
+                blocks_delivered: 0,
             },
         );
         Ok(())
@@ -320,7 +327,7 @@ impl PeerManager {
     /// Apply a score delta; ban if it crosses the threshold.
     pub fn score(&mut self, addr: &SocketAddr, delta: i32) {
         let ban_ip = if let Some(p) = self.peers.get_mut(addr) {
-            p.score = p.score.saturating_add(delta);
+            p.score = p.score.saturating_add(delta).min(MAX_SCORE);
             p.score <= BAN_SCORE
         } else {
             false
@@ -328,6 +335,27 @@ impl PeerManager {
         if ban_ip {
             self.ban_peer(*addr);
         }
+    }
+
+    /// A block from `addr` connected: count it and credit the score.
+    pub fn credit_block(&mut self, addr: &SocketAddr) {
+        if let Some(p) = self.peers.get_mut(addr) {
+            p.blocks_delivered = p.blocks_delivered.saturating_add(1);
+        }
+        self.score(addr, SCORE_GOOD_BLOCK);
+    }
+
+    /// The peer whose good history protects it from stall penalties: the
+    /// one that delivered the most connected blocks, an outbound peer (one
+    /// we chose) before any inbound one. Stalls still move its requests
+    /// elsewhere; they just never ban it, so a node cannot be talked into
+    /// banning the last peer that actually serves it the chain.
+    pub fn protected_peer(&self) -> Option<SocketAddr> {
+        self.peers
+            .values()
+            .filter(|p| p.handshaken && p.blocks_delivered > 0)
+            .max_by_key(|p| (p.outbound, p.blocks_delivered))
+            .map(|p| p.addr)
     }
 
     /// Current score of a peer.
@@ -609,6 +637,25 @@ mod tests {
             pm.score(&a, SCORE_BAD_MESSAGE); // -20 × 6 = -120 ≤ -100
         }
         assert!(pm.is_banned(&a));
+    }
+
+    #[test]
+    fn good_history_is_capped_so_misbehaviour_still_bans() {
+        let mut pm = PeerManager::new();
+        let a = addr(1);
+        pm.register(a, true, &version_msg()).unwrap();
+        for _ in 0..500 {
+            pm.credit_block(&a);
+        }
+        assert_eq!(pm.score_of(&a), Some(MAX_SCORE));
+        assert_eq!(pm.get(&a).map(|p| p.blocks_delivered), Some(500));
+        for _ in 0..10 {
+            pm.score(&a, SCORE_BAD_MESSAGE); // 100 - 10 × 20 = -100
+        }
+        assert!(
+            pm.is_banned(&a),
+            "ten bad messages ban even a long-serving peer"
+        );
     }
 
     #[test]

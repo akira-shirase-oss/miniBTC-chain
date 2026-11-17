@@ -18,7 +18,7 @@
 ## Security verification (P14, 2026-11-16)
 
 A defensive pass over every surface, each fix with a test shown failing
-first (`docs/DECISIONS.md` D-018–D-021):
+first (`docs/DECISIONS.md` D-018–D-022):
 
 - **P2P.** A ban now closes the banned peer's live connection (it used to
   keep reading everything the peer sent), and a peer that withholds
@@ -48,8 +48,19 @@ first (`docs/DECISIONS.md` D-018–D-021):
   advisory check that also covers the fuzz lockfile; actions are pinned
   by SHA and updated weekly by Dependabot.
 
-The devnet demo passes 22/22 on the final build
-(`perf/results/devnet-demo-20261116-220512.log`).
+**Review round 5** (D-022): a peer is asked only for blocks it
+announced, a peer that lacks one answers `notfound`, and the peer with
+the best delivery history is never banned for stalls, so phantom headers
+can no longer get honest peers banned; peer scores are capped at +100.
+HTTP connections also get a write-stall deadline and a request cap, the
+wallet UI's Host check ignores case and answers 400 without a Host, and
+the gate explains an advisory-database fetch failure instead of failing
+with cargo-deny's raw error. Live evidence:
+`perf/results/live-g1-g2-20261116.log`.
+
+The devnet demo passed 22/22 at `23a42b8`
+(`perf/results/devnet-demo-20261116-220512.log`); round 5 was verified by
+the gate, CI and the live checks above, not by a demo rerun.
 
 A from-scratch Bitcoin-style blockchain in Rust: a full node that validates
 every transaction and block, a P2P network, a miner, an HD wallet, a CLI, a

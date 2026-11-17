@@ -37,6 +37,10 @@ pub const GETDATA_BATCH: usize = 1_000;
 /// connects or the peer disconnects.
 pub const HEADERS_PER_PEER: usize = BLOCK_WINDOW;
 
+/// Most peers remembered as announcers of one indexed header, besides the
+/// peer that sent it first.
+pub const ANNOUNCERS_PER_HEADER: usize = 8;
+
 /// Errors from sync decisions.
 #[derive(Debug, thiserror::Error)]
 pub enum SyncError {
@@ -111,6 +115,12 @@ pub struct Sync {
     /// leaves when its block connects (`note_have`) or its peer leaves.
     headers: HashMap<Hash256, (HeaderInfo, SocketAddr)>,
     headers_per_peer: HashMap<SocketAddr, usize>,
+    /// Other peers that announced an indexed header (sent it in `headers`
+    /// or named its block in an `inv`), besides its source. A missing
+    /// block is asked only of peers that announced it: asking one that
+    /// never did, and then counting its silence as withholding, let an
+    /// attacker get honest peers banned (review round 5, G1).
+    also: HashMap<Hash256, Vec<SocketAddr>>,
 }
 
 impl Sync {
@@ -125,6 +135,7 @@ impl Sync {
             peers: HashMap::new(),
             headers: HashMap::new(),
             headers_per_peer: HashMap::new(),
+            also: HashMap::new(),
         }
     }
 
@@ -135,6 +146,79 @@ impl Sync {
         // The block index carries this header now.
         if let Some((_, from)) = self.headers.remove(&hash) {
             self.dec_headers(from);
+        }
+        self.also.remove(&hash);
+    }
+
+    /// Every peer known to have announced the indexed header `hash`: its
+    /// source first, then the others in the order they announced it.
+    pub fn announcers(&self, hash: &Hash256) -> Vec<SocketAddr> {
+        let Some((_, source)) = self.headers.get(hash) else {
+            return Vec::new();
+        };
+        let mut out = vec![*source];
+        if let Some(also) = self.also.get(hash) {
+            out.extend(also.iter().copied());
+        }
+        out
+    }
+
+    /// Whether `peer` announced the indexed header `hash`.
+    pub fn has_announced(&self, hash: &Hash256, peer: &SocketAddr) -> bool {
+        self.headers.get(hash).is_some_and(|(_, src)| src == peer)
+            || self.also.get(hash).is_some_and(|l| l.contains(peer))
+    }
+
+    /// Record that `peer` announced `hash` (an `inv`, or a header we had
+    /// already indexed from someone else). Only indexed headers are
+    /// tracked; at most `ANNOUNCERS_PER_HEADER` besides the source.
+    pub fn note_announced(&mut self, hash: Hash256, peer: SocketAddr) {
+        let Some((_, source)) = self.headers.get(&hash) else {
+            return;
+        };
+        if *source == peer {
+            return;
+        }
+        let list = self.also.entry(hash).or_default();
+        if !list.contains(&peer) && list.len() < ANNOUNCERS_PER_HEADER {
+            list.push(peer);
+        }
+    }
+
+    /// `peer` said it does not have `hash` (`notfound`): it no longer
+    /// counts as an announcer. A header nobody announces any more is
+    /// dropped; its source passes to the next announcer otherwise.
+    pub fn forget_announcer(&mut self, hash: &Hash256, peer: &SocketAddr) {
+        if let Some(list) = self.also.get_mut(hash) {
+            list.retain(|p| p != peer);
+        }
+        if self.headers.get(hash).is_some_and(|(_, src)| src == peer) {
+            self.dec_headers(*peer);
+            self.hand_over_or_drop(*hash);
+        }
+        if self.also.get(hash).is_some_and(Vec::is_empty) {
+            self.also.remove(hash);
+        }
+    }
+
+    /// Give the indexed header `hash` (whose source is leaving) to its next
+    /// announcer, or drop it when there is none.
+    fn hand_over_or_drop(&mut self, hash: Hash256) {
+        let next = self
+            .also
+            .get_mut(&hash)
+            .and_then(|l| (!l.is_empty()).then(|| l.remove(0)));
+        match next {
+            Some(p) => {
+                if let Some(entry) = self.headers.get_mut(&hash) {
+                    entry.1 = p;
+                }
+                *self.headers_per_peer.entry(p).or_insert(0) += 1;
+            }
+            None => {
+                self.headers.remove(&hash);
+                self.also.remove(&hash);
+            }
         }
     }
 
@@ -169,12 +253,25 @@ impl Sync {
         self.peers.entry(addr).or_default();
     }
 
-    /// Remove a peer (disconnect), with the headers it alone vouched for.
+    /// Remove a peer (disconnect), with the headers it alone vouched for;
+    /// a header another peer also announced passes to that peer.
     pub fn remove_peer(&mut self, addr: &SocketAddr) {
         self.peers.remove(addr);
-        if self.headers_per_peer.remove(addr).is_some() {
-            self.headers.retain(|_, (_, from)| from != addr);
+        for list in self.also.values_mut() {
+            list.retain(|p| p != addr);
         }
+        if self.headers_per_peer.remove(addr).is_some() {
+            let sourced: Vec<Hash256> = self
+                .headers
+                .iter()
+                .filter(|(_, (_, from))| from == addr)
+                .map(|(h, _)| *h)
+                .collect();
+            for h in sourced {
+                self.hand_over_or_drop(h);
+            }
+        }
+        self.also.retain(|_, l| !l.is_empty());
     }
 
     /// Process an incoming `headers` message from `peer` and return the
@@ -218,10 +315,12 @@ impl Sync {
         }
         let mut to_fetch = Vec::new();
         for (h, &hash) in headers.iter().zip(&hashes) {
-            if self.have.contains(&hash)
-                || self.headers.contains_key(&hash)
-                || chain(&hash).is_some()
-            {
+            if self.headers.contains_key(&hash) {
+                // Indexed from someone else: this peer has it too.
+                self.note_announced(hash, peer);
+                continue;
+            }
+            if self.have.contains(&hash) || chain(&hash).is_some() {
                 continue; // already known
             }
             let parent = self
@@ -605,6 +704,39 @@ mod tests {
     /// after message used to be stored every time (1,000,000 entries after
     /// 500 messages). It is now indexed once, repeats within a message are
     /// refused, and unsolicited repeats are errors the node penalises.
+    #[test]
+    fn announcers_are_every_peer_that_sent_a_header_and_outlive_its_source() {
+        let p = params();
+        let g = Hash256([0x01; 32]);
+        let mut sync = Sync::new(p, g);
+        let (a, b, c) = (peer(1), peer(2), peer(3));
+        for x in [a, b, c] {
+            sync.add_peer(x);
+        }
+        let hs = header_chain(g, 3);
+        let h1 = hs[0].block_hash();
+        assert_eq!(sync.on_headers(a, &hs, genesis_only(g)).unwrap().len(), 3);
+        // B sends the same headers (an answer to our getheaders): no new
+        // index entries, but B now has them too.
+        sync.note_getheaders_sent(&b);
+        assert!(sync.on_headers(b, &hs, genesis_only(g)).unwrap().is_empty());
+        assert_eq!(sync.announcers(&h1), vec![a, b]);
+        assert!(!sync.has_announced(&h1, &c), "C never announced it");
+        // The source leaves: B keeps the headers.
+        sync.remove_peer(&a);
+        assert_eq!(sync.known_header_count(), 3);
+        assert_eq!(sync.announcers(&h1), vec![b]);
+        // B says notfound for h1: nobody announces it, so it is dropped.
+        sync.forget_announcer(&h1, &b);
+        assert!(sync.announcers(&h1).is_empty());
+        assert_eq!(sync.known_header_count(), 2);
+        // An inv only counts for an indexed header.
+        sync.note_announced(hs[1].block_hash(), c);
+        assert!(sync.has_announced(&hs[1].block_hash(), &c));
+        sync.note_announced(Hash256([0x77; 32]), c);
+        assert!(sync.announcers(&Hash256([0x77; 32])).is_empty());
+    }
+
     #[test]
     fn a_replayed_header_is_indexed_once_and_repeats_are_errors() {
         let p = params();

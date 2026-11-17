@@ -66,12 +66,21 @@ for f in "${files[@]}"; do
     echo "$bad" >&2
   fi
 
-  # 5. Hosted runners only.
+  # 5. CI's advisory check stays online: the cached-database escape hatch
+  #    is for a maintainer's offline machine only.
+  if grep -qE 'MINIBTC_DENY_OFFLINE' "$f"; then
+    err "$f: sets MINIBTC_DENY_OFFLINE (CI must fetch the live advisory database)"
+  fi
+  if grep -qE 'cargo deny[^#]*--offline' "$f"; then
+    err "$f: runs cargo deny --offline (CI must fetch the live advisory database)"
+  fi
+
+  # 6. Hosted runners only.
   if grep -qE 'runs-on:.*self-hosted' "$f"; then
     err "$f: self-hosted runner"
   fi
 
-  # 6. Every checkout drops its credentials.
+  # 7. Every checkout drops its credentials.
   checkouts="$(grep -cE 'uses:[[:space:]]*actions/checkout@' "$f" || true)"
   dropped="$(grep -cE 'persist-credentials:[[:space:]]*false' "$f" || true)"
   if [ "$checkouts" -ne "$dropped" ]; then

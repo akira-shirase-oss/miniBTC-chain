@@ -337,6 +337,7 @@ fn attack_malformed_messages_never_panic() {
         ("pong", Message::Pong(42)),
         ("inv", Message::Inv(vec![inv_item()])),
         ("getdata", Message::GetData(vec![inv_item()])),
+        ("notfound", Message::NotFound(vec![inv_item()])),
         ("addr", Message::Addr(vec![(net_addr(), 1_700_000_000)])),
         (
             "reject",

@@ -53,14 +53,16 @@ files; create/restore are UI flows (see below).
   the token is compared without an early exit.
 - `Origin` header, when present, must match the listen socket
   (`127.0.0.1:port` or `localhost:port`).
-- `Host` must name this server (the bound address or `localhost:port`);
-  anything else gets 421 before a handler runs (DNS rebinding, D-019).
+- `Host` must name this server (the bound address or `localhost:port`,
+  ignoring case); anything else gets 421 before a handler runs (DNS
+  rebinding, D-019), and a request with no `Host` gets 400.
 - Every response carries a CSP with no script source and
   `frame-ancestors 'none'`, `nosniff`, `X-Frame-Options: DENY`,
   `Referrer-Policy: no-referrer` and `Cache-Control: no-store`.
 - `--listen` must be loopback unless `--allow-remote` is given. Serving
-  is bounded: 64 connections, a 10 s header deadline, 45 s per request,
-  64 KiB form bodies (D-019).
+  is bounded: 64 connections, a 10 s header deadline, a 10 s write-stall
+  deadline, 1,000 requests per connection, 45 s per request, 64 KiB form
+  bodies (D-019).
 
 ### Send flow (two-step, human-gated)
 
