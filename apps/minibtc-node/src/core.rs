@@ -48,6 +48,15 @@ pub(crate) const REQUESTS_MAX: usize = REQUESTS_PER_PEER * minibtc_p2p::peer::MA
 /// A block request not answered within this expires and is re-requested,
 /// from another peer when there is one (backoff + rotation).
 pub(crate) const REQUEST_TTL: Duration = Duration::from_secs(60);
+/// A peer that holds block requests and delivers none of them for this long
+/// is stalling the download: its requests move to other peers well before
+/// `REQUEST_TTL`. The window halves with each consecutive stall.
+pub(crate) const BLOCK_STALL_TIMEOUT: Duration = Duration::from_secs(10);
+/// The shortest stall window, however often a peer has stalled.
+pub(crate) const BLOCK_STALL_MIN: Duration = Duration::from_secs(2);
+/// Most requests a peer that stalled may hold until it delivers again —
+/// one `getdata` worth instead of `REQUESTS_PER_PEER`.
+pub(crate) const STALLED_PEER_REQUESTS: usize = 128;
 
 /// One queued block plus what the caps need.
 struct PendingEntry {
@@ -153,6 +162,11 @@ pub struct BlockRequests {
     /// hash was taken or re-requested since.
     order: VecDeque<(Instant, Hash256)>,
     per_peer: HashMap<SocketAddr, usize>,
+    /// Per peer with requests outstanding: since when it has delivered
+    /// nothing (its first request, or its last delivered block).
+    waiting_since: HashMap<SocketAddr, Instant>,
+    /// Consecutive stalls per peer; cleared when it delivers a block.
+    strikes: HashMap<SocketAddr, u32>,
 }
 
 impl BlockRequests {
@@ -173,11 +187,19 @@ impl BlockRequests {
             self.dec(old);
         }
         let mine = self.per_peer.get(&peer).copied().unwrap_or(0);
-        if mine >= REQUESTS_PER_PEER || self.by_hash.len() >= REQUESTS_MAX {
+        let cap = if self.strikes(&peer) > 0 {
+            STALLED_PEER_REQUESTS
+        } else {
+            REQUESTS_PER_PEER
+        };
+        if mine >= cap || self.by_hash.len() >= REQUESTS_MAX {
             return false;
         }
         self.by_hash.insert(hash, (peer, now));
         *self.per_peer.entry(peer).or_insert(0) += 1;
+        if mine == 0 {
+            self.waiting_since.insert(peer, now);
+        }
         self.order.push_back((now, hash));
         if self.order.len() > 2 * REQUESTS_MAX {
             // Drop stale queue entries (re-pointed requests), amortised.
@@ -200,16 +222,65 @@ impl BlockRequests {
 
     /// Whether `hash` was requested from `peer` (and not expired);
     /// consumes the request.
+    /// A delivery is progress: the peer's stall clock restarts and its
+    /// strikes are cleared.
     pub fn take(&mut self, hash: &Hash256, peer: SocketAddr, now: Instant) -> bool {
         self.expire(now);
         match self.by_hash.get(hash) {
             Some((asked, _)) if *asked == peer => {
                 self.by_hash.remove(hash);
                 self.dec(peer);
+                if self.per_peer.contains_key(&peer) {
+                    self.waiting_since.insert(peer, now);
+                }
+                self.strikes.remove(&peer);
                 true
             }
             _ => false,
         }
+    }
+
+    /// Consecutive stalls of `peer` (0 once it delivers).
+    pub fn strikes(&self, peer: &SocketAddr) -> u32 {
+        self.strikes.get(peer).copied().unwrap_or(0)
+    }
+
+    /// The stall window for `peer`: `BLOCK_STALL_TIMEOUT`, halved per
+    /// consecutive stall, never below `BLOCK_STALL_MIN`.
+    pub fn stall_window(&self, peer: &SocketAddr) -> Duration {
+        let halvings = self.strikes(peer).min(8);
+        (BLOCK_STALL_TIMEOUT / (1u32 << halvings)).max(BLOCK_STALL_MIN)
+    }
+
+    /// Peers with requests outstanding that have delivered none of them
+    /// within their stall window.
+    pub fn stalled(&self, now: Instant) -> Vec<SocketAddr> {
+        self.waiting_since
+            .iter()
+            .filter(|(peer, since)| {
+                self.per_peer.contains_key(*peer)
+                    && now.saturating_duration_since(**since) > self.stall_window(peer)
+            })
+            .map(|(peer, _)| *peer)
+            .collect()
+    }
+
+    /// Withdraw every request outstanding to a stalling `peer` and count a
+    /// strike against it. Returns the hashes, for asking other peers.
+    pub fn take_stalled(&mut self, peer: &SocketAddr) -> Vec<Hash256> {
+        let hashes: Vec<Hash256> = self
+            .by_hash
+            .iter()
+            .filter(|(_, (p, _))| p == peer)
+            .map(|(h, _)| *h)
+            .collect();
+        for h in &hashes {
+            self.by_hash.remove(h);
+        }
+        self.per_peer.remove(peer);
+        self.waiting_since.remove(peer);
+        *self.strikes.entry(*peer).or_insert(0) += 1;
+        hashes
     }
 
     /// Forget requests older than `REQUEST_TTL` — pops from the front of
@@ -238,6 +309,8 @@ impl BlockRequests {
     pub fn forget_peer(&mut self, peer: &SocketAddr) {
         self.by_hash.retain(|_, (p, _)| p != peer);
         self.per_peer.remove(peer);
+        self.waiting_since.remove(peer);
+        self.strikes.remove(peer);
     }
 
     fn dec(&mut self, peer: SocketAddr) {
@@ -245,6 +318,7 @@ impl BlockRequests {
             *n = n.saturating_sub(1);
             if *n == 0 {
                 self.per_peer.remove(&peer);
+                self.waiting_since.remove(&peer);
             }
         }
     }
@@ -1003,6 +1077,43 @@ mod tests {
         r.note(hash_n(130), a, t1);
         r.note(hash_n(130), a, t1);
         assert_eq!(r.len(), 49);
+    }
+
+    #[test]
+    fn a_peer_that_delivers_nothing_is_stalled_and_its_window_shrinks() {
+        let a = SocketAddr::from(([10, 0, 0, 1], 1));
+        let t0 = Instant::now();
+        let mut r = BlockRequests::default();
+        for i in 0..10 {
+            assert!(r.note(hash_n(i), a, t0));
+        }
+        assert!(r.stalled(t0 + BLOCK_STALL_TIMEOUT).is_empty());
+        // A delivery restarts the clock.
+        let t1 = t0 + Duration::from_secs(5);
+        assert!(r.take(&hash_n(0), a, t1));
+        assert!(r.stalled(t1 + BLOCK_STALL_TIMEOUT).is_empty());
+        let late = t1 + BLOCK_STALL_TIMEOUT + Duration::from_millis(1);
+        assert_eq!(r.stalled(late), vec![a]);
+
+        // Withdrawn: 9 left, a strike, a shorter window and a smaller cap.
+        assert_eq!(r.take_stalled(&a).len(), 9);
+        assert_eq!(r.in_flight(&a), 0);
+        assert_eq!(r.strikes(&a), 1);
+        assert_eq!(r.stall_window(&a), BLOCK_STALL_TIMEOUT / 2);
+        let recorded = (100..400).filter(|&i| r.note(hash_n(i), a, late)).count();
+        assert_eq!(recorded, STALLED_PEER_REQUESTS);
+        let soon = late + BLOCK_STALL_TIMEOUT / 2 + Duration::from_millis(1);
+        assert_eq!(r.stalled(soon), vec![a]);
+        r.take_stalled(&a);
+        r.take_stalled(&a);
+        r.take_stalled(&a);
+        assert_eq!(r.stall_window(&a), BLOCK_STALL_MIN);
+
+        // Delivering again clears the strikes.
+        assert!(r.note(hash_n(500), a, soon));
+        assert!(r.take(&hash_n(500), a, soon));
+        assert_eq!(r.strikes(&a), 0);
+        assert_eq!(r.stall_window(&a), BLOCK_STALL_TIMEOUT);
     }
 
     #[test]

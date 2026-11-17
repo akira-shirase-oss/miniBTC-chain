@@ -34,6 +34,11 @@ const REFILL_LIMIT: usize = 4_096;
 const STALL_TIMEOUT: Duration = Duration::from_secs(120);
 /// Maintenance sweep interval.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+/// How often block requests are checked for stalling peers.
+const STALL_CHECK_INTERVAL: Duration = Duration::from_secs(2);
+/// Penalty each time a peer lets its block requests stall (four in a row,
+/// with no block delivered in between, reach the ban threshold).
+const SCORE_WITHHELD_BLOCKS: i32 = -25;
 /// Redial interval for the address book.
 const REDIAL_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -124,11 +129,15 @@ pub async fn run(node: Node, listen: SocketAddr, connect: Vec<SocketAddr>) {
     let maintenance = tokio::spawn(async move {
         let mut sweep_tick = tokio::time::interval(SWEEP_INTERVAL);
         let mut redial_tick = tokio::time::interval(REDIAL_INTERVAL);
+        let mut stall_tick = tokio::time::interval(STALL_CHECK_INTERVAL);
         loop {
             tokio::select! {
                 _ = sleep_if_cancelled(&maint_node) => break,
                 _ = sweep_tick.tick() => sweep(&maint_node).await,
                 _ = redial_tick.tick() => redial_addrbook(&maint_node).await,
+                _ = stall_tick.tick() => {
+                    rotate_stalled_requests(&maint_node, std::time::Instant::now());
+                }
             }
         }
     });
@@ -231,6 +240,38 @@ async fn sweep(node: &Node) {
         tracing::info!(%addr, "disconnecting stalled/unhandshaken peer");
         disconnect(node, addr);
     }
+    end_unregistered_sessions(node);
+}
+
+/// Move the block requests of peers that deliver nothing to other peers,
+/// long before the 60 s request TTL, and penalise the staller. A peer that
+/// sent real headers and then withheld the blocks used to hold up to 2,048
+/// requests — the lowest heights, so nothing could connect — for the whole
+/// TTL with no penalty (review F2). After a stall the peer may hold one
+/// `getdata` worth of requests, its next window is half as long, and it is
+/// asked only when no peer without strikes is connected.
+fn rotate_stalled_requests(node: &Node, now: std::time::Instant) {
+    let asks = {
+        let mut inner = node.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let stalled = inner.requests.stalled(now);
+        if stalled.is_empty() {
+            return;
+        }
+        let mut avoid: HashMap<Hash256, SocketAddr> = HashMap::new();
+        for peer in stalled {
+            let hashes = inner.requests.take_stalled(&peer);
+            tracing::info!(
+                %peer,
+                blocks = hashes.len(),
+                strikes = inner.requests.strikes(&peer),
+                "peer delivered none of its requested blocks; asking other peers"
+            );
+            inner.peers.score(&peer, SCORE_WITHHELD_BLOCKS);
+            avoid.extend(hashes.into_iter().map(|h| (h, peer)));
+        }
+        refill_requests(&mut inner, None, &avoid)
+    };
+    send_refill(node, None, asks);
     end_unregistered_sessions(node);
 }
 
@@ -849,8 +890,9 @@ async fn handle_getdata(
 /// Request blocks for indexed headers that are neither held, queued nor in
 /// flight. Each goes to `prefer` (the peer just heard from), else the peer
 /// that sent the header, else any other sync peer — but not to the peer in
-/// `avoid` that let an earlier request for it expire, unless no one else
-/// is connected. Returns the hashes to ask each peer for.
+/// `avoid` that let an earlier request for it expire, nor to a peer whose
+/// requests stalled since its last delivery, unless no one else is
+/// connected. Returns the hashes to ask each peer for.
 fn refill_requests(
     inner: &mut NodeInner,
     prefer: Option<SocketAddr>,
@@ -872,7 +914,7 @@ fn refill_requests(
         let mut fallback = None;
         let mut pick = None;
         for p in candidates {
-            if Some(&p) == failed {
+            if Some(&p) == failed || inner.requests.strikes(&p) > 0 {
                 fallback.get_or_insert(p);
                 continue;
             }
@@ -1278,6 +1320,11 @@ mod tests {
             send_refill(node, None, asks);
         }
 
+        /// Run node `i`'s stall check as if `after` had passed.
+        fn stall_check_after(&self, i: usize, after: Duration) {
+            rotate_stalled_requests(&self.nodes[i], std::time::Instant::now() + after);
+        }
+
         /// Deliver messages until no link carries any (bounded rounds).
         async fn pump(&mut self) {
             for _ in 0..10_000 {
@@ -1670,6 +1717,51 @@ mod tests {
             net.tip(0),
             "lost blocks must be requested again"
         );
+    }
+
+    #[tokio::test]
+    async fn a_peer_withholding_requested_blocks_is_bypassed_and_penalised() {
+        // Review F2: a peer that sends real headers and then withholds the
+        // blocks held every request for the 60 s TTL, with no penalty.
+        let mut net = TestNet::no_retarget(3);
+        let (honest, victim, withholder) = (0, 1, 2);
+        net.mine(honest, 300);
+        net.connect(honest, withholder);
+        net.ask_headers(withholder, honest);
+        net.pump().await;
+        assert_eq!(net.tip(withholder), net.tip(honest));
+
+        net.connect(victim, withholder);
+        net.connect(victim, honest);
+        net.ask_headers(victim, withholder);
+        let withheld = move |from: usize, to: usize, msg: &Message| {
+            from == withholder && to == victim && matches!(msg, Message::Block(_))
+        };
+        net.pump_dropping(withheld).await;
+        assert_eq!(
+            net.tip(victim).1,
+            0,
+            "every block was asked of the withholder"
+        );
+
+        // Past the stall window, well inside the request TTL.
+        let after = crate::core::BLOCK_STALL_TIMEOUT + Duration::from_secs(1);
+        assert!(after < crate::core::REQUEST_TTL);
+        net.stall_check_after(victim, after);
+        net.pump_dropping(withheld).await;
+        assert_eq!(
+            net.tip(victim),
+            net.tip(honest),
+            "the victim must fetch the withheld blocks from the honest peer"
+        );
+        let inner = net.nodes[victim]
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let score = |i: usize| inner.peers.score_of(&net.addrs[i]).unwrap_or(0);
+        assert!(score(withholder) < 0, "the withholder is penalised");
+        assert!(score(honest) > 0, "the honest peer is credited");
+        assert!(inner.requests.strikes(&net.addrs[withholder]) > 0);
     }
 
     #[tokio::test]
