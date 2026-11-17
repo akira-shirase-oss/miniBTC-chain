@@ -1524,6 +1524,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// Every route, over the shared app state.
 fn router(app: Arc<App>) -> Router {
+    let guard_app = app.clone();
     Router::new()
         .route("/", get(index))
         .route("/new", get(new_form).post(new_submit))
@@ -1550,6 +1551,64 @@ fn router(app: Arc<App>) -> Router {
             REQUEST_TIMEOUT,
         ))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(64 * 1024))
+        // Outermost: every response, including errors from the layers
+        // above, carries the security headers.
+        .layer(axum::middleware::from_fn_with_state(guard_app, guard))
+}
+
+/// The response headers every wallet UI page carries: no scripts, no
+/// framing, no MIME sniffing, no referrer, and never cached (pages show
+/// balances, addresses and, once, a seed).
+const SECURITY_HEADERS: [(header::HeaderName, &str); 5] = [
+    (
+        header::CONTENT_SECURITY_POLICY,
+        "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; \
+         frame-ancestors 'none'; base-uri 'none'",
+    ),
+    (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+    (header::X_FRAME_OPTIONS, "DENY"),
+    (header::REFERRER_POLICY, "no-referrer"),
+    (header::CACHE_CONTROL, "no-store"),
+];
+
+/// Whether the request's Host names this server: the bound address or
+/// `localhost:<port>`. A page served under any other name (DNS
+/// rebinding: a hostile site's name pointed at 127.0.0.1) is refused
+/// before a handler runs. Bound to an unspecified address (opt-in remote
+/// use), any host on the right port is accepted.
+fn host_ok(headers: &HeaderMap, listen: SocketAddr) -> bool {
+    let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    if host == listen.to_string() || host == format!("localhost:{}", listen.port()) {
+        return true;
+    }
+    listen.ip().is_unspecified()
+        && host
+            .rsplit_once(':')
+            .is_some_and(|(_, port)| port == listen.port().to_string())
+}
+
+/// Host check on the way in, security headers on the way out.
+async fn guard(
+    State(app): State<Arc<App>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let mut res = if host_ok(req.headers(), app.listen) {
+        next.run(req).await
+    } else {
+        (
+            axum::http::StatusCode::MISDIRECTED_REQUEST,
+            "unexpected Host",
+        )
+            .into_response()
+    };
+    for (name, value) in SECURITY_HEADERS {
+        res.headers_mut()
+            .insert(name, header::HeaderValue::from_static(value));
+    }
+    res
 }
 
 #[cfg(test)]
@@ -1865,6 +1924,120 @@ mod tests {
             .unwrap_or_else(|_| panic!());
         assert_eq!(sends.load(Ordering::SeqCst), 1);
         let _ = std::fs::remove_dir_all(&app.datadir);
+    }
+
+    #[tokio::test]
+    async fn every_response_carries_the_security_headers_and_a_foreign_host_is_refused() {
+        use std::sync::atomic::Ordering;
+        use tower::ServiceExt;
+        let (port, sends) = counting_rpc().await;
+        let app = app_with_pending_send(port);
+        let ours = "127.0.0.1:18448";
+        let get = |path: &str, host: Option<&str>| {
+            let mut b = axum::http::Request::get(path);
+            if let Some(h) = host {
+                b = b.header(header::HOST, h);
+            }
+            b.body(axum::body::Body::empty())
+                .unwrap_or_else(|_| panic!())
+        };
+        let requests = [
+            ("index", get("/", Some(ours))),
+            ("seed", get("/seed", Some(ours))),
+            ("wallet", get("/wallet", Some(ours))),
+            ("healthz", get("/healthz", Some("localhost:18448"))),
+            ("unknown route", get("/nope", Some(ours))),
+            ("foreign host", get("/", Some("evil.example:18448"))),
+            ("no host", get("/", None)),
+            (
+                "confirm",
+                confirm_request(
+                    Some("mb_wallet=tok"),
+                    Some("http://127.0.0.1:18448"),
+                    "csrf=bad",
+                ),
+            ),
+        ];
+        for (case, req) in requests {
+            let res = router(app.clone())
+                .oneshot(req)
+                .await
+                .unwrap_or_else(|_| panic!());
+            let h = res.headers();
+            let csp = h
+                .get(header::CONTENT_SECURITY_POLICY)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default();
+            assert!(csp.contains("default-src 'none'"), "{case}: CSP {csp:?}");
+            assert!(
+                csp.contains("frame-ancestors 'none'"),
+                "{case}: CSP {csp:?}"
+            );
+            assert_eq!(
+                h.get(header::X_CONTENT_TYPE_OPTIONS)
+                    .and_then(|v| v.to_str().ok()),
+                Some("nosniff"),
+                "{case}"
+            );
+            assert_eq!(
+                h.get(header::CACHE_CONTROL).and_then(|v| v.to_str().ok()),
+                Some("no-store"),
+                "{case}"
+            );
+            if case.ends_with("host") {
+                assert_eq!(
+                    res.status(),
+                    axum::http::StatusCode::MISDIRECTED_REQUEST,
+                    "{case}"
+                );
+            }
+        }
+
+        // A request that would broadcast, but names a foreign host (DNS
+        // rebinding), never reaches the handler.
+        arm_pending(&app);
+        let mut req = confirm_request(
+            Some("mb_wallet=tok"),
+            Some("http://127.0.0.1:18448"),
+            "csrf=c5rf",
+        );
+        req.headers_mut().insert(
+            header::HOST,
+            "rebind.evil.example:18448"
+                .parse()
+                .unwrap_or_else(|_| panic!()),
+        );
+        let res = router(app.clone())
+            .oneshot(req)
+            .await
+            .unwrap_or_else(|_| panic!());
+        assert_eq!(res.status(), axum::http::StatusCode::MISDIRECTED_REQUEST);
+        assert_eq!(sends.load(Ordering::SeqCst), 0);
+        let _ = std::fs::remove_dir_all(&app.datadir);
+    }
+
+    #[test]
+    fn host_check_accepts_only_this_server() {
+        let listen: SocketAddr = "127.0.0.1:18448".parse().unwrap_or_else(|_| panic!());
+        let with = |h: &str| {
+            let mut m = HeaderMap::new();
+            m.insert(header::HOST, h.parse().unwrap_or_else(|_| panic!()));
+            m
+        };
+        assert!(host_ok(&with("127.0.0.1:18448"), listen));
+        assert!(host_ok(&with("localhost:18448"), listen));
+        for bad in [
+            "127.0.0.1:18449",
+            "localhost",
+            "evil.example:18448",
+            "127.0.0.1:18448.evil.example",
+        ] {
+            assert!(!host_ok(&with(bad), listen), "{bad}");
+        }
+        assert!(!host_ok(&HeaderMap::new(), listen));
+        let any: SocketAddr = "0.0.0.0:18448".parse().unwrap_or_else(|_| panic!());
+        assert!(host_ok(&with("192.168.1.9:18448"), any));
+        assert!(!host_ok(&with("192.168.1.9:1"), any));
     }
 
     #[test]
