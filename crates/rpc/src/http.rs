@@ -9,7 +9,11 @@
 //! - a cap on open connections — past it a new connection is closed at
 //!   once instead of holding a task and a socket;
 //! - a header-read deadline on every request, including the wait for the
-//!   next request on a kept-alive connection, so idle sockets close.
+//!   next request on a kept-alive connection, so idle sockets close;
+//! - a write-stall deadline: a client that stops reading its responses
+//!   (while pipelining requests) loses the connection instead of holding
+//!   it and its slot forever;
+//! - a cap on requests per connection, after which the connection closes.
 //!
 //! Per-request deadlines (body reads, handler time) belong to each router,
 //! because the right bound differs: an RPC `generatetoaddress` legitimately
@@ -18,10 +22,15 @@
 use axum::Router;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
+use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::net::TcpListener;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 
 /// Connection bounds for [`serve_bounded`].
@@ -33,6 +42,12 @@ pub struct Limits {
     /// connection starts waiting for them (so it also closes idle
     /// kept-alive connections).
     pub header_read_timeout: Duration,
+    /// A write may wait this long for the client to read; past it the
+    /// connection is dropped. (Hyper has no write timeout of its own.)
+    pub write_stall_timeout: Duration,
+    /// Requests served on one connection; the last answer carries
+    /// `Connection: close`.
+    pub max_requests_per_connection: usize,
 }
 
 impl Limits {
@@ -40,7 +55,92 @@ impl Limits {
     pub const LOCAL: Limits = Limits {
         max_connections: 64,
         header_read_timeout: Duration::from_secs(10),
+        write_stall_timeout: Duration::from_secs(10),
+        max_requests_per_connection: 1_000,
     };
+}
+
+/// A connection whose writes may stall for at most `stall`. Reads pass
+/// through (the header deadline bounds them).
+struct WriteDeadline {
+    io: TcpStream,
+    stall: Duration,
+    waiting: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl WriteDeadline {
+    /// The inner write is pending: start (or keep) the stall clock, and
+    /// fail once it runs out.
+    fn stalled<T>(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<T>> {
+        let stall = self.stall;
+        let sleep = self
+            .waiting
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep(stall)));
+        match sleep.as_mut().poll(cx) {
+            Poll::Ready(()) => Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "client stopped reading: write stalled",
+            ))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn progressed<T>(&mut self, r: std::io::Result<T>) -> Poll<std::io::Result<T>> {
+        self.waiting = None;
+        Poll::Ready(r)
+    }
+}
+
+impl AsyncRead for WriteDeadline {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().io).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for WriteDeadline {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.io).poll_write(cx, buf) {
+            Poll::Ready(r) => this.progressed(r),
+            Poll::Pending => this.stalled(cx),
+        }
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.io).poll_write_vectored(cx, bufs) {
+            Poll::Ready(r) => this.progressed(r),
+            Poll::Pending => this.stalled(cx),
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.io.is_write_vectored()
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.io).poll_flush(cx) {
+            Poll::Ready(r) => this.progressed(r),
+            Poll::Pending => this.stalled(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().io).poll_shutdown(cx)
+    }
 }
 
 /// Refuse a non-loopback bind unless the operator opted in. Every MiniBTC
@@ -79,13 +179,36 @@ pub async fn serve_bounded(listener: TcpListener, router: Router, limits: Limits
             drop(stream);
             continue;
         };
-        let service = TowerToHyperService::new(router.clone());
+        let inner = TowerToHyperService::new(router.clone());
+        let served = Arc::new(AtomicUsize::new(0));
+        let max = limits.max_requests_per_connection;
+        // Count requests; the one that reaches the cap is answered with
+        // `Connection: close`, after which hyper ends the connection.
+        let service = hyper::service::service_fn(move |req| {
+            let n = served.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+            let call = hyper::service::Service::call(&inner, req);
+            async move {
+                let mut res = call.await?;
+                if n >= max {
+                    res.headers_mut().insert(
+                        axum::http::header::CONNECTION,
+                        axum::http::HeaderValue::from_static("close"),
+                    );
+                }
+                Ok::<_, std::convert::Infallible>(res)
+            }
+        });
+        let io = WriteDeadline {
+            io: stream,
+            stall: limits.write_stall_timeout,
+            waiting: None,
+        };
         tokio::spawn(async move {
             let _permit = permit;
             let mut http = hyper::server::conn::http1::Builder::new();
             http.timer(TokioTimer::new())
                 .header_read_timeout(limits.header_read_timeout);
-            if let Err(e) = http.serve_connection(TokioIo::new(stream), service).await {
+            if let Err(e) = http.serve_connection(TokioIo::new(io), service).await {
                 tracing::debug!(%peer, "connection ended: {e}");
             }
         });
