@@ -18,6 +18,7 @@ use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
 
 /// Per-peer outbound queue depth — a stalled peer drops announcements.
 const PEER_QUEUE: usize = 256;
@@ -145,16 +146,60 @@ async fn sleep_if_cancelled(node: &Node) {
     }
 }
 
-/// Disconnect a peer by addr: drop its queue entry so the session's
-/// writer ends, score it, and remove from tables.
+/// Disconnect a peer by addr: remove it from the tables and end its
+/// session, which closes the socket.
 fn disconnect(node: &Node, addr: SocketAddr) {
     node.peer_tx.lock().ok().map(|mut m| m.remove(&addr));
-    let mut inner = node.inner.lock().unwrap_or_else(|e| e.into_inner());
-    inner.peers.remove(&addr);
-    inner.sync.remove_peer(&addr);
-    inner.requests.forget_peer(&addr);
-    // Drop the TCP side too: the session notices its queue closed and
-    // exits; the peer table entry is already gone.
+    {
+        let mut inner = node.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.peers.remove(&addr);
+        inner.sync.remove_peer(&addr);
+        inner.requests.forget_peer(&addr);
+    }
+    end_session(node, addr);
+}
+
+/// Session ids, so a session's cleanup never removes a newer session's
+/// registry entry for the same address.
+static SESSION_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// End the live session for `addr`, if any: its reader stops at once
+/// (mid-frame is fine, the connection is closing) and its socket closes.
+fn end_session(node: &Node, addr: SocketAddr) {
+    let entry = node
+        .sessions
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&addr);
+    if let Some((_, token)) = entry {
+        token.cancel();
+    }
+}
+
+/// End every session whose peer is no longer in the peer table — banned
+/// (by scoring or the operator's `banpeer`) or disconnected. A ban used
+/// to remove the peer from the table only, while its session kept
+/// reading and processing everything it sent.
+pub(crate) fn end_unregistered_sessions(node: &Node) {
+    let registered: HashSet<SocketAddr> = {
+        let inner = node.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.peers.addrs().into_iter().collect()
+    };
+    let gone: Vec<CancellationToken> = {
+        let mut sessions = node.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        let addrs: Vec<SocketAddr> = sessions
+            .keys()
+            .filter(|a| !registered.contains(a))
+            .copied()
+            .collect();
+        addrs
+            .iter()
+            .filter_map(|a| sessions.remove(a).map(|(_, t)| t))
+            .collect()
+    };
+    for token in gone {
+        token.cancel();
+    }
 }
 
 /// Sweep: disconnect stalled + over-handshake-timeout peers, and expire
@@ -186,6 +231,7 @@ async fn sweep(node: &Node) {
         tracing::info!(%addr, "disconnecting stalled/unhandshaken peer");
         disconnect(node, addr);
     }
+    end_unregistered_sessions(node);
 }
 
 /// Dial up to a few addrbook entries not already connected.
@@ -391,6 +437,13 @@ async fn session(
     }
 
     // --- Message loop ---
+    // Register the session so a ban or disconnect can end it.
+    let session_id = SESSION_SEQ.fetch_add(1, Ordering::Relaxed);
+    let kicked = CancellationToken::new();
+    node.sessions
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(addr, (session_id, kicked.clone()));
     // Outbound queue: RPC/P2P producers push; the writer drains.
     let (tx, mut rx) = mpsc::channel::<Message>(PEER_QUEUE);
     node.peer_tx
@@ -432,20 +485,37 @@ async fn session(
         }
     });
 
-    // Reader loop.
+    // Reader loop. It ends when the session is kicked (ban, disconnect)
+    // and after any message that leaves the peer unregistered — the peer's
+    // own misbehaviour usually bans it inside `handle_message`.
     loop {
-        match timeout(
-            codec::IO_TIMEOUT + Duration::from_secs(5),
-            codec::recv(&mut rd, &params),
-        )
-        .await
-        {
+        let read = tokio::select! {
+            biased;
+            () = kicked.cancelled() => {
+                tracing::debug!(%addr, "session ended: peer banned or disconnected");
+                break;
+            }
+            r = timeout(
+                codec::IO_TIMEOUT + Duration::from_secs(5),
+                codec::recv(&mut rd, &params),
+            ) => r,
+        };
+        match read {
             Ok(Ok(msg)) => {
-                {
+                let registered = {
                     let mut inner = node.inner.lock().unwrap_or_else(|e| e.into_inner());
                     inner.peers.touch(&addr);
+                    inner.peers.get(&addr).is_some()
+                };
+                if !registered || !handle_message(&node, addr, msg, &tx).await {
+                    break;
                 }
-                if !handle_message(&node, addr, msg, &tx).await {
+                let still_registered = {
+                    let inner = node.inner.lock().unwrap_or_else(|e| e.into_inner());
+                    inner.peers.get(&addr).is_some()
+                };
+                if !still_registered {
+                    tracing::info!(%addr, "peer banned; closing its connection");
                     break;
                 }
             }
@@ -465,6 +535,12 @@ async fn session(
     }
 
     // --- Cleanup ---
+    {
+        let mut sessions = node.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        if sessions.get(&addr).is_some_and(|(id, _)| *id == session_id) {
+            sessions.remove(&addr);
+        }
+    }
     node.peer_tx
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1380,6 +1456,155 @@ mod tests {
         );
         assert!(sent <= 20, "banned within a few messages, took {sent}");
         assert!(inner.sync.known_header_count() <= 1, "nothing accumulates");
+    }
+
+    /// A header on genesis with valid proof of work, for replay floods.
+    fn replayable_header(node: &Node) -> minibtc_primitives::BlockHeader {
+        let genesis = {
+            let inner = node.inner.lock().unwrap_or_else(|e| e.into_inner());
+            inner.chain.blocks[&inner.chain.genesis].block.header
+        };
+        let target = minibtc_consensus::target_for_bits(genesis.bits).unwrap();
+        let mut h = minibtc_primitives::BlockHeader {
+            version: 1,
+            prev_hash: genesis.block_hash(),
+            merkle_root: Hash256([0x42; 32]),
+            time: genesis.time + 31,
+            bits: genesis.bits,
+            nonce: 0,
+        };
+        while !h.check_pow(&target) {
+            h.nonce += 1;
+        }
+        h
+    }
+
+    /// A real session over loopback: `accept_session` on the node's side,
+    /// a hand-driven peer on the other, handshake done.
+    async fn live_session(node: &Node) -> (TcpStream, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let at = listener.local_addr().unwrap();
+        let n = node.clone();
+        let server = tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.unwrap();
+            let permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
+            accept_session(n, stream, peer, permit).await;
+        });
+        let params = node.params.clone();
+        let mut client = TcpStream::connect(at).await.unwrap();
+        codec::write_message(&mut client, &our_version_msg(&params, 0), &params)
+            .await
+            .unwrap();
+        let first = codec::recv(&mut client, &params).await.unwrap();
+        assert!(matches!(first, Message::Version { .. }));
+        codec::write_message(&mut client, &Message::Verack, &params)
+            .await
+            .unwrap();
+        loop {
+            if matches!(
+                codec::recv(&mut client, &params).await.unwrap(),
+                Message::Verack
+            ) {
+                break;
+            }
+        }
+        let me = client.local_addr().unwrap();
+        timeout(Duration::from_secs(5), async {
+            while !node
+                .sessions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&me)
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("session registered");
+        (client, server)
+    }
+
+    /// Whether the node closes `client`'s connection within `within`
+    /// (reads drain whatever the node still sends; EOF or reset = closed).
+    async fn closed_within(client: &mut TcpStream, within: Duration) -> bool {
+        use tokio::io::AsyncReadExt;
+        timeout(within, async {
+            let mut buf = [0u8; 4_096];
+            loop {
+                match client.read(&mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {}
+                }
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    #[tokio::test]
+    async fn a_banned_peer_is_disconnected_while_it_keeps_sending() {
+        // Review F1: the ban removed the peer from the table, but its
+        // session kept decoding and handling every message it sent (4,144
+        // in 30 s live) until the peer itself went quiet.
+        let node = in_memory(ChainParams::devnet());
+        let (mut client, server) = live_session(&node).await;
+        let me = client.local_addr().unwrap();
+        let h = replayable_header(&node);
+        let flood = Message::Headers {
+            count: 2_000,
+            headers: vec![h; 2_000],
+        };
+        let mut sent = 0;
+        for _ in 0..40 {
+            if codec::write_message(&mut client, &flood, &node.params)
+                .await
+                .is_err()
+            {
+                break; // the node already closed the connection
+            }
+            sent += 1;
+        }
+        assert!(sent >= 5, "the flood reached the node ({sent} messages)");
+        assert!(
+            node.inner
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .peers
+                .is_banned(&me),
+            "the replaying peer is banned"
+        );
+        assert!(
+            closed_within(&mut client, Duration::from_secs(5)).await,
+            "a banned peer's connection must be closed, not kept reading"
+        );
+        timeout(Duration::from_secs(5), server)
+            .await
+            .expect("the session task ends")
+            .unwrap();
+        assert!(
+            node.sessions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn banpeer_closes_the_live_connection() {
+        use minibtc_rpc::RpcBackend;
+        let node = in_memory(ChainParams::devnet());
+        let (mut client, server) = live_session(&node).await;
+        crate::rpc::NodeBackend::new(node.clone())
+            .call("banpeer", &[serde_json::json!("127.0.0.1")])
+            .unwrap();
+        assert!(
+            closed_within(&mut client, Duration::from_secs(5)).await,
+            "banpeer must end the banned IP's live session"
+        );
+        timeout(Duration::from_secs(5), server)
+            .await
+            .expect("the session task ends")
+            .unwrap();
     }
 
     #[tokio::test]

@@ -319,20 +319,10 @@ impl RpcBackend for NodeBackend {
                 let ip: std::net::IpAddr = ip_s
                     .parse()
                     .map_err(|_| RpcError::InvalidParams("bad ip".into()))?;
-                let mut inner = self.inner();
-                inner.peers.ban(ip);
-                // Also drop any live session from that IP.
-                let addrs: Vec<std::net::SocketAddr> = inner
-                    .peers
-                    .snapshot()
-                    .into_iter()
-                    .map(|(a, _)| a)
-                    .filter(|a| a.ip() == ip)
-                    .collect();
-                drop(inner);
-                for a in addrs {
-                    self.node.peer_tx.lock().ok().map(|mut m| m.remove(&a));
-                }
+                self.inner().peers.ban(ip);
+                // `ban` removed that IP's peers from the table; end their
+                // live sessions too, so the sockets close now.
+                crate::net::end_unregistered_sessions(&self.node);
                 Ok(json!({ "banned": ip_s }))
             }
 

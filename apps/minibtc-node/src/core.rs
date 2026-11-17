@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 /// Bounded address-book size.
 pub(crate) const ADDRBOOK_CAP: usize = 1_024;
@@ -313,6 +314,10 @@ pub struct Node {
     pub store: Option<Store>,
     /// Per-peer outbound message queues.
     pub peer_tx: Arc<Mutex<HashMap<SocketAddr, mpsc::Sender<Message>>>>,
+    /// Live sessions by address: (session id, cancel token). Cancelling the
+    /// token ends that session's reader and writer and closes its socket —
+    /// how a ban or a disconnect reaches a connection that is still sending.
+    pub sessions: Arc<Mutex<HashMap<SocketAddr, (u64, CancellationToken)>>>,
     /// Shutdown flag — mining loops check it.
     pub cancel: Arc<AtomicBool>,
 }
@@ -382,6 +387,7 @@ pub fn open(datadir: &Path, params: ChainParams, reindex: bool) -> Result<Node, 
         inner: Arc::new(Mutex::new(inner)),
         store: Some(store),
         peer_tx: Arc::new(Mutex::new(HashMap::new())),
+        sessions: Arc::new(Mutex::new(HashMap::new())),
         cancel: Arc::new(AtomicBool::new(false)),
     })
 }
@@ -412,6 +418,7 @@ pub(crate) fn in_memory(params: ChainParams) -> Node {
         inner: Arc::new(Mutex::new(inner)),
         store: None,
         peer_tx: Arc::new(Mutex::new(HashMap::new())),
+        sessions: Arc::new(Mutex::new(HashMap::new())),
         cancel: Arc::new(AtomicBool::new(false)),
     }
 }
