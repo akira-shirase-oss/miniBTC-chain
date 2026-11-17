@@ -278,13 +278,16 @@ fn run_chain(ops: usize) -> ScenarioResult {
         }
     }
     let secs = t0.elapsed().as_secs_f64();
-    finish(
+    // Every spend is valid by construction; a rejected one means the
+    // scenario is timing the rejection path, which is a failure.
+    finish_checked(
         "chain",
         "validations",
         ops,
         secs,
         20_000.0,
-        format!("valid={ok}"),
+        format!("valid={ok} of {ops}"),
+        ok == ops,
     )
 }
 
@@ -396,7 +399,10 @@ fn spend_tx(i: usize) -> Transaction {
                 txid: Hash256::from_hex(&format!("{:064x}", i as u64 % 512 + 1)).unwrap(),
                 vout: 0,
             },
-            script_sig: vec![0x51],
+            // Spends an OP_TRUE output: an empty scriptSig leaves exactly
+            // one true item (cleanstack). `[OP_1]` here left two, so every
+            // validation failed.
+            script_sig: vec![],
             sequence: 0xffff_ffff,
         }],
         outputs: vec![TxOutput {
@@ -447,6 +453,22 @@ impl minibtc_consensus::UtxoView for RichView {
 }
 
 // ---------- report ----------
+
+/// [`finish`] for a scenario whose operations must also be correct: it
+/// passes only when the throughput threshold is met *and* `correct`.
+fn finish_checked(
+    name: &'static str,
+    unit: &'static str,
+    ops: usize,
+    secs: f64,
+    threshold: f64,
+    detail: String,
+    correct: bool,
+) -> ScenarioResult {
+    let mut r = finish(name, unit, ops, secs, threshold, detail);
+    r.pass &= correct;
+    r
+}
 
 fn git_commit() -> String {
     Command::new("git")
@@ -516,4 +538,33 @@ fn write_report(outdir: &PathBuf, report: &Report) -> Result<PathBuf> {
     std::fs::write(&path, serde_json::to_string_pretty(&doc)?)?;
     println!("report: {}", path.display());
     Ok(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_chain_scenario_transaction_is_valid() {
+        // The chain scenario measured the rejection path for months: its
+        // spends failed the cleanstack rule (scriptSig OP_1 + scriptPubKey
+        // OP_1 leaves two items), and it still passed on throughput alone.
+        let params = ChainParams::devnet();
+        let view = RichView::new(&params);
+        for i in 0..1_024 {
+            let r = minibtc_consensus::validate_tx(&spend_tx(i), &view, &params);
+            assert!(r.is_ok(), "spend_tx({i}): {r:?}");
+        }
+    }
+
+    #[test]
+    fn the_chain_scenario_fails_unless_every_validation_succeeds() {
+        let r = run_chain(2_000);
+        assert_eq!(r.detail, "valid=2000 of 2000");
+        let bad = finish_checked("chain", "validations", 10, 1.0, 1.0, String::new(), false);
+        assert!(
+            !bad.pass,
+            "a scenario with failed validations must not pass"
+        );
+    }
 }
