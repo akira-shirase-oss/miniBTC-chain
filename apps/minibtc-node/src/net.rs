@@ -481,31 +481,60 @@ async fn cleanup(node: &Node, addr: SocketAddr) {
     inner.requests.forget_peer(&addr);
 }
 
-/// Build a getheaders locator: tip + a few ancestors (bounded).
+/// A locator from our tip.
 fn sync_locator(inner: &NodeInner) -> Vec<Hash256> {
+    locator_from(inner, inner.chain.tip)
+}
+
+/// The locator for continuing header sync with `peer`: from the best
+/// header it sent us while that block has not connected (it is ahead of
+/// us, possibly on another branch), else from our tip. Building it only
+/// from our tip made every answer repeat the first 2,000 headers past the
+/// fork, so a fork deeper than that on both sides never resolved.
+fn peer_locator(inner: &NodeInner, peer: &SocketAddr) -> Vec<Hash256> {
+    match inner.sync.best_header(peer) {
+        Some(h) if !inner.chain.blocks.contains_key(&h) => locator_from(inner, h),
+        _ => sync_locator(inner),
+    }
+}
+
+/// Bitcoin-style block locator starting at `start` (a block in the index
+/// or an indexed header): ten hashes one apart, then the step doubles,
+/// always ending with genesis. At most 64 entries (the codec allows 128),
+/// which reaches back far beyond any chain this devnet can build.
+fn locator_from(inner: &NodeInner, start: Hash256) -> Vec<Hash256> {
+    let genesis = inner.chain.genesis;
+    let prev_of = |h: &Hash256| -> Option<Hash256> {
+        inner
+            .chain
+            .blocks
+            .get(h)
+            .map(|r| r.block.header.prev_hash)
+            .or_else(|| inner.sync.header_info(h).map(|i| i.prev))
+    };
     let mut loc = Vec::new();
-    let mut cur = inner.chain.tip;
-    let h = inner.chain.height();
-    // Exponential-ish step back for a useful locator.
-    let mut step = 1u32;
-    loop {
-        if h == 0 || loc.len() >= 16 {
+    let mut cur = start;
+    let mut step = 1usize;
+    while loc.len() < 63 {
+        loc.push(cur);
+        if cur == genesis {
             break;
         }
-        loc.push(cur);
-        let target = h.saturating_sub(step);
-        // Walk back `step` blocks.
-        let mut walk = h;
-        while walk > target {
-            match inner.chain.blocks.get(&cur) {
-                Some(rec) => {
-                    cur = rec.block.header.prev_hash;
-                    walk = walk.saturating_sub(1);
+        if loc.len() >= 10 {
+            step = step.saturating_mul(2);
+        }
+        for _ in 0..step {
+            match prev_of(&cur) {
+                Some(p) if p != Hash256::ZERO && cur != genesis => cur = p,
+                _ => {
+                    cur = genesis;
+                    break;
                 }
-                None => break,
             }
         }
-        step = step.saturating_mul(2);
+    }
+    if loc.last() != Some(&genesis) {
+        loc.push(genesis);
     }
     loc
 }
@@ -589,9 +618,22 @@ async fn handle_message(
                     // (for example served past a peer's per-getdata limit).
                     let want = drain_wanted(&mut inner, addr);
                     let asks = refill_requests(&mut inner, Some(addr), &HashMap::new());
+                    // A full batch means there is more: continue right after
+                    // its last header (not from our tip, which may be on
+                    // another branch below the batch).
+                    let more = (headers.len() == minibtc_p2p::sync::HEADERS_BATCH).then(|| {
+                        inner.sync.note_getheaders_sent(&addr);
+                        peer_locator(&inner, &addr)
+                    });
                     drop(inner);
                     send_getdata(reply, want);
                     send_refill(node, Some((addr, reply)), asks);
+                    if let Some(locator) = more {
+                        let _ = reply.try_send(Message::GetHeaders {
+                            locator,
+                            stop: Hash256::ZERO,
+                        });
+                    }
                 }
                 Err(e) => {
                     tracing::debug!(%addr, "bad headers: {e}");
@@ -897,7 +939,7 @@ async fn drain_pending(node: &Node, origin: SocketAddr, reply: &mpsc::Sender<Mes
         let locator = {
             let mut inner = node.inner.lock().unwrap_or_else(|e| e.into_inner());
             inner.sync.note_getheaders_sent(&origin);
-            sync_locator(&inner)
+            peer_locator(&inner, &origin)
         };
         let _ = reply.try_send(Message::GetHeaders {
             locator,
@@ -1355,6 +1397,25 @@ mod tests {
             net.tip(1),
             net.tip(0),
             "the node must catch up all 1,000 blocks"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fork_deeper_than_one_headers_batch_resolves() {
+        // Both branches are longer than one headers answer (2,000). N1 must
+        // learn all 2,350 headers of the heavier branch, not the same first
+        // 2,000 again and again.
+        let mut net = TestNet::no_retarget(2);
+        net.mine(0, 2_150);
+        net.mine(1, 2_350);
+        net.connect(0, 1);
+        net.ask_headers(0, 1);
+        net.pump().await;
+        assert_eq!(net.tip(1).1, 2_350);
+        assert_eq!(
+            net.tip(0),
+            net.tip(1),
+            "N1 must reorg onto the heavier 2,350-block branch"
         );
     }
 

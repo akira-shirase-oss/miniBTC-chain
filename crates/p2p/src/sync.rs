@@ -87,6 +87,9 @@ pub struct PeerDownload {
     /// `getheaders` sent to this peer and not yet answered: an answer
     /// that brings nothing new is expected then, not a fault.
     pub headers_requested: u32,
+    /// The last header of the last valid headers message from this peer —
+    /// where the next `getheaders` to it continues from.
+    pub best_header: Option<Hash256>,
 }
 
 /// The sync coordinator — one per node.
@@ -235,6 +238,9 @@ impl Sync {
         }
         if to_fetch.is_empty() && !headers.is_empty() && !solicited {
             return Err(SyncError::NothingNew);
+        }
+        if let (Some(pd), Some(last)) = (self.peers.get_mut(&peer), hashes.last()) {
+            pd.best_header = Some(*last);
         }
         // Record in the peer's wanted queue (bounded by the window).
         if let Some(pd) = self.peers.get_mut(&peer) {
@@ -412,6 +418,17 @@ impl Sync {
             .collect();
         v.sort_unstable_by_key(|(height, h, _)| (*height, *h));
         v.into_iter().take(limit).map(|(_, h, p)| (h, p)).collect()
+    }
+
+    /// The indexed entry for a header whose block has not connected.
+    pub fn header_info(&self, hash: &Hash256) -> Option<HeaderInfo> {
+        self.headers.get(hash).map(|(i, _)| *i)
+    }
+
+    /// Where header sync with `peer` continues from (see
+    /// [`PeerDownload::best_header`]).
+    pub fn best_header(&self, peer: &SocketAddr) -> Option<Hash256> {
+        self.peers.get(peer).and_then(|pd| pd.best_header)
     }
 
     /// Peers registered for sync.

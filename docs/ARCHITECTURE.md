@@ -97,6 +97,11 @@ Hard rules:
   the peer disconnects. A message may carry at most 2,000 headers and no
   repeats; an unsolicited message that adds nothing is penalised, so a
   replayed cheap header leads to a ban.
+- **Locators** are Bitcoin-style (ten hashes one apart, then doubling
+  steps, ending with genesis). A follow-up `getheaders` to a peer starts
+  from the best header that peer sent us while its block has not
+  connected, and a full 2,000-header answer is continued at once from its
+  last header, so a fork deeper than one batch on both sides resolves.
 - **Block download** asks in `getdata` messages of at most 128 items (the
   most a peer serves per message; a larger request gets 128 blocks and a
   `reject`). An indexed header whose block is neither held, queued nor in
