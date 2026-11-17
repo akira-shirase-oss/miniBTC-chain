@@ -213,7 +213,7 @@ async fn redial_addrbook(node: &Node) {
 async fn dial_and_session(node: Node, addr: SocketAddr) {
     {
         let mut inner = node.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if inner.peers.is_banned(&addr.ip()) {
+        if inner.peers.is_banned(&addr) {
             return;
         }
         // One dial per address, end to end: registered peers and
@@ -255,7 +255,7 @@ pub async fn accept_session(
 ) {
     {
         let mut inner = node.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if inner.peers.is_banned(&addr.ip()) {
+        if inner.peers.is_banned(&addr) {
             return;
         }
         // admit() reserves the slot: concurrent handshakes count against
@@ -996,7 +996,7 @@ fn learn_addrs(node: &Node, addrs: &[(minibtc_p2p::codec::NetAddress, u32)]) {
             continue;
         }
         let sa = SocketAddr::new(ip, a.port);
-        if inner.peers.is_banned(&ip) || inner.addrbook.contains(&sa) {
+        if inner.peers.is_banned(&sa) || inner.addrbook.contains(&sa) {
             continue;
         }
         if inner.addrbook.len() >= ADDRBOOK_CAP {
@@ -1360,7 +1360,7 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .peers
-                .is_banned(&attacker.ip())
+                .is_banned(&attacker)
             {
                 break;
             }
@@ -1375,7 +1375,7 @@ mod tests {
         }
         let inner = node.inner.lock().unwrap_or_else(|e| e.into_inner());
         assert!(
-            inner.peers.is_banned(&attacker.ip()),
+            inner.peers.is_banned(&attacker),
             "the replaying peer must be banned (sent {sent} messages)"
         );
         assert!(sent <= 20, "banned within a few messages, took {sent}");

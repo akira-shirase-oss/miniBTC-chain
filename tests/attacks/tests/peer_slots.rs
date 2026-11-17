@@ -115,3 +115,52 @@ fn a_reserved_slot_is_filled_by_registration_and_freed_on_release() {
     pm.remove(&b);
     pm.admit(c, false).unwrap();
 }
+
+#[test]
+fn a_misbehaving_local_peer_does_not_cut_off_other_local_peers() {
+    // On a loopback devnet every node is 127.0.0.1. Banning the IP for one
+    // bad process used to drop and refuse every local peer for an hour.
+    let mut pm = PeerManager::new();
+    let bad = SocketAddr::from(([127, 0, 0, 1], 5_001));
+    let good = SocketAddr::from(([127, 0, 0, 1], 5_002));
+    pm.register(bad, false, &version(1)).unwrap();
+    pm.register(good, false, &version(2)).unwrap();
+    for _ in 0..6 {
+        pm.score(&bad, minibtc_p2p::peer::SCORE_BAD_MESSAGE);
+    }
+    assert!(pm.get(&bad).is_none(), "the bad peer is dropped");
+    assert!(
+        pm.get(&good).is_some(),
+        "another local peer must stay connected"
+    );
+    assert!(
+        matches!(pm.admit(bad, false), Err(PeerError::Banned)),
+        "the same address stays banned"
+    );
+    pm.remove(&good);
+    assert!(
+        pm.admit(SocketAddr::from(([127, 0, 0, 1], 5_003)), false)
+            .is_ok(),
+        "a different local address is not banned"
+    );
+}
+
+#[test]
+fn a_misbehaving_public_peer_is_banned_by_ip() {
+    let mut pm = PeerManager::new();
+    let bad = SocketAddr::from(([8, 8, 4, 4], 1));
+    let same_ip = SocketAddr::from(([8, 8, 4, 4], 2));
+    pm.register(bad, false, &version(1)).unwrap();
+    pm.register(same_ip, false, &version(2)).unwrap();
+    for _ in 0..6 {
+        pm.score(&bad, minibtc_p2p::peer::SCORE_BAD_MESSAGE);
+    }
+    assert!(
+        pm.get(&same_ip).is_none(),
+        "every connection from the IP is dropped"
+    );
+    assert!(matches!(
+        pm.admit(SocketAddr::from(([8, 8, 4, 4], 3)), false),
+        Err(PeerError::Banned)
+    ));
+}

@@ -272,6 +272,22 @@ UTXO overlay and commits only if the whole branch connects. When block
   verdict depends on the local clock (Core's `BLOCK_TIME_FUTURE` is
   never cached either). A later block on the branch retries the reorg.
 
+### D-017 — Ban scope: by IP for public peers, by address for local ones (2026-11-16)
+
+A peer whose score reaches the ban threshold is banned for an hour. For a
+public address the ban covers the whole IP, as before: every connection
+from it is dropped and new ones are refused. For a loopback, private
+(RFC 1918, IPv6 unique-local) or link-local address it covers only that
+exact IP and port. On a local devnet every node is 127.0.0.1 (or shares
+one LAN prefix), so a per-IP ban for one misbehaving process used to cut
+off every local peer for an hour.
+
+Tradeoff, accepted: a local process that reconnects from a new port is
+not refused by the ban (per-IP and per-subnet connection caps still
+apply). Local addresses belong to the operator; the threat the ban
+answers is a remote peer. The operator's `banpeer` RPC still bans a whole
+IP, local or not.
+
 ## Open questions
 
 - None blocking. Post-v1 candidates if revisited: SegWit/Taproot sighash
