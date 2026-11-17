@@ -153,6 +153,15 @@ non-loopback `--listen` exits naming `--allow-remote`. Explorer adds
 
 ## Load smoke (ab, this machine — laptop numbers, not capacity)
 
+**Method (from `f510ad8` on): `ab -r -k`.** Every server now closes a
+connection after 1,000 requests (`Connection: close` on the last answer,
+D-019), and plain `ab -k` stops at its first receive error, so it aborts
+as soon as its connections reach that cap. `-r` keeps ab going; expect
+about one flagged request per capped connection (≈0.1% at 1,000
+requests per connection), which is ab's HTTP/1.0 keep-alive handling of
+the close, not a failed request (curl over one keep-alive connection
+sees every answer complete and reconnects once per 1,000).
+
 - Explorer `GET /mempool`: **100,000 req, 50 conns — 3,052 req/s, 0
   failures** (ab, sustained).
 - Wallet-ui `GET /wallet` (authed; full UTXO rescan per request):

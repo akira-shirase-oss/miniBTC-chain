@@ -2,7 +2,17 @@
 all-features = true
 
 [advisories]
-ignore = []
+# Every exception names the advisory, why it does not apply or cannot be
+# fixed yet, and a "review by" date; scripts/check-deny.sh fails the gate
+# once that date has passed.
+ignore = [
+    # chrono is unmaintained (RustSec "unmaintained", not a vulnerability;
+    # the advisory lists no safe upgrade). It reaches MiniBTC only through
+    # rmcp (the MCP server) and the schemars "chrono04" feature rmcp turns
+    # on; no MiniBTC code uses chrono. rmcp 3.10.0, the newest on
+    # 2026-11-17, still depends on it.
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained, only via rmcp/schemars; no release drops it (rmcp 3.10.0 checked 2026-11-17); review by 2026-12-17" },
+]
 
 [licenses]
 allow = ["MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Unicode-3.0", "Zlib", "CC0-1.0", "MPL-2.0"]

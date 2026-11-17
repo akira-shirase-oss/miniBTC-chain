@@ -391,6 +391,13 @@ connections closed on accept, by design.
   `pull_request_target`, no expression inside `run:` and no persisted
   checkout credentials. CI uses cargo-deny 0.20.2 (the newest release at
   least two weeks old); the maintainer's machine ran 0.21.0.
+- **Advisory exceptions are dated** (2026-11-17). RUSTSEC-2026-0543
+  (chrono unmaintained, no safe upgrade) arrived through rmcp and its
+  schemars `chrono04` feature and turned CI red; no rmcp release drops
+  it (3.10.0 checked) and no MiniBTC code uses chrono, so `deny.toml`
+  ignores it with a reason ending "review by 2026-12-17".
+  `scripts/check-deny.sh` fails the gate when any exception lacks a
+  review date or its date has passed.
 
 ### D-021 — Push-only scriptSigs: mempool policy, not consensus (2026-11-16)
 
