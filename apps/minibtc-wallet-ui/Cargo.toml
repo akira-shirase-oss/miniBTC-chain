@@ -26,5 +26,8 @@ clap.workspace = true
 rand.workspace = true
 zeroize.workspace = true
 
+[dev-dependencies]
+tower = { workspace = true, features = ["util"] }
+
 [lints]
 workspace = true

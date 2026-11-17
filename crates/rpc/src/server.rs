@@ -198,6 +198,13 @@ async fn rpc_handler(State(st): State<ServerState>, headers: HeaderMap, body: By
     }
 }
 
+/// Compare two secrets (tokens, passwords) without an early exit on the
+/// first differing byte. Lengths are not secret here: every token this
+/// workspace compares has a fixed, public length.
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.ct_eq(b)
+}
+
 /// Constant-time byte compare helper (slice ct_eq via subtle-free impl).
 trait CtEq {
     fn ct_eq(&self, other: &[u8]) -> bool;

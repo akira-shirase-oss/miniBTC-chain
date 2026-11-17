@@ -368,7 +368,8 @@ fn require_post_session(
     let token = session_token(app, headers)?;
     let sessions = app.sessions.lock().unwrap_or_else(|e| e.into_inner());
     let s = sessions.get(&token)?;
-    (form.get("csrf").map(String::as_str) == Some(s.csrf.as_str())).then_some(token)
+    let sent = form.get("csrf")?;
+    minibtc_rpc::server::constant_time_eq(sent.as_bytes(), s.csrf.as_bytes()).then_some(token)
 }
 
 /// Insert a new session; returns the cookie token.
@@ -1505,7 +1506,15 @@ async fn main() -> Result<()> {
         pending_creates: Mutex::new(HashMap::new()),
         unlock_fails: Mutex::new(HashMap::new()),
     });
-    let router = Router::new()
+    let listener = tokio::net::TcpListener::bind(args.listen).await?;
+    tracing::info!("wallet-ui listening on http://{}", args.listen);
+    axum::serve(listener, router(app)).await?;
+    Ok(())
+}
+
+/// Every route, over the shared app state.
+fn router(app: Arc<App>) -> Router {
+    Router::new()
         .route("/", get(index))
         .route("/new", get(new_form).post(new_submit))
         .route("/restore", get(restore_form).post(restore_submit))
@@ -1524,11 +1533,7 @@ async fn main() -> Result<()> {
         .route("/wallet/address/new", post(new_address))
         .route("/wallet/lock", post(lock))
         .route("/healthz", get(healthz))
-        .with_state(app);
-    let listener = tokio::net::TcpListener::bind(args.listen).await?;
-    tracing::info!("wallet-ui listening on http://{}", args.listen);
-    axum::serve(listener, router).await?;
-    Ok(())
+        .with_state(app)
 }
 
 #[cfg(test)]
@@ -1681,6 +1686,169 @@ mod tests {
                 .unwrap_or_else(|e| e.into_inner())
                 .is_empty()
         );
+    }
+
+    /// A stand-in node RPC on loopback that counts `sendrawtransaction`.
+    async fn counting_rpc() -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let sends = Arc::new(AtomicUsize::new(0));
+        let counter = sends.clone();
+        let app = Router::new().route(
+            "/",
+            post(move |axum::Json(req): axum::Json<Value>| {
+                let counter = counter.clone();
+                async move {
+                    if req["method"] == "sendrawtransaction" {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                    }
+                    axum::Json(
+                        json!({"jsonrpc": "2.0", "id": req["id"], "result": "ab".repeat(32)}),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (port, sends)
+    }
+
+    fn app_with_pending_send(rpc_port: u16) -> Arc<App> {
+        let auth = minibtc_rpc::server::CookieAuth {
+            user: "u".into(),
+            pass: "p".into(),
+        };
+        let wallet = Wallet::generate("", 0, 0, 0, 100)
+            .unwrap_or_else(|_| panic!())
+            .0;
+        let app = Arc::new(App {
+            rpc: RpcClient::new("127.0.0.1", rpc_port, auth).unwrap_or_else(|_| panic!()),
+            params: ChainParams::devnet(),
+            datadir: std::env::temp_dir().join(format!("mbtc-wui-{}", std::process::id())),
+            listen: "127.0.0.1:18448".parse().unwrap_or_else(|_| panic!()),
+            ttl: Duration::from_secs(600),
+            sessions: Mutex::new(HashMap::new()),
+            pending_creates: Mutex::new(HashMap::new()),
+            unlock_fails: Mutex::new(HashMap::new()),
+        });
+        app.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                "tok".into(),
+                Session {
+                    name: "w".into(),
+                    wallet,
+                    csrf: "c5rf".into(),
+                    touched: Instant::now(),
+                    pending: None,
+                },
+            );
+        app
+    }
+
+    fn arm_pending(app: &App) {
+        app.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut("tok")
+            .unwrap_or_else(|| panic!())
+            .pending = Some(PendingSend {
+            to: "addr".into(),
+            amount_sats: 1,
+            fee_rate: 1,
+            fee_sats: 1,
+            txid: "00".repeat(32),
+            tx_hex: "00".into(),
+            inputs: 1,
+        });
+    }
+
+    fn confirm_request(
+        cookie: Option<&str>,
+        origin: Option<&str>,
+        body: &str,
+    ) -> axum::http::Request<axum::body::Body> {
+        let mut b = axum::http::Request::post("/wallet/send/confirm")
+            .header(header::HOST, "127.0.0.1:18448")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+        if let Some(c) = cookie {
+            b = b.header(header::COOKIE, c);
+        }
+        if let Some(o) = origin {
+            b = b.header(header::ORIGIN, o);
+        }
+        b.body(axum::body::Body::from(body.to_string()))
+            .unwrap_or_else(|_| panic!())
+    }
+
+    #[tokio::test]
+    async fn send_confirm_without_a_valid_csrf_token_or_origin_never_broadcasts() {
+        use std::sync::atomic::Ordering;
+        use tower::ServiceExt;
+        let (port, sends) = counting_rpc().await;
+        let app = app_with_pending_send(port);
+        let ours = Some("http://127.0.0.1:18448");
+        let refused = [
+            ("no csrf field", Some("mb_wallet=tok"), ours, ""),
+            ("empty csrf", Some("mb_wallet=tok"), ours, "csrf="),
+            ("wrong csrf", Some("mb_wallet=tok"), ours, "csrf=c5rg"),
+            ("csrf prefix", Some("mb_wallet=tok"), ours, "csrf=c5r"),
+            (
+                "foreign origin",
+                Some("mb_wallet=tok"),
+                Some("http://evil.example"),
+                "csrf=c5rf",
+            ),
+            (
+                "look-alike origin",
+                Some("mb_wallet=tok"),
+                Some("http://127.0.0.1:18448.evil.example"),
+                "csrf=c5rf",
+            ),
+            (
+                "opaque origin",
+                Some("mb_wallet=tok"),
+                Some("null"),
+                "csrf=c5rf",
+            ),
+            ("no session cookie", None, ours, "csrf=c5rf"),
+            (
+                "unknown session",
+                Some("mb_wallet=other"),
+                ours,
+                "csrf=c5rf",
+            ),
+        ];
+        for (case, cookie, origin, body) in refused {
+            arm_pending(&app);
+            let res = router(app.clone())
+                .oneshot(confirm_request(cookie, origin, body))
+                .await
+                .unwrap_or_else(|_| panic!());
+            assert_eq!(
+                sends.load(Ordering::SeqCst),
+                0,
+                "{case}: sendrawtransaction must not be called (status {})",
+                res.status()
+            );
+            let still_pending = app
+                .sessions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get("tok")
+                .is_some_and(|s| s.pending.is_some());
+            assert!(still_pending, "{case}: the pending send is left untouched");
+        }
+
+        // Control: the right session, token and origin do broadcast, once.
+        arm_pending(&app);
+        router(app.clone())
+            .oneshot(confirm_request(Some("mb_wallet=tok"), ours, "csrf=c5rf"))
+            .await
+            .unwrap_or_else(|_| panic!());
+        assert_eq!(sends.load(Ordering::SeqCst), 1);
+        let _ = std::fs::remove_dir_all(&app.datadir);
     }
 
     #[test]
