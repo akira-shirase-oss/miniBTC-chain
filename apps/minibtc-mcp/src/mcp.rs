@@ -41,6 +41,10 @@ const MAX_EXPLAIN_BLOCK_INPUTS: usize = 500;
 const MAX_BLOCKS_FOR_MEDIAN: u32 = 11;
 const MAX_MEMPOOL_ROWS: usize = 200;
 
+/// Tools that write: build a draft, broadcast, or mine. `--read-only`
+/// neither lists nor runs them.
+const WRITE_TOOLS: [&str; 3] = ["draft_payment", "request_send", "mine_blocks"];
+
 /// Most peers `get_peers` returns.
 const MAX_PEER_ROWS: usize = 64;
 /// The label `get_peers` puts on text a remote peer chose.
@@ -823,6 +827,16 @@ impl MiniBtcMcp {
             Ok(w) => w.to_string(),
             Err(_) => return Self::err("missing 'wallet'"),
         };
+        // Wallet name sanitization mirrors the CLI's rule, checked before
+        // anything else runs (it becomes a subprocess argument).
+        if wallet.is_empty()
+            || wallet.len() > 64
+            || !wallet
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        {
+            return Self::err("invalid wallet name");
+        }
         let to = match Self::arg_str(args, "to_address") {
             Ok(a) => a.to_string(),
             Err(_) => return Self::err("missing 'to_address'"),
@@ -850,15 +864,6 @@ impl MiniBtcMcp {
         if !(1..=1000).contains(&fee_rate) {
             return Self::err("fee_rate_sats_per_kvb must be 1..=1000");
         }
-        // Wallet name sanitization mirrors the CLI's rule.
-        if wallet.is_empty()
-            || !wallet
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-        {
-            return Self::err("invalid wallet name");
-        }
-
         // Amount in BTC string with exactly 8 decimals (sats/1e8).
         let btc = format!(
             "{}.{:08}",
@@ -1168,7 +1173,43 @@ impl MiniBtcMcp {
 
     // ---------- tool table ----------
 
-    fn tool_defs() -> Vec<Tool> {
+    /// The tools this server offers: all of them, or only the read and
+    /// explain tools when `read_only`.
+    fn tool_defs(read_only: bool) -> Vec<Tool> {
+        let mut tools = Self::all_tool_defs();
+        if read_only {
+            tools.retain(|t| !WRITE_TOOLS.contains(&t.name.as_ref()));
+        }
+        tools
+    }
+
+    /// Run one tool. A write tool on a `--read-only` server is refused
+    /// before it touches anything.
+    async fn dispatch(&self, name: &str, args: &Map<String, Value>) -> CallToolResult {
+        if self.shared.read_only && WRITE_TOOLS.contains(&name) {
+            return Self::err(format!(
+                "{name} is disabled: this server was started with --read-only"
+            ));
+        }
+        match name {
+            "get_chain_info" => self.t_chain_info().await,
+            "get_block" => self.t_block(args).await,
+            "get_transaction" => self.t_transaction(args).await,
+            "get_address_summary" => self.t_address_summary(args).await,
+            "list_mempool" => self.t_mempool().await,
+            "get_peers" => self.t_peers().await,
+            "explain_transaction" => self.t_explain_transaction(args).await,
+            "explain_block" => self.t_explain_block(args).await,
+            "draft_payment" => self.t_draft_payment(args).await,
+            "request_send" => self.t_request_send(args).await,
+            "mine_blocks" => self.t_mine_blocks(args).await,
+            other => {
+                CallToolResult::error(vec![ContentBlock::text(format!("unknown tool '{other}'"))])
+            }
+        }
+    }
+
+    fn all_tool_defs() -> Vec<Tool> {
         let schema = |props: Value, required: &[&str]| {
             let mut s = json!({
                 "type": "object",
@@ -1391,7 +1432,7 @@ impl ServerHandler for MiniBtcMcp {
         _context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<ListToolsResult, McpError>> + Send + '_ {
         std::future::ready(Ok(ListToolsResult {
-            tools: Self::tool_defs(),
+            tools: Self::tool_defs(self.shared.read_only),
             ..Default::default()
         }))
     }
@@ -1404,22 +1445,7 @@ impl ServerHandler for MiniBtcMcp {
         let name = request.name.to_string();
         let args = request.arguments.clone().unwrap_or_default();
         async move {
-            let result = match name.as_str() {
-                "get_chain_info" => self.t_chain_info().await,
-                "get_block" => self.t_block(&args).await,
-                "get_transaction" => self.t_transaction(&args).await,
-                "get_address_summary" => self.t_address_summary(&args).await,
-                "list_mempool" => self.t_mempool().await,
-                "get_peers" => self.t_peers().await,
-                "explain_transaction" => self.t_explain_transaction(&args).await,
-                "explain_block" => self.t_explain_block(&args).await,
-                "draft_payment" => self.t_draft_payment(&args).await,
-                "request_send" => self.t_request_send(&args).await,
-                "mine_blocks" => self.t_mine_blocks(&args).await,
-                other => CallToolResult::error(vec![ContentBlock::text(format!(
-                    "unknown tool '{other}'"
-                ))]),
-            };
+            let result = self.dispatch(&name, &args).await;
             let ok = result.is_error != Some(true);
             self.audit_call("tool", &name, &args, ok, &json!({})).await;
             Ok(result.into())
@@ -1606,7 +1632,114 @@ mod tests {
             max_spend_sats: 1_000_000,
             max_daily_sats: 10_000_000,
             miner_address: "mqmLVoDnuDpSH4FyWn8enX3ksHVEDGX4Ke".into(),
+            read_only: false,
         }))
+    }
+
+    pub(crate) fn read_only_server(rpc_port: u16) -> MiniBtcMcp {
+        let full = server(rpc_port);
+        let shared = Arc::try_unwrap(full.shared).unwrap_or_else(|_| panic!("sole owner"));
+        MiniBtcMcp::new(Arc::new(Shared {
+            read_only: true,
+            ..shared
+        }))
+    }
+
+    fn calls(log: &std::sync::Mutex<Vec<String>>) -> Vec<String> {
+        log.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    #[tokio::test]
+    async fn read_only_lists_and_runs_no_write_tool() {
+        let all: Vec<String> = MiniBtcMcp::tool_defs(false)
+            .iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        for w in WRITE_TOOLS {
+            assert!(all.iter().any(|n| n == w), "{w} exists");
+        }
+        // The list matches the annotations: everything else is read-only.
+        for t in MiniBtcMcp::tool_defs(true) {
+            assert!(!WRITE_TOOLS.contains(&t.name.as_ref()), "{} listed", t.name);
+            let ro = t.annotations.as_ref().and_then(|a| a.read_only_hint);
+            assert_eq!(ro, Some(true), "{} is annotated read-only", t.name);
+        }
+
+        fn reply(_: &str) -> Value {
+            json!({"devnet": true, "isvalid": true})
+        }
+        let (port, log) = stub_rpc(reply).await;
+        let ro = read_only_server(port);
+        let mut args = Map::new();
+        args.insert("nblocks".into(), json!(1));
+        args.insert("draft_id".into(), json!("d"));
+        args.insert("wallet".into(), json!("w"));
+        args.insert(
+            "to_address".into(),
+            json!("mqmLVoDnuDpSH4FyWn8enX3ksHVEDGX4Ke"),
+        );
+        args.insert("amount_sats".into(), json!(1_000));
+        for w in WRITE_TOOLS {
+            let r = ro.dispatch(w, &args).await;
+            assert_eq!(r.is_error, Some(true), "{w} refused");
+            assert!(text_of(&r).contains("--read-only"), "{w}: {}", text_of(&r));
+        }
+        assert!(
+            calls(&log).is_empty(),
+            "nothing reached the node: {:?}",
+            calls(&log)
+        );
+        // Read tools still work.
+        let r = ro.dispatch("get_peers", &Map::new()).await;
+        assert_ne!(r.is_error, Some(true));
+    }
+
+    #[tokio::test]
+    async fn mine_blocks_is_refused_off_devnet() {
+        fn reply(method: &str) -> Value {
+            match method {
+                "getblockchaininfo" => json!({"devnet": false, "chain": "minibtc-main"}),
+                _ => json!(true),
+            }
+        }
+        let (port, log) = stub_rpc(reply).await;
+        let mut args = Map::new();
+        args.insert("nblocks".into(), json!(1));
+        let r = server(port).dispatch("mine_blocks", &args).await;
+        assert_eq!(r.is_error, Some(true));
+        assert!(text_of(&r).contains("devnet"), "{}", text_of(&r));
+        assert_eq!(calls(&log), vec!["getblockchaininfo".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_traversal_or_oversized_wallet_name_is_refused_before_anything_runs() {
+        fn reply(_: &str) -> Value {
+            json!({"isvalid": true})
+        }
+        let (port, log) = stub_rpc(reply).await;
+        let s = server(port);
+        let long = "w".repeat(65);
+        for name in ["../x", "a/b", "..\\x", "", "w\u{0}", long.as_str()] {
+            let mut args = Map::new();
+            args.insert("wallet".into(), json!(name));
+            args.insert(
+                "to_address".into(),
+                json!("mqmLVoDnuDpSH4FyWn8enX3ksHVEDGX4Ke"),
+            );
+            args.insert("amount_sats".into(), json!(1_000));
+            let r = s.dispatch("draft_payment", &args).await;
+            assert_eq!(r.is_error, Some(true), "{name:?}");
+            assert!(
+                text_of(&r).contains("invalid wallet name"),
+                "{name:?}: {}",
+                text_of(&r)
+            );
+        }
+        assert!(
+            calls(&log).is_empty(),
+            "refused before any RPC: {:?}",
+            calls(&log)
+        );
     }
 
     fn text_of(r: &CallToolResult) -> String {

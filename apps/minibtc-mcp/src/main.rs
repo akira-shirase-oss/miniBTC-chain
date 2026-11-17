@@ -78,6 +78,11 @@ struct Args {
     #[arg(long, default_value = DEFAULT_MINER_ADDRESS)]
     miner_address: String,
 
+    /// Serve only the read and explain tools: draft_payment, request_send
+    /// and mine_blocks are neither listed nor callable.
+    #[arg(long)]
+    read_only: bool,
+
     /// One-shot: list pending payment drafts, then exit.
     #[arg(long)]
     list_drafts: bool,
@@ -337,6 +342,8 @@ pub struct Shared {
     pub max_spend_sats: u64,
     pub max_daily_sats: u64,
     pub miner_address: String,
+    /// `--read-only`: no write tool is listed or callable.
+    pub read_only: bool,
 }
 
 #[tokio::main]
@@ -399,6 +406,7 @@ async fn main() -> Result<()> {
         max_spend_sats: args.max_spend_sats,
         max_daily_sats: args.max_daily_sats,
         miner_address: args.miner_address.clone(),
+        read_only: args.read_only,
     });
     let handler = mcp::MiniBtcMcp::new(shared);
     let transport = rmcp::transport::io::stdio();
