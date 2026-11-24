@@ -40,7 +40,7 @@ hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio", "service"] }
 tower = "0.5"
 tower-http = { version = "0.7", features = ["trace", "timeout", "limit", "catch-panic"] }
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
 base64 = "0.23"
 rand = "0.10"
 # --- serialization / errors / logging ---
@@ -61,9 +61,9 @@ bs58 = "0.5"
 hex = "0.4"
 secrecy = "0.10"
 zeroize = "1"
-chacha20poly1305 = "0.10"
+chacha20poly1305 = "0.11"
 # --- storage ---
-redb = "4"
+redb = "5"
 # --- cli ---
 clap = { version = "4", features = ["derive"] }
 # --- mcp ---
